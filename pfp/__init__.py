@@ -57,6 +57,16 @@ from .arena import (
     ArenaFeed,
     TronArenaRenderer,
 )
+from .self_improvement import (
+    EventLogMiner,
+    MinedArenaMetrics,
+    RewriteProposition,
+    RunBoundarySwitchError,
+    SandboxResult,
+    SelfImprovementLoop,
+    VersionRegistry,
+    VersionSnapshot,
+)
 
 __all__ = [
     "DEFAULT_BASE_URL",
@@ -95,5 +105,13 @@ __all__ = [
     "ArenaEvent",
     "ArenaFeed",
     "TronArenaRenderer",
+    "EventLogMiner",
+    "MinedArenaMetrics",
+    "RewriteProposition",
+    "RunBoundarySwitchError",
+    "SandboxResult",
+    "SelfImprovementLoop",
+    "VersionRegistry",
+    "VersionSnapshot",
 ]
 

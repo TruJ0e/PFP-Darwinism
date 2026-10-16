@@ -675,6 +675,63 @@ class _MockChatCompletions:
                 False,
             )
 
+        # 10. Piece 8: Self-improvement loop (self-assessment, anti-model critic, proposition synthesis)
+        if "self_assessment" in lower or "post-run summary" in lower:
+            return (
+                json.dumps(
+                    {
+                        "what_worked": [
+                            "Cross-branch merge of firewall + sshd hypotheses produced highest-certainty winner",
+                            "3-round rotated falsification gauntlet filtered out ungrounded NS proxy/fail2ban branches",
+                        ],
+                        "what_to_improve": [
+                            "Increase merges_attracted weight slightly to reward convergent branches earlier",
+                            "Tighten similarity_threshold slightly to reduce redundant sibling exploration",
+                        ],
+                    }
+                ),
+                False,
+            )
+
+        if "anti_model" in lower or "purely negative critic" in lower:
+            return (
+                json.dumps(
+                    {
+                        "evidence_grounded_attacks": [
+                            {
+                                "target": "ns_blind_variation_spend",
+                                "evidence_seq": "ns_tick -> fail",
+                                "critique": "NS mutations on client ProxyCommand/fail2ban consumed exploration budget before being killed by logic/assumption_audit falsifiers.",
+                            },
+                            {
+                                "target": "unmerged_leaf_branches",
+                                "evidence_seq": "branch -> conclude",
+                                "critique": "Deep leaf branches that did not attract merges had lower spend-to-certainty efficiency than merged branches.",
+                            },
+                        ]
+                    }
+                ),
+                False,
+            )
+
+        if "synthesize_proposition" in lower or "concrete changes (dials, prompts, thresholds)" in lower:
+            return (
+                json.dumps(
+                    {
+                        "summary": "Boost merges_attracted weight (1.5 -> 1.75) and survival weight (3.0 -> 3.25) based on mined merge win rate.",
+                        "dial_changes": {
+                            "merges_attracted_weight": 1.75,
+                            "survived_falsifications_weight": 3.25,
+                            "prefilter_threshold": 0.22,
+                        },
+                        "prompt_changes": {
+                            "plaus_probe_hint": "Prioritize host-level service + firewall state checks before exotic client overrides.",
+                        },
+                    }
+                ),
+                False,
+            )
+
         # Default reasoning continuation
         fork = _PLAUS_FORK_POOL[(self._call_count + choice_idx) % len(_PLAUS_FORK_POOL)]
         return (
