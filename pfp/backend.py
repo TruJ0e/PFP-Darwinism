@@ -590,6 +590,33 @@ class _MockChatCompletions:
                 False,
             )
 
+        # 8. Piece 5: Merge synthesizer (Super call unifying aligned branches)
+        if "merge_synthesizer" in lower or "unify compatible branches" in lower:
+            return (
+                json.dumps(
+                    {
+                        "unified_fork": "Unified host-ingress remediation: enable laptop sshd + allow inbound TCP/22 on firewall",
+                        "unified_reasoning": (
+                            "Merged synthesis: Laptop->desktop works via outbound stateful SYN, while desktop->laptop "
+                            "requires both (1) starting/enabling `sshd` on the laptop LAN interface and (2) opening "
+                            "inbound TCP/22 in the laptop host firewall (`ufw allow 22/tcp` / Windows Defender rule)."
+                        ),
+                        "kept_claims": [
+                            "Start and enable OpenSSH server daemon (`systemctl enable --now ssh`) on laptop",
+                            "Allow inbound TCP/22 in laptop stateful host firewall and verify with `ss -tlnp | grep :22`",
+                        ],
+                        "dropped_redundant": [
+                            "Duplicate diagnosis that outbound laptop SYN succeeds while inbound desktop SYN fails",
+                        ],
+                        "provenance": {
+                            "parent_a": ["Contributed stateful firewall inbound TCP/22 rule analysis"],
+                            "parent_b": ["Contributed OpenSSH server daemon (`sshd`) listener verification"],
+                        },
+                    }
+                ),
+                False,
+            )
+
         # Default reasoning continuation
         fork = _PLAUS_FORK_POOL[(self._call_count + choice_idx) % len(_PLAUS_FORK_POOL)]
         return (

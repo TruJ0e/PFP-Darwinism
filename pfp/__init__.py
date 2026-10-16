@@ -40,6 +40,10 @@ from .alignment_detector import (
     compute_branch_embedding,
     cosine_similarity,
 )
+from .merge_synthesizer import (
+    MergeSynthesisResult,
+    MergeSynthesizer,
+)
 
 __all__ = [
     "DEFAULT_BASE_URL",
@@ -67,5 +71,7 @@ __all__ = [
     "AlignmentVerdict",
     "compute_branch_embedding",
     "cosine_similarity",
+    "MergeSynthesisResult",
+    "MergeSynthesizer",
 ]
 

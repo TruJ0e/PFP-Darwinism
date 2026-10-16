@@ -77,6 +77,8 @@ class BranchRecord:
     last_tested_at: float = field(default_factory=time.time)
     reasoning_trace: List[str] = field(default_factory=list)
     state_history: List[StateTransitionRecord] = field(default_factory=list)
+    merge_parents: List[str] = field(default_factory=list)
+    merge_provenance: Dict[str, List[str]] = field(default_factory=dict)
 
     @property
     def is_alive(self) -> bool:
@@ -93,6 +95,7 @@ class BranchRecord:
         return {
             "id": self.id,
             "parent": self.parent,
+            "merge_parents": list(self.merge_parents),
             "depth": self.depth,
             "state": self.state.value,
             "certainty_score": round(self.certainty_score, 4),
@@ -102,6 +105,7 @@ class BranchRecord:
             "survived_falsifications": self.survived_falsifications,
             "merges_attracted": self.merges_attracted,
             "open_critic_objections": self.open_critic_objections,
+            "merge_provenance": self.merge_provenance,
         }
 
 

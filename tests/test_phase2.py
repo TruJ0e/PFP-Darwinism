@@ -9,6 +9,10 @@ import unittest
 from pfp import (
     AlignmentDetector,
     AlignmentVerdict,
+    BranchState,
+    BudgetLedger,
+    InvalidStateTransitionError,
+    MergeSynthesizer,
     MockOpenAIClient,
     PFPTracker,
 )
@@ -90,6 +94,73 @@ class TestPiece4AlignmentDetector(unittest.TestCase):
         self.assertEqual(res_ad.verdict, AlignmentVerdict.UNRELATED)
         self.assertFalse(res_ad.is_alignable)
         self.assertFalse(res_ad.is_contradictory)
+
+
+class TestPiece5MergeSynthesizer(unittest.TestCase):
+    def test_merge_unification_provenance_and_budget_transfer(self) -> None:
+        client = MockOpenAIClient(force_cost_scale=1.0)
+        tracker = PFPTracker()
+        ledger = BudgetLedger()
+
+        tracker.register_branch(
+            "p1",
+            parent="root",
+            budget_remaining=0.025,
+            fork_under_exploration="Inspect stateful firewall and inbound port 22 rules on the laptop",
+            certainty_score=1.5,
+            depth=1,
+        )
+        tracker.update_branch("p1", reasoning_step="Firewall rule check on laptop TCP/22")
+
+        tracker.register_branch(
+            "p2",
+            parent="root",
+            budget_remaining=0.030,
+            fork_under_exploration="Verify OpenSSH server daemon is installed and listening on the laptop",
+            certainty_score=2.0,
+            depth=1,
+        )
+        tracker.update_branch("p2", reasoning_step="sshd listener check on laptop TCP/22")
+
+        events = []
+        synthesizer = MergeSynthesizer(
+            client=client,
+            tracker=tracker,
+            budget_ledger=ledger,
+            event_sink=events.append,
+        )
+        res = synthesizer.merge_branches("p1", "p2", "m_child_1")
+
+        # 1. Child starts Possible, NEVER Passed
+        child = tracker.get("m_child_1")
+        self.assertEqual(child.state, BranchState.POSSIBLE)
+        self.assertEqual(res.child_state, BranchState.POSSIBLE)
+
+        # 2. Both parents are absorbed (terminal) and their budgets are zeroed
+        p1_after = tracker.get("p1")
+        p2_after = tracker.get("p2")
+        self.assertEqual(p1_after.state, BranchState.ABSORBED)
+        self.assertEqual(p2_after.state, BranchState.ABSORBED)
+        self.assertEqual(p1_after.budget_remaining, 0.0)
+        self.assertEqual(p2_after.budget_remaining, 0.0)
+        with self.assertRaises(InvalidStateTransitionError):
+            tracker.transition("p1", BranchState.POSSIBLE)
+
+        # 3. Unused parent budgets transferred to child (born richer than either parent)
+        self.assertAlmostEqual(
+            child.budget_remaining + res.synthesis_cost_usd,
+            0.025 + 0.030,
+            places=5,
+        )
+        self.assertGreater(child.budget_remaining, 0.030)
+
+        # 4. Provenance preserved (which parent contributed what)
+        self.assertIn("p1", child.merge_provenance)
+        self.assertIn("p2", child.merge_provenance)
+        self.assertGreater(len(child.merge_provenance["p1"]), 0)
+        self.assertGreater(len(child.merge_provenance["p2"]), 0)
+        self.assertEqual(child.merge_parents, ["p1", "p2"])
+        self.assertGreaterEqual(child.merges_attracted, 1)
 
 
 if __name__ == "__main__":
