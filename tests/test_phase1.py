@@ -1,5 +1,6 @@
 """
-End-to-end and unit tests for PFP Darwinism Phase 1 (Pieces 1–3 + Backend).
+End-to-end and unit tests for PFP Darwinism Phase 1 (Pieces 1–3 + Backend),
+covering both Pass 1 literal requirements and Pass 2 intent & refinement guarantees.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from pfp import (
     BranchState,
     BudgetLedger,
     CertaintyWeights,
-    Directive,
     InvalidStateTransitionError,
     IssueDetector,
     MainHarness,
@@ -79,14 +79,16 @@ class TestPiece3PFPTracker(unittest.TestCase):
         )
         self.assertEqual(rec.state, BranchState.POSSIBLE)
         self.assertEqual(rec.fork_under_exploration, "firewall_check")
+        self.assertEqual(len(rec.state_history), 1)
 
         # Possible -> Pass is valid
-        tracker.transition("b1", BranchState.PASS)
+        tracker.transition("b1", BranchState.PASS, reason="survived_3_gauntlet_rounds")
         self.assertEqual(tracker.get("b1").state, BranchState.PASS)
 
         # Pass -> Absorbed is valid ("anything -> absorbed on merge")
-        tracker.transition("b1", BranchState.ABSORBED)
+        tracker.transition("b1", BranchState.ABSORBED, reason="merged_into_b3")
         self.assertEqual(tracker.get("b1").state, BranchState.ABSORBED)
+        self.assertEqual(len(tracker.get("b1").state_history), 3)
 
         # Absorbed -> Possible is illegal (no resurrection)
         with self.assertRaises(InvalidStateTransitionError):
@@ -98,7 +100,9 @@ class TestPiece3PFPTracker(unittest.TestCase):
             parent="b1",
             budget_remaining=0.02,
             fork_under_exploration="sshd_check",
+            depth=1,
         )
+        self.assertIn("firewall_check", tracker.known_forks_in_lineage("b2"))
         tracker.transition("b2", BranchState.FAIL)
         self.assertEqual(tracker.get("b2").state, BranchState.FAIL)
         with self.assertRaises(InvalidStateTransitionError):
@@ -123,14 +127,25 @@ class TestPiece1IssueDetector(unittest.TestCase):
         self.assertGreater(len(res_split.distinct_forks), 1)
         self.assertGreater(res_split.mean_token_entropy, 0.0)
 
+        # Cross-lineage novelty exhaustion filters out already-explored forks
+        already_seen = [f.fork_description for f in res_split.distinct_forks]
+        res_filtered = detector.detect_plaus(
+            problem="SSH works laptop->desktop but not desktop->laptop.",
+            parent_reasoning="Initial observation.",
+            depth=0,
+            known_forks=already_seen,
+        )
+        self.assertTrue(res_filtered.novelty_exhausted)
+
         # At depth=2, continuations cluster -> no issue, merge and flow straight
         res_cluster = detector.detect_plaus(
             problem="SSH works laptop->desktop but not desktop->laptop.",
-            parent_reasoning="Narrowed to firewall rule.",
+            parent_reasoning="Verified solution narrowed to firewall rule.",
             depth=2,
         )
         self.assertFalse(res_cluster.should_split)
         self.assertIsNotNone(res_cluster.merged_continuation)
+        self.assertGreaterEqual(res_cluster.distinct_forks[0].cluster_size, 1)
 
         # NS blind variation trigger
         res_ns = detector.trigger_ns(
@@ -168,9 +183,13 @@ class TestPiece1IssueDetector(unittest.TestCase):
 
 
 class TestPiece2BranchSpawnerAndBudget(unittest.TestCase):
-    def test_budget_mechanics_and_end_to_end_harness(self) -> None:
+    def test_strict_budget_conservation_and_floor_pruning(self) -> None:
         client = MockOpenAIClient()
-        ledger = BudgetLedger(hard_cap_usd=2.00, finish_reserve_ratio=0.125)
+        ledger = BudgetLedger(
+            hard_cap_usd=2.00,
+            finish_reserve_ratio=0.125,
+            min_branch_floor_usd=0.002,
+        )
         root = ledger.size_problem_once(client, "Diagnose asymmetric SSH.")
         self.assertGreater(root, 0.0)
         self.assertLessEqual(root, 2.00)
@@ -178,22 +197,65 @@ class TestPiece2BranchSpawnerAndBudget(unittest.TestCase):
 
         # Tight budget -> slower NS cadence
         fast_cadence = ledger.compute_ns_cadence(0.05)
-        slow_cadence = ledger.compute_ns_cadence(0.005)
+        slow_cadence = ledger.compute_ns_cadence(0.003)
         self.assertGreater(slow_cadence, fast_cadence)
 
-        # Certainty-weighted sibling split with depth decay (x0.5) and floor
-        splits = ledger.split_among_siblings(0.04, [2.0, 0.0, -1.0], apply_depth_decay=True)
+        # Certainty-weighted sibling split with depth decay (x0.5), floor, and exact conservation
+        parent_budget = 0.04
+        splits = ledger.split_among_siblings(parent_budget, [2.0, 0.0, -1.0], apply_depth_decay=True)
         self.assertEqual(len(splits), 3)
         self.assertGreater(splits[0], splits[1])
         self.assertGreater(splits[1], splits[2])
         self.assertTrue(all(s >= ledger.min_branch_floor_usd for s in splits))
+        self.assertAlmostEqual(sum(splits), parent_budget * 0.5, places=5)
 
-        # Full end-to-end MainHarness run (3 starter agents -> recursive MiniHarnesses)
-        harness = MainHarness(client=client, starter_agents=3, hard_cap_usd=2.00, depth_dial=3, k_probes=3)
+        # When decayed pool (0.5 * 0.009 = 0.0045) can only fund 2 children at floor 0.002,
+        # asking for 4 siblings trims to 2 siblings and conserves pool!
+        tight_splits = ledger.split_among_siblings(0.009, [3.0, 2.0, 1.0, 0.0], apply_depth_decay=True)
+        self.assertEqual(len(tight_splits), 2)
+        self.assertTrue(all(s >= ledger.min_branch_floor_usd for s in tight_splits))
+        self.assertAlmostEqual(sum(tight_splits), 0.0045, places=5)
+
+        # Finish reserve protection: branches with open critic objections cannot touch finish reserve
+        tracker = PFPTracker()
+        unready = tracker.register_branch("u1", None, 0.0005, "fork_a", certainty_score=1.0)
+        tracker.update_branch("u1", open_critic_objections=1)
+        self.assertEqual(ledger.draw_from_finish_reserve(tracker.get("u1"), 0.002), 0.0)
+
+        # Near-conclusion branch (high certainty, 0 open critic objections) CAN draw from finish reserve
+        ready = tracker.register_branch("r1", None, 0.0005, "fork_b", certainty_score=1.0)
+        tracker.update_branch("r1", open_critic_objections=0)
+        drawn = ledger.draw_from_finish_reserve(tracker.get("r1"), 0.002)
+        self.assertEqual(drawn, 0.002)
+
+    def test_end_to_end_parallel_harness_and_budget_cap(self) -> None:
+        client = MockOpenAIClient()
+        harness = MainHarness(
+            client=client,
+            starter_agents=3,
+            hard_cap_usd=2.00,
+            depth_dial=3,
+            k_probes=3,
+        )
         result = harness.run("A small business's SSH works laptop->desktop but not desktop->laptop.")
         self.assertGreater(result["total_branches_spawned"], 3)
         self.assertEqual(len(result["scoreboard"]), result["total_branches_spawned"])
         self.assertGreater(result["events_count"], 0)
+
+        # Verify strict budget conservation: total_spent + unspent_branch_budgets + finish_reserve_remaining <= root_budget
+        b = result["budget"]
+        total_accounted = (
+            b["total_spent_usd"]
+            + b["unspent_branch_budgets_usd"]
+            + b["finish_reserve_remaining_usd"]
+        )
+        self.assertLessEqual(total_accounted, b["root_budget_usd"] + 1e-4)
+        self.assertLessEqual(b["root_budget_usd"], b["hard_cap_usd"])
+
+        # Verify no alive branch died mid-thought (all alive branches reached conclusion)
+        for rec in harness.tracker.active_branches():
+            has_conclusion = any("[Conclusion]" in step for step in rec.reasoning_trace)
+            self.assertTrue(has_conclusion, f"Branch {rec.id} did not conclude cleanly")
 
 
 if __name__ == "__main__":

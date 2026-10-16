@@ -1,33 +1,38 @@
 """
 Piece 2: Branch Spawner — directives, mini-harnesses, budget
-(Pass 1: literal implementation per DESIGN.md).
+(Pass 2: intent & refinement).
 
-Components:
-- Directive: compact packet per branch containing parent's reasoning so far
-  (compressed), the fork it's exploring, its state (Possible), its budget.
-- BudgetLedger:
-  * Root budget = 2 * difficulty_estimate (one cheap probe call sizes the
-    problem, then double as buffer). Single round, hard cap as safety rail
-    (user-set, default $2.00).
-  * Depth decay: each level gets a fraction of its parent (* 0.5).
-  * Certainty-weighted split among siblings, with a floor (never zero).
-  * NS cadence derived from budget: `cadence = expected_agent_seconds / budget_calls`.
-  * Kill conditions: budget exhausted, marked Fail, merged (Absorbed). No max depth.
-  * Finish reserve: 10-15% of root held back; exploration can't touch it,
-    only near-conclusion branches (high certainty, no open issues) can draw.
-  * Graceful degradation: as budget depletes, NS slows -> stops -> no new
-    spawns -> everything runs to conclusion.
-- MiniHarness: every branch *is* a harness carrying the same machinery
-  recursively (own divergence detection, own sub-branching, own NS cadence).
-- MainHarness: runs the top level (default 3 starter agents, or 9 at real scale);
-  mini-harnesses run subtrees; all events bubble up.
+Refinements in Pass 2 (by what was meant):
+- Strict budget conservation + floor-bounded depth decay:
+  * Child pool is strictly `0.5 * parent_available_budget`.
+  * Sibling allocations are certainty-weighted with a strict floor
+    (`min_branch_floor_usd`), AND bounded so `sum(child_budgets) == child_pool`.
+  * When `child_pool` can only fund `M < N` forks at the floor, the top `M`
+    forks (by certainty/support) are funded; when `child_pool < min_branch_floor_usd`,
+    spawning stops naturally via depth decay without needing a hard max-depth kill.
+- Progressive multi-stage graceful degradation ("NS slows -> stops -> no new
+  spawns -> everything runs to conclusion. Nothing dies mid-thought"):
+  * Stage 1 (Exploration): Plaus K-probe + NS blind variation on budget-derived
+    cadence (`cadence = max(1.0, expected_agent_seconds / budget_calls)`).
+  * Stage 2 (NS Stopped): As budget tightens, NS cadence slows and stops
+    (`ns_stopped = True`) before Plaus exploration is curtailed.
+  * Stage 3 (Exploitation / Conclusion): New spawns stop (`spawns_stopped = True`),
+    and the branch uses its protected conclusion reserve (or draws from the
+    10-15% root `finish_reserve` if near-conclusion: high certainty, zero open
+    critic objections) so nothing ever dies mid-thought.
+- Concurrent execution ("Not round-robin turns. All branches live at once, all
+  the time"): starter agents and child mini-harnesses execute concurrently via
+  `ThreadPoolExecutor`, synchronized through thread-safe `BudgetLedger` and `PFPTracker`.
 """
 
 from __future__ import annotations
 
 import json
+import math
+import threading
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .issue_detector import IssueDetectionResult, IssueDetector, ProbeContinuation
@@ -82,13 +87,14 @@ class HarnessEvent:
 
 class BudgetLedger:
     """
-    Single-round budget mechanics per Piece 2:
+    Thread-safe, single-round budget ledger per Piece 2:
     - Root budget = min(hard_cap, 2 * difficulty_estimate)
     - Finish reserve = 10-15% (default 12.5%) of root held back for near-conclusion
       branches (high certainty, no open critic issues).
     - Depth decay = 0.5 per level.
-    - Certainty-weighted split among siblings with a non-zero floor.
-    - NS cadence = expected_agent_seconds / budget_calls.
+    - Certainty-weighted split among siblings with a non-zero floor AND strict
+      conservation (`sum(splits) <= pool`).
+    - NS cadence = expected_agent_seconds / budget_calls (clamped to >= 1.0s baseline).
     """
 
     def __init__(
@@ -98,7 +104,8 @@ class BudgetLedger:
         depth_decay: float = 0.5,
         finish_reserve_ratio: float = 0.125,
         min_branch_floor_usd: float = 0.002,
-        expected_agent_seconds: float = 4.0,
+        conclusion_reserve_usd: float = 0.001,
+        expected_agent_seconds: float = 20.0,
         estimated_cost_per_call_usd: float = 0.0005,
         high_certainty_threshold: float = 0.0,
     ) -> None:
@@ -108,15 +115,18 @@ class BudgetLedger:
         self.depth_decay = depth_decay
         self.finish_reserve_ratio = finish_reserve_ratio
         self.min_branch_floor_usd = min_branch_floor_usd
+        self.conclusion_reserve_usd = conclusion_reserve_usd
         self.expected_agent_seconds = expected_agent_seconds
         self.estimated_cost_per_call_usd = max(1e-6, estimated_cost_per_call_usd)
         self.high_certainty_threshold = high_certainty_threshold
 
         self.difficulty_estimate_usd: float = 0.0
         self.root_budget_usd: float = 0.0
+        self.initial_finish_reserve_usd: float = 0.0
         self.finish_reserve_usd: float = 0.0
         self.exploration_pool_usd: float = 0.0
         self.total_spent_usd: float = 0.0
+        self._lock = threading.RLock()
 
     def size_problem_once(self, client: Any, problem: str) -> float:
         """
@@ -149,25 +159,44 @@ class BudgetLedger:
         except Exception:
             est = 0.05
 
-        self.difficulty_estimate_usd = max(est, probe_cost * 4.0)
-        self.root_budget_usd = min(self.hard_cap_usd, 2.0 * self.difficulty_estimate_usd)
-        self.finish_reserve_usd = round(self.root_budget_usd * self.finish_reserve_ratio, 6)
-        self.exploration_pool_usd = round(
-            max(0.0, self.root_budget_usd - self.finish_reserve_usd - probe_cost), 6
-        )
-        self.total_spent_usd = probe_cost
-        return self.root_budget_usd
+        with self._lock:
+            self.difficulty_estimate_usd = max(est, probe_cost * 4.0)
+            self.root_budget_usd = min(self.hard_cap_usd, 2.0 * self.difficulty_estimate_usd)
+            self.initial_finish_reserve_usd = round(self.root_budget_usd * self.finish_reserve_ratio, 6)
+            self.finish_reserve_usd = self.initial_finish_reserve_usd
+            self.exploration_pool_usd = round(
+                max(0.0, self.root_budget_usd - self.finish_reserve_usd - probe_cost), 6
+            )
+            self.total_spent_usd = round(probe_cost, 6)
+            return self.root_budget_usd
+
+    def record_spend(self, amount_usd: float) -> float:
+        with self._lock:
+            self.total_spent_usd = round(self.total_spent_usd + max(0.0, amount_usd), 6)
+            return self.total_spent_usd
 
     def compute_ns_cadence(self, branch_budget: float) -> float:
         """
         NS cadence derived from budget:
             cadence = expected_agent_seconds / budget_calls
         Tight budget -> slower cadence.
+        When spendable budget calls <= 0, returns inf (NS stopped).
         """
-        budget_calls = branch_budget / self.estimated_cost_per_call_usd
-        if budget_calls <= 0:
+        spendable = max(0.0, branch_budget - self.conclusion_reserve_usd)
+        budget_calls = spendable / self.estimated_cost_per_call_usd
+        if budget_calls <= 0.0:
             return float("inf")
         return self.expected_agent_seconds / budget_calls
+
+    def max_fundable_siblings(self, parent_budget: float, apply_depth_decay: bool = True) -> int:
+        """
+        Determine how many children can be funded at or above `min_branch_floor_usd`
+        from the decayed child pool (`parent_budget * depth_decay`).
+        """
+        pool = parent_budget * (self.depth_decay if apply_depth_decay else 1.0)
+        if pool < self.min_branch_floor_usd:
+            return 0
+        return int(pool // self.min_branch_floor_usd)
 
     def split_among_siblings(
         self,
@@ -177,25 +206,38 @@ class BudgetLedger:
     ) -> List[float]:
         """
         Depth decay (x0.5 of parent) + Certainty-weighted split among siblings,
-        with a floor (enough to prove itself or die, never zero).
+        with a floor (enough to prove itself or die, never zero) and exact budget
+        conservation (`sum(allocations) == pool`).
         """
         n = len(certainty_scores)
         if n == 0:
             return []
 
-        pool = parent_budget * (self.depth_decay if apply_depth_decay else 1.0)
-        if pool <= 0:
-            return [self.min_branch_floor_usd for _ in range(n)]
+        pool = round(parent_budget * (self.depth_decay if apply_depth_decay else 1.0), 6)
+        max_n = int(pool // self.min_branch_floor_usd)
+        if max_n <= 0:
+            return []
 
-        # Shift certainty scores so weights are strictly positive
-        min_score = min(certainty_scores)
-        shifted = [(s - min_score) + 1.0 for s in certainty_scores]
-        total_weight = sum(shifted)
+        active_scores = list(certainty_scores[:max_n])
+        k = len(active_scores)
+        floor_total = round(k * self.min_branch_floor_usd, 6)
+        surplus = max(0.0, pool - floor_total)
+
+        # Softmax / positive-shifted weights so higher certainty gets a larger share of surplus
+        min_s = min(active_scores)
+        weights = [math.exp(min(10.0, (s - min_s))) for s in active_scores]
+        w_sum = sum(weights) or float(k)
 
         allocations: List[float] = []
-        for w in shifted:
-            raw_share = pool * (w / total_weight)
-            allocations.append(max(self.min_branch_floor_usd, round(raw_share, 6)))
+        allocated_so_far = 0.0
+        for idx, w in enumerate(weights):
+            if idx == k - 1:
+                share = max(self.min_branch_floor_usd, round(pool - allocated_so_far, 6))
+            else:
+                share = round(self.min_branch_floor_usd + surplus * (w / w_sum), 6)
+                allocated_so_far = round(allocated_so_far + share, 6)
+            allocations.append(share)
+
         return allocations
 
     def draw_from_finish_reserve(
@@ -207,17 +249,18 @@ class BudgetLedger:
         Finish reserve: 10-15% of root held back; exploration can't touch it,
         only near-conclusion branches (high certainty, no open issues) can draw.
         """
-        is_near_conclusion = (
-            record.state == BranchState.POSSIBLE
-            and record.certainty_score >= self.high_certainty_threshold
-            and record.open_critic_objections == 0
-        )
-        if not is_near_conclusion or self.finish_reserve_usd <= 0.0:
-            return 0.0
+        with self._lock:
+            is_near_conclusion = (
+                record.state == BranchState.POSSIBLE
+                and record.certainty_score >= self.high_certainty_threshold
+                and record.open_critic_objections == 0
+            )
+            if not is_near_conclusion or self.finish_reserve_usd <= 0.0:
+                return 0.0
 
-        granted = min(self.finish_reserve_usd, requested_usd)
-        self.finish_reserve_usd = round(self.finish_reserve_usd - granted, 6)
-        return granted
+            granted = round(min(self.finish_reserve_usd, max(0.0, requested_usd)), 6)
+            self.finish_reserve_usd = round(self.finish_reserve_usd - granted, 6)
+            return granted
 
 
 def compress_parent_reasoning(client: Any, reasoning_trace: Sequence[str]) -> tuple[str, float]:
@@ -248,7 +291,7 @@ def compress_parent_reasoning(client: Any, reasoning_trace: Sequence[str]) -> tu
 
 class MiniHarness:
     """
-    Piece 2 Mini-harness:
+    Piece 2 Mini-harness (Pass 2 refined):
     Every branch *is* a harness — carries the same machinery recursively
     (own divergence detection, own sub-branching, own NS cadence).
     Updates its own record in PFPTracker and bubbles all events up to parent/main.
@@ -268,6 +311,7 @@ class MiniHarness:
         budget_ledger: BudgetLedger,
         event_sink: Callable[[HarnessEvent], None],
         branch_counter: Callable[[], str],
+        initial_certainty: float = 0.0,
     ) -> None:
         self.branch_id = branch_id
         self.parent_id = parent_id
@@ -281,11 +325,13 @@ class MiniHarness:
         self.event_sink = event_sink
         self.branch_counter = branch_counter
 
+        self.initial_budget: float = max(1e-6, directive.budget)
         self.children: List[MiniHarness] = []
         self.ns_cadence_s: float = self.budget_ledger.compute_ns_cadence(directive.budget)
         self.last_ns_tick: float = time.time()
         self.ns_stopped: bool = False
         self.spawns_stopped: bool = False
+        self.degradation_stage: str = "exploration"
         self.concluded: bool = False
         self.conclusion_text: Optional[str] = None
 
@@ -296,7 +342,8 @@ class MiniHarness:
             budget_remaining=self.directive.budget,
             fork_under_exploration=self.directive.fork_exploring,
             state=self.directive.state,
-            certainty_score=0.0,
+            certainty_score=initial_certainty,
+            depth=self.depth,
         )
         if self.directive.parent_reasoning_compressed:
             self.tracker.update_branch(
@@ -324,33 +371,76 @@ class MiniHarness:
         )
         self.event_sink(evt)
 
-    def _spend(self, cost_usd: float, reason: str) -> None:
+    def _spend(self, cost_usd: float, reason: str) -> float:
         rec = self.tracker.get(self.branch_id)
-        new_budget = max(0.0, rec.budget_remaining - cost_usd)
-        self.budget_ledger.total_spent_usd += cost_usd
+        actual_deducted = min(rec.budget_remaining, max(0.0, cost_usd))
+        new_budget = round(max(0.0, rec.budget_remaining - actual_deducted), 6)
+        self.budget_ledger.record_spend(actual_deducted)
         self.tracker.update_branch(self.branch_id, budget_remaining=new_budget)
         self.ns_cadence_s = self.budget_ledger.compute_ns_cadence(new_budget)
         self._emit(
             "budget_change",
             {
                 "reason": reason,
-                "spent_usd": round(cost_usd, 6),
+                "spent_usd": round(actual_deducted, 6),
                 "budget_remaining": round(new_budget, 6),
                 "ns_cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
             },
         )
+        self._evaluate_graceful_degradation(new_budget)
+        return new_budget
 
-    def _refresh_certainty(self, open_objections: Optional[int] = None) -> float:
+    def _evaluate_graceful_degradation(self, current_budget: float) -> str:
+        """
+        Progressive graceful degradation per Piece 2:
+        As budget depletes, NS slows -> stops -> no new spawns -> everything runs
+        to conclusion. Exploration degrades into exploitation. Nothing dies mid-thought.
+        """
+        ratio = current_budget / self.initial_budget
+        can_fund_child = (
+            self.budget_ledger.max_fundable_siblings(
+                max(0.0, current_budget - self.budget_ledger.conclusion_reserve_usd),
+                apply_depth_decay=True,
+            )
+            >= 1
+        )
+
+        prev_stage = self.degradation_stage
+        if not can_fund_child or ratio <= 0.25 or current_budget <= self.budget_ledger.min_branch_floor_usd * 2.0:
+            self.ns_stopped = True
+            self.spawns_stopped = True
+            self.degradation_stage = "exploitation_only"
+        elif ratio <= 0.45 or self.ns_cadence_s == float("inf"):
+            self.ns_stopped = True
+            self.degradation_stage = "ns_stopped"
+        else:
+            self.degradation_stage = "exploration"
+
+        if self.degradation_stage != prev_stage:
+            self._emit(
+                "degrade",
+                {
+                    "from_stage": prev_stage,
+                    "to_stage": self.degradation_stage,
+                    "ns_stopped": self.ns_stopped,
+                    "spawns_stopped": self.spawns_stopped,
+                    "budget_remaining": round(current_budget, 6),
+                },
+            )
+        return self.degradation_stage
+
+    def _refresh_certainty(self, open_objections: Optional[int] = None, support_bonus: float = 0.0) -> float:
         rec = self.tracker.get(self.branch_id)
         if open_objections is not None:
             rec.open_critic_objections = open_objections
         age_untested = max(0.0, time.time() - rec.last_tested_at)
-        score = self.detector.compute_certainty(
+        base_score = self.detector.compute_certainty(
             survived_falsifications=rec.survived_falsifications,
             merges_attracted=rec.merges_attracted,
             open_critic_objections=rec.open_critic_objections,
             seconds_since_last_test=age_untested,
         )
+        score = round(base_score + support_bonus, 4)
         self.tracker.update_branch(self.branch_id, certainty_score=score)
         return score
 
@@ -375,28 +465,56 @@ class MiniHarness:
         trigger: str,
     ) -> List[MiniHarness]:
         rec = self.tracker.get(self.branch_id)
-        if not forks or self.spawns_stopped or rec.budget_remaining <= self.budget_ledger.min_branch_floor_usd:
+        if not forks or self.spawns_stopped:
             return []
+
+        # Hold back conclusion_reserve_usd on the parent so the parent never dies mid-thought
+        spendable_for_branching = max(0.0, rec.budget_remaining - self.budget_ledger.conclusion_reserve_usd)
+        max_kids = self.budget_ledger.max_fundable_siblings(spendable_for_branching, apply_depth_decay=True)
+        if max_kids <= 0:
+            self._evaluate_graceful_degradation(rec.budget_remaining)
+            return []
+
+        # Order candidate forks by behavioral cluster support_score so if budget only funds M < N,
+        # the highest-confidence forks are prioritized
+        ordered_forks = sorted(forks, key=lambda f: f.support_score, reverse=True)[:max_kids]
 
         compressed, comp_cost = compress_parent_reasoning(self.client, rec.reasoning_trace)
         if comp_cost > 0:
             self._spend(comp_cost, "directive_compression")
 
         rec = self.tracker.get(self.branch_id)
-        # Sibling certainty weights (initial scores before selection reveals differences)
-        sibling_scores = [rec.certainty_score for _ in forks]
+        spendable_for_branching = max(0.0, rec.budget_remaining - self.budget_ledger.conclusion_reserve_usd)
+        sibling_scores = [rec.certainty_score + f.support_score for f in ordered_forks]
         child_budgets = self.budget_ledger.split_among_siblings(
-            parent_budget=rec.budget_remaining,
+            parent_budget=spendable_for_branching,
             certainty_scores=sibling_scores,
             apply_depth_decay=True,
         )
+        if not child_budgets:
+            self._evaluate_graceful_degradation(rec.budget_remaining)
+            return []
 
-        # Deduct the decayed child pool (0.5 * parent_budget) from parent
-        allocated_pool = min(rec.budget_remaining, rec.budget_remaining * self.budget_ledger.depth_decay)
-        self._spend(allocated_pool, f"spawn_{trigger}_children")
+        ordered_forks = ordered_forks[: len(child_budgets)]
+        total_child_pool = round(sum(child_budgets), 6)
+
+        # Transfer child pool from parent to children (not spent on API yet, just re-allocated)
+        new_parent_budget = round(max(0.0, rec.budget_remaining - total_child_pool), 6)
+        self.tracker.update_branch(self.branch_id, budget_remaining=new_parent_budget)
+        self.ns_cadence_s = self.budget_ledger.compute_ns_cadence(new_parent_budget)
+        self._emit(
+            "budget_change",
+            {
+                "reason": f"allocate_{trigger}_children_pool",
+                "allocated_to_children_usd": total_child_pool,
+                "budget_remaining": new_parent_budget,
+                "ns_cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
+            },
+        )
+        self._evaluate_graceful_degradation(new_parent_budget)
 
         spawned: List[MiniHarness] = []
-        for fork, c_budget in zip(forks, child_budgets):
+        for fork, c_budget in zip(ordered_forks, child_budgets):
             child_id = self.branch_counter()
             directive = Directive(
                 parent_reasoning_compressed=compressed,
@@ -416,6 +534,7 @@ class MiniHarness:
                 budget_ledger=self.budget_ledger,
                 event_sink=self.event_sink,
                 branch_counter=self.branch_counter,
+                initial_certainty=round(fork.support_score, 4),
             )
             child.tracker.update_branch(
                 child_id,
@@ -429,10 +548,22 @@ class MiniHarness:
             {
                 "trigger": trigger,
                 "children_ids": [c.branch_id for c in spawned],
-                "forks": [f.fork_id for f in forks],
+                "forks": [f.fork_id for f in ordered_forks],
+                "child_budgets": [round(b, 6) for b in child_budgets],
             },
         )
         return spawned
+
+    def _run_children_parallel(self, children: Sequence[MiniHarness]) -> None:
+        if not children:
+            return
+        if len(children) == 1:
+            children[0].step()
+            return
+        with ThreadPoolExecutor(max_workers=len(children)) as pool:
+            futs = [pool.submit(c.step) for c in children]
+            for f in as_completed(futs):
+                f.result()
 
     def _run_to_conclusion(self) -> None:
         """
@@ -441,14 +572,14 @@ class MiniHarness:
         nothing dies mid-thought. Near-conclusion branches can draw from finish reserve.
         """
         rec = self.tracker.get(self.branch_id)
-        if rec.budget_remaining < self.budget_ledger.min_branch_floor_usd:
+        if rec.budget_remaining <= self.budget_ledger.conclusion_reserve_usd:
             reserve_drawn = self.budget_ledger.draw_from_finish_reserve(
-                rec, self.budget_ledger.min_branch_floor_usd * 2.0
+                rec, self.budget_ledger.min_branch_floor_usd
             )
             if reserve_drawn > 0:
                 self.tracker.update_branch(
                     self.branch_id,
-                    budget_remaining=rec.budget_remaining + reserve_drawn,
+                    budget_remaining=round(rec.budget_remaining + reserve_drawn, 6),
                 )
                 self._emit(
                     "budget_change",
@@ -486,8 +617,8 @@ class MiniHarness:
 
     def step(self, force_ns_check: bool = False) -> None:
         """
-        Execute one reasoning + divergence cycle on this MiniHarness, and recursively
-        step any spawned child mini-harnesses.
+        Execute reasoning + divergence cycle on this MiniHarness, and concurrently
+        run any spawned child mini-harnesses.
         """
         killed, reason = self.is_killed()
         if killed:
@@ -495,38 +626,31 @@ class MiniHarness:
             return
 
         rec = self.tracker.get(self.branch_id)
+        stage = self._evaluate_graceful_degradation(rec.budget_remaining)
 
-        # Graceful degradation check: as budget depletes, NS slows -> stops -> no new spawns -> conclude
-        low_budget_threshold = self.budget_ledger.min_branch_floor_usd * 3.0
-        if rec.budget_remaining <= low_budget_threshold:
-            self.ns_stopped = True
-            self.spawns_stopped = True
-            self._emit(
-                "degrade",
-                {
-                    "stage": "exploitation_only",
-                    "ns_stopped": True,
-                    "spawns_stopped": True,
-                    "budget_remaining": round(rec.budget_remaining, 6),
-                },
-            )
+        if stage == "exploitation_only":
             self._run_to_conclusion()
             return
 
         # 1. Plaus issue detection: fire K blind continuations & read issue off divergence
         parent_context = " | ".join(rec.reasoning_trace) or self.directive.parent_reasoning_compressed
+        known_forks = self.tracker.known_forks_in_lineage(self.branch_id)
         plaus_res: IssueDetectionResult = self.detector.detect_plaus(
             problem=self.problem,
             parent_reasoning=parent_context,
             depth=self.depth,
+            known_forks=known_forks,
         )
         self._spend(plaus_res.cost_usd, "plaus_issue_detection")
-        self._refresh_certainty(open_objections=len(plaus_res.unjustified_leaps))
+        cluster_bonus = plaus_res.distinct_forks[0].support_score if plaus_res.distinct_forks else 0.0
+        self._refresh_certainty(
+            open_objections=len(plaus_res.unjustified_leaps),
+            support_bonus=cluster_bonus,
+        )
 
         if plaus_res.should_split and not self.spawns_stopped:
             children = self._spawn_children_from_forks(plaus_res.distinct_forks, trigger="plaus")
-            for child in children:
-                child.step()
+            self._run_children_parallel(children)
         else:
             # Continuations clustered -> no issue, merge/consolidate and flow straight
             if plaus_res.merged_continuation:
@@ -535,14 +659,13 @@ class MiniHarness:
                     reasoning_step=f"[Clustered flow] {plaus_res.merged_continuation}",
                 )
 
-        # 2. Check NS (natural selection) blind fan-out cadence if budget remains
+        # 2. Check NS (natural selection) blind fan-out cadence if still in exploration stage
         rec = self.tracker.get(self.branch_id)
         now = time.time()
         elapsed_since_ns = now - self.last_ns_tick
         if (
             not self.ns_stopped
             and not self.spawns_stopped
-            and rec.budget_remaining > low_budget_threshold
             and (force_ns_check or elapsed_since_ns >= self.ns_cadence_s)
         ):
             self.last_ns_tick = now
@@ -551,21 +674,21 @@ class MiniHarness:
                 parent_reasoning=" | ".join(rec.reasoning_trace),
                 depth=self.depth,
                 fanout_count=1,
+                known_forks=self.tracker.known_forks_in_lineage(self.branch_id),
             )
             self._spend(ns_res.cost_usd, "ns_blind_variation")
             self._emit(
                 "ns_tick",
                 {
-                    "cadence_s": round(self.ns_cadence_s, 4),
+                    "cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
                     "spawned_count": len(ns_res.distinct_forks),
                 },
             )
-            if ns_res.should_split:
+            if ns_res.should_split and not self.spawns_stopped:
                 ns_children = self._spawn_children_from_forks(ns_res.distinct_forks, trigger="ns")
-                for ns_child in ns_children:
-                    ns_child.step()
+                self._run_children_parallel(ns_children)
 
-        # 3. Conclude this branch if it hasn't concluded yet and still has alive state
+        # 3. Conclude this branch cleanly so nothing dies mid-thought
         if not self.concluded and self.tracker.get(self.branch_id).is_alive:
             self._run_to_conclusion()
 
@@ -576,8 +699,8 @@ class MainHarness:
     - Sizes the problem in one cheap probe call (`root_budget = 2 * difficulty_estimate`,
       capped at `hard_cap_usd`, with 10-15% `finish_reserve`).
     - Spawns starter agents (default 3 for demo scale, configurable to 9 for real scale).
-    - Each starter agent is a recursive `MiniHarness`; all events bubble up to `self.events`.
-    - Aggregates all branch states in `self.tracker` (`PFPTracker`).
+    - Runs all starter MiniHarnesses concurrently ("All branches live at once, all the time").
+    - Aggregates all branch states in `self.tracker` (`PFPTracker`) and events in `self.events`.
     """
 
     def __init__(
@@ -597,27 +720,29 @@ class MainHarness:
         self.events: List[HarnessEvent] = []
         self.starters: List[MiniHarness] = []
         self._seq = 0
+        self._lock = threading.RLock()
 
     def _next_branch_id(self) -> str:
-        self._seq += 1
-        return f"branch_{self._seq:04d}"
+        with self._lock:
+            self._seq += 1
+            return f"branch_{self._seq:04d}"
 
     def _on_event(self, event: HarnessEvent) -> None:
-        self.events.append(event)
+        with self._lock:
+            self.events.append(event)
 
     def run(self, problem: str, force_ns_on_starters: bool = True) -> Dict[str, Any]:
         """
         Run the Phase 1 harness (Pieces 1-3) on `problem`:
         1. Size the problem once to establish single-round root budget and finish reserve.
-        2. Fire starter probe to seed `starter_agents` initial MiniHarnesses.
-        3. Run each starter MiniHarness (which recursively detects Plaus/NS splits,
-           spawns sub-branches with decayed certainty-weighted budgets, and degrades
-           gracefully to conclusion).
+        2. Split exploration pool across `starter_agents` initial MiniHarnesses.
+        3. Run all starter MiniHarnesses in parallel; each recursively detects Plaus/NS
+           splits, spawns sub-branches with decayed certainty-weighted budgets, and
+           degrades gracefully to conclusion.
         4. Return aggregated tracker scoreboard, budget ledger summary, and event stream.
         """
         self.budget_ledger.size_problem_once(self.client, problem)
 
-        # Split exploration pool across starter agents
         starter_scores = [0.0 for _ in range(self.starter_agents)]
         starter_budgets = self.budget_ledger.split_among_siblings(
             parent_budget=self.budget_ledger.exploration_pool_usd,
@@ -625,13 +750,13 @@ class MainHarness:
             apply_depth_decay=False,
         )
 
-        for idx in range(self.starter_agents):
+        for idx, s_budget in enumerate(starter_budgets):
             b_id = self._next_branch_id()
             directive = Directive(
                 parent_reasoning_compressed="Root arena entry — starter agent.",
                 fork_exploring=f"starter_agent_{idx + 1}",
                 state=BranchState.POSSIBLE,
-                budget=starter_budgets[idx],
+                budget=s_budget,
             )
             mini = MiniHarness(
                 branch_id=b_id,
@@ -648,8 +773,18 @@ class MainHarness:
             )
             self.starters.append(mini)
 
-        for mini in self.starters:
-            mini.step(force_ns_check=force_ns_on_starters)
+        # All starter branches live at once in parallel
+        with ThreadPoolExecutor(max_workers=max(1, len(self.starters))) as pool:
+            futs = [
+                pool.submit(mini.step, force_ns_on_starters)
+                for mini in self.starters
+            ]
+            for f in as_completed(futs):
+                f.result()
+
+        remaining_across_branches = round(
+            sum(r.budget_remaining for r in self.tracker.all_records()), 6
+        )
 
         return {
             "problem": problem,
@@ -659,9 +794,11 @@ class MainHarness:
             "budget": {
                 "difficulty_estimate_usd": round(self.budget_ledger.difficulty_estimate_usd, 6),
                 "root_budget_usd": round(self.budget_ledger.root_budget_usd, 6),
-                "finish_reserve_usd": round(self.budget_ledger.finish_reserve_usd, 6),
+                "initial_finish_reserve_usd": round(self.budget_ledger.initial_finish_reserve_usd, 6),
+                "finish_reserve_remaining_usd": round(self.budget_ledger.finish_reserve_usd, 6),
                 "exploration_pool_usd": round(self.budget_ledger.exploration_pool_usd, 6),
                 "total_spent_usd": round(self.budget_ledger.total_spent_usd, 6),
+                "unspent_branch_budgets_usd": remaining_across_branches,
                 "hard_cap_usd": round(self.budget_ledger.hard_cap_usd, 6),
             },
             "total_branches_spawned": len(self.tracker.all_records()),

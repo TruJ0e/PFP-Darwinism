@@ -1,27 +1,18 @@
 """
-Piece 1: Issue Detector — when to split (Pass 1: literal implementation per DESIGN.md).
+Piece 1: Issue Detector — when to split (Pass 2: intent & refinement).
 
-Core mechanism:
-- Branch first, read the issue off the divergence.
-- At each step, fire K diverse continuations blind (high temperature, cheap).
-- If they cluster — no issue, merge and flow straight.
-- If they genuinely split — that split *is* the issue, discovered not predicted.
-
-Two split triggers:
-- Plaus: measurable uncertainty —
-  (a) divergence across probe continuations (primary, behavioral),
-  (b) token entropy via logprobs (cheap, noisy),
-  (c) critic pass listing unjustified leaps.
-- NS: blind fan-out on cadence (every 1–2s per agent, budget-derived).
-  The mutation rate catching unknown unknowns.
-
-Branch count: bounded by novelty exhaustion (stop when new continuations are
-remixes) and the depth dial.
-
-Certainty ranking:
-survived falsifications (big plus), merges attracted (plus), open critic
-objections (minus), age-without-testing (decays). Certainty is revealed by
-selection, not computed upfront. Score weights are tunable dials.
+Refinements in Pass 2 (by what was meant):
+- Cluster consolidation & support scoring (`cluster_size`, `support_score`):
+  when multiple K blind continuations converge on the same fork, their reasoning
+  is consolidated and `cluster_size` is tracked so sibling resource allocation
+  knows which fork had stronger behavioral convergence vs. singletons.
+- Cross-lineage novelty exhaustion (`known_forks`): filters out continuations
+  that are remixes not only of earlier probes in the current K-batch, but also
+  of forks already explored by ancestors or siblings in the arena.
+- Tri-signal Plaus synthesis: when surface probes cluster onto a single path,
+  yet logprob token entropy is high AND the critic pass flags multiple
+  unjustified leaps, the detector converts the critic's unjustified leaps into
+  explicit challenge forks so hidden uncertainty still splits properly.
 """
 
 from __future__ import annotations
@@ -30,7 +21,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, List, Optional, Sequence, Set
 
 
 @dataclass
@@ -55,6 +46,8 @@ class ProbeContinuation:
     fork_description: str
     reasoning: str
     token_entropy: float = 0.0
+    cluster_size: int = 1
+    support_score: float = 0.0
     raw_content: str = ""
 
 
@@ -149,8 +142,10 @@ def _parse_probe_json(raw_text: str, idx: int) -> ProbeContinuation:
 
 class IssueDetector:
     """
-    Piece 1: Issue detector.
+    Piece 1: Issue detector (Pass 2 refined).
     - Fires K blind continuations at high temperature to read issues off behavioral divergence.
+    - Clusters similar probes (tracking `cluster_size` and consolidating reasoning) while
+      enforcing novelty exhaustion against both in-batch probes and `known_forks` in the lineage.
     - Combines behavioral divergence (primary), token logprob entropy (cheap/noisy),
       and critic pass listing unjustified leaps (Plaus trigger).
     - Supports NS blind fan-out on budget-derived cadence (NS trigger).
@@ -229,37 +224,65 @@ class IssueDetector:
             leaps = [raw.strip()] if raw.strip() else []
         return leaps, cost
 
-    def _deduplicate_by_novelty(
+    def _cluster_and_deduplicate(
         self,
         continuations: Sequence[ProbeContinuation],
         max_branches: int,
+        known_forks: Sequence[str] = (),
     ) -> tuple[List[ProbeContinuation], bool]:
         """
-        Filter probe continuations until novelty is exhausted (new continuations are remixes
-        of already-accepted forks) or bounded by depth_dial / max_branches.
+        Cluster probe continuations and filter against `known_forks` until novelty is
+        exhausted (new continuations are remixes of already-accepted forks) or bounded
+        by `max_branches` (from `depth_dial`).
         """
         distinct: List[ProbeContinuation] = []
         novelty_exhausted = False
+        total_probes = max(1, len(continuations))
 
         for cand in continuations:
-            is_remix = False
+            cand_text = f"{cand.fork_description} {cand.reasoning}"
+
+            # Check if candidate is a remix of an already-explored ancestor/sibling fork
+            already_known = False
+            for kf in known_forks:
+                if kf == cand.fork_description or _jaccard_similarity(cand.fork_description, kf) >= self.similarity_threshold:
+                    already_known = True
+                    break
+            if already_known:
+                novelty_exhausted = True
+                continue
+
+            # Check if candidate clusters with an existing fork in this probe batch
+            matched_cluster: Optional[ProbeContinuation] = None
             for existing in distinct:
                 if cand.fork_id == existing.fork_id:
-                    is_remix = True
+                    matched_cluster = existing
                     break
                 sim = _jaccard_similarity(
-                    f"{cand.fork_description} {cand.reasoning}",
+                    cand_text,
                     f"{existing.fork_description} {existing.reasoning}",
                 )
                 if sim >= self.similarity_threshold:
-                    is_remix = True
+                    matched_cluster = existing
                     break
-            if is_remix:
+
+            if matched_cluster is not None:
                 novelty_exhausted = True
+                matched_cluster.cluster_size += 1
+                if cand.reasoning not in matched_cluster.reasoning:
+                    matched_cluster.reasoning = f"{matched_cluster.reasoning} | {cand.reasoning}"
                 continue
-            distinct.append(cand)
-            if len(distinct) >= max_branches:
-                break
+
+            if len(distinct) < max_branches:
+                distinct.append(cand)
+            else:
+                novelty_exhausted = True
+
+        # Compute initial support_score for each cluster based on convergence & inverse entropy
+        for cluster in distinct:
+            convergence_bonus = (cluster.cluster_size / float(total_probes)) * 1.5
+            entropy_penalty = cluster.token_entropy * 0.25
+            cluster.support_score = round(convergence_bonus - entropy_penalty, 4)
 
         return distinct, novelty_exhausted
 
@@ -268,13 +291,17 @@ class IssueDetector:
         problem: str,
         parent_reasoning: str,
         depth: int = 0,
+        known_forks: Sequence[str] = (),
+        k_override: Optional[int] = None,
     ) -> IssueDetectionResult:
         """
         Fire K diverse continuations blind (high temperature, cheap).
-        - If they cluster -> no issue, merge and flow straight.
-        - If they genuinely split -> that split *is* the issue, discovered not predicted.
-        Also computes token entropy via logprobs and runs the critic pass listing unjustified leaps.
+        - If they cluster (and critic/entropy don't flag hidden leaps) -> no issue,
+          merge and flow straight.
+        - If they genuinely split (or high entropy + critic leaps expose hidden forks) ->
+          that split *is* the issue, discovered not predicted.
         """
+        num_probes = max(1, k_override if k_override is not None else self.k_probes)
         prompt = (
             f"probe_continuation depth={depth}\n"
             f"Fire K diverse continuations for problem: {problem}\n"
@@ -287,7 +314,7 @@ class IssueDetector:
             max_tokens=200,
             logprobs=True,
             top_logprobs=4,
-            n=self.k_probes,
+            n=num_probes,
         )
         total_cost = float(resp.usage.cost_usd)
 
@@ -307,17 +334,36 @@ class IssueDetector:
 
         # Bound branch count by novelty exhaustion and the depth dial
         max_allowed = max(1, self.depth_dial - depth)
-        distinct_forks, novelty_exhausted = self._deduplicate_by_novelty(
-            probes, max_branches=max_allowed
+        distinct_forks, novelty_exhausted = self._cluster_and_deduplicate(
+            probes,
+            max_branches=max_allowed,
+            known_forks=known_forks,
         )
 
-        # Primary behavioral trigger: >1 genuinely distinct clusters
-        behavioral_split = len(distinct_forks) > 1
         entropy_high = mean_entropy >= self.entropy_threshold
-        has_critic_leaps = len(leaps) > 0
+
+        # Secondary Plaus synthesis: if surface continuations clustered into <=1 fork,
+        # but high token entropy + multiple critic leaps indicate an unaddressed hidden fork,
+        # turn the critic leaps into explicit alternative forks (up to max_allowed).
+        if len(distinct_forks) <= 1 and entropy_high and len(leaps) >= 2 and max_allowed > 1:
+            for idx, leap in enumerate(leaps):
+                if len(distinct_forks) >= max_allowed:
+                    break
+                distinct_forks.append(
+                    ProbeContinuation(
+                        fork_id=f"critic_leap_fork_{idx + 1}",
+                        fork_description=f"Resolve critic leap: {leap}",
+                        reasoning=f"Testing assumption flagged by critic: {leap}",
+                        token_entropy=mean_entropy,
+                        cluster_size=1,
+                        support_score=0.1,
+                    )
+                )
+
+        behavioral_split = len(distinct_forks) > 1
 
         if behavioral_split:
-            fork_names = ", ".join(f.fork_id for f in distinct_forks)
+            fork_names = ", ".join(f"{f.fork_id}(n={f.cluster_size})" for f in distinct_forks)
             issue_summary = (
                 f"Plaus divergence discovered across {len(distinct_forks)} forks [{fork_names}] "
                 f"(entropy={mean_entropy:.2f}, critic_leaps={len(leaps)})"
@@ -345,7 +391,7 @@ class IssueDetector:
             trigger=None,
             issue_summary=(
                 f"Continuations clustered into 1 path "
-                f"(entropy_high={entropy_high}, critic_leaps={ has_critic_leaps }) — flowing straight."
+                f"(entropy_high={entropy_high}, critic_leaps={len(leaps)}) — flowing straight."
             ),
             distinct_forks=distinct_forks,
             merged_continuation=consolidated,
@@ -361,6 +407,7 @@ class IssueDetector:
         parent_reasoning: str,
         depth: int = 0,
         fanout_count: int = 2,
+        known_forks: Sequence[str] = (),
     ) -> IssueDetectionResult:
         """
         NS (natural selection): blind fan-out on cadence with no trigger.
@@ -389,8 +436,10 @@ class IssueDetector:
             p.token_entropy = compute_token_entropy_from_choice(ch)
             probes.append(p)
 
-        distinct_forks, novelty_exhausted = self._deduplicate_by_novelty(
-            probes, max_branches=max_allowed
+        distinct_forks, novelty_exhausted = self._cluster_and_deduplicate(
+            probes,
+            max_branches=max_allowed,
+            known_forks=known_forks,
         )
         mean_entropy = (
             sum(p.token_entropy for p in probes) / len(probes) if probes else 0.0
