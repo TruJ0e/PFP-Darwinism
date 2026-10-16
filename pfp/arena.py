@@ -349,6 +349,108 @@ class TronArenaRenderer:
             "winners_box": winners_box,
         }
 
+    def render_spatial_grid(
+        self,
+        state: Dict[str, Any],
+        height: int = 16,
+    ) -> List[str]:
+        """
+        Pass 2 refinement: 2D spatial Tron light-cycle arena grid (`width x height`).
+        - Center column (`mid_x`) is the glowing Verified Main Line (`║`).
+        - Starter agents drop from row 0 at distinct horizontal lanes (`▼`), leaving
+          vertical light-cycle trails (`│`).
+        - Plaus / NS splits fan out horizontally (`╭──┴──╮`) into child lanes.
+        - Failed branches veer into the center Verified Main Line (`═══X╣`) and die (`✖`).
+        - Merged branches converge inward (`╰──>[M]<──╯`) into a unified child lane.
+        - Passing survivors ride the verified trunk down to the bottom exit (`╚══> [WINNER'S BOX]`).
+        """
+        w = self.width - 4
+        h = max(12, height)
+        mid_x = w // 2
+        grid = [[" " for _ in range(w)] for _ in range(h)]
+
+        # Draw center Verified Main Line (trunk)
+        for r in range(h):
+            grid[r][mid_x] = "║"
+
+        starters = state["starters"]
+        lane_x: Dict[str, int] = {}
+        starter_lanes = [max(4, mid_x - 30), max(8, mid_x - 14), min(w - 6, mid_x + 18)]
+        for idx, sid in enumerate(starters):
+            lx = starter_lanes[idx % len(starter_lanes)]
+            if lx == mid_x:
+                lx += 6
+            lane_x[sid] = lx
+            if 0 <= lx < w:
+                grid[0][lx] = "▼"
+                for r in range(1, min(4, h)):
+                    grid[r][lx] = "│"
+
+        # Assign lanes for children from splits
+        row_cursor = 3
+        for sp in state["splits"]:
+            pid = sp["parent_id"]
+            px = lane_x.get(pid, max(6, mid_x - 20))
+            kids = sp["children_ids"]
+            if row_cursor < h - 3:
+                for idx, cid in enumerate(kids):
+                    offset = (idx - (len(kids) // 2)) * 5
+                    if offset == 0:
+                        offset = 4
+                    cx = max(2, min(w - 3, px + offset))
+                    if cx == mid_x:
+                        cx = min(w - 3, cx + 3)
+                    lane_x[cid] = cx
+                    lo, hi = min(px, cx), max(px, cx)
+                    for x in range(lo, hi + 1):
+                        if x != mid_x and grid[row_cursor][x] == " ":
+                            grid[row_cursor][x] = "─"
+                    grid[row_cursor][cx] = "╮" if cx > px else "╭"
+                    if row_cursor + 1 < h - 2:
+                        grid[row_cursor + 1][cx] = "│"
+                row_cursor = min(h - 4, row_cursor + 2)
+
+        # Draw crashes into the center Verified Main Line (Tron rules: hit main line -> FAIL)
+        crash_row = min(h - 5, max(4, row_cursor))
+        for cr in state["crashes"][:4]:
+            bid = cr["branch_id"]
+            bx = lane_x.get(bid, max(4, mid_x - 16))
+            if crash_row < h - 2:
+                lo, hi = min(bx, mid_x), max(bx, mid_x)
+                for x in range(lo, hi):
+                    if x != mid_x:
+                        grid[crash_row][x] = "═"
+                collide_x = mid_x - 1 if bx < mid_x else min(w - 2, mid_x + 1)
+                grid[crash_row][collide_x] = "X"
+                crash_row = min(h - 3, crash_row + 1)
+
+        # Draw merges converging toward the bottom-center survivor path
+        merge_row = min(h - 3, max(6, crash_row))
+        for mg in state["merges"][:3]:
+            pa, pb, cid = mg["parent_a_id"], mg["parent_b_id"], mg["child_id"]
+            xa = lane_x.get(pa, max(6, mid_x - 18))
+            xb = lane_x.get(pb, min(w - 6, mid_x + 18))
+            xm = min(w - 4, mid_x + 4)
+            lane_x[cid] = xm
+            lo, hi = min(xa, xb, xm), max(xa, xb, xm)
+            for x in range(lo, hi + 1):
+                if x != mid_x:
+                    grid[merge_row][x] = "═"
+            if 0 <= xm < w:
+                grid[merge_row][xm] = "╬"
+                for r in range(merge_row + 1, h):
+                    grid[r][xm] = "║"
+
+        # Bottom exit arrow on Verified Main Line
+        grid[h - 1][mid_x] = "▼"
+
+        rendered_rows = [" ╭" + ("─" * w) + "╮"]
+        for r_idx, row in enumerate(grid):
+            tag = "TOP" if r_idx == 0 else ("BOT" if r_idx == h - 1 else "   ")
+            rendered_rows.append(f" │{''.join(row)}│ {tag}")
+        rendered_rows.append(" ╰" + ("─" * w) + "╯")
+        return rendered_rows
+
     def render_ascii(
         self,
         events: Iterable[ArenaEvent | Dict[str, Any]],
@@ -356,8 +458,9 @@ class TronArenaRenderer:
         upto_seq: Optional[int] = None,
     ) -> str:
         """
-        Render the Tron-style light-cycle arena, verified main line, merge trails,
-        Scoreboard HUD (per-agent state + time alive), and Winner's Box from the stream.
+        Render the Tron-style light-cycle arena, 2D spatial grid, verified main line,
+        merge trails, Scoreboard HUD (per-agent state + time alive), and Winner's Box
+        from the stream.
         """
         state = self.reconstruct_state_from_stream(events, upto_seq=upto_seq)
         w = self.width
@@ -379,7 +482,11 @@ class TronArenaRenderer:
         lines.append("                      " + "   v   ".join("    v     " for _ in starters))
         lines.append(thin)
 
-        # 2. Arena Flow Grid: Splits, Verified Main Line Crashes (Tron rules), Merges, Revocations
+        # 2. 2D Spatial Tron Light-Cycle Grid + Event Callouts
+        lines.append(" 2D TRON LIGHT-CYCLE GRID (▼=DROP, │/─=TRAIL, ║=VERIFIED MAIN LINE, X=CRASH, ╬=MERGE):".ljust(w))
+        lines.extend(self.render_spatial_grid(state, height=12))
+        lines.append(thin)
+
         lines.append(" ARENA LIGHT-CYCLE FLOW & VERIFIED MAIN LINE (║ = VERIFIED TRUNK):".ljust(w))
         lines.append("   [TOP] ───────────────╔═══ VERIFIED MAIN LINE ═══╗─────────────── [TOP]")
 
@@ -481,7 +588,9 @@ class TronArenaRenderer:
     ) -> Path:
         """
         Export a self-contained Tron light-cycle HTML5/Canvas arena player and live HUD
-        driven directly by the embedded JSON event stream (`events`).
+        driven directly by the embedded JSON event stream (`events`), featuring animated
+        playback controls (Play/Pause/Scrub) so live UI, replay, and demo video all render
+        from the exact same stream.
         """
         ev_dicts = [
             (e.to_dict() if isinstance(e, ArenaEvent) else dict(e))
@@ -519,6 +628,24 @@ class TronArenaRenderer:
     text-shadow: 0 0 8px rgba(0, 240, 255, 0.6);
     font-size: 16px;
     letter-spacing: 1px;
+  }}
+  .controls {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+    font-size: 12px;
+  }}
+  button {{
+    background: #07223b;
+    color: #00f0ff;
+    border: 1px solid #00f0ff;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-family: inherit;
+  }}
+  input[type="range"] {{
+    flex: 1;
   }}
   canvas {{
     width: 100%;
@@ -559,6 +686,11 @@ class TronArenaRenderer:
   <div class="panel">
     <h1>NEBIUS — SURVIVAL OF THE FITTEST // TRON ARENA</h1>
     <div style="font-size:12px;margin-bottom:8px;color:#8ab4f8;">Problem: {problem}</div>
+    <div class="controls">
+      <button id="playBtn">Replay Stream</button>
+      <input id="seqSlider" type="range" min="1" max="{max(1, len(ev_dicts))}" value="{len(ev_dicts)}" />
+      <span id="seqLabel">Event {len(ev_dicts)} / {len(ev_dicts)}</span>
+    </div>
     <canvas id="arenaCanvas" width="900" height="460"></canvas>
     <div class="winners-box" id="winnersBox">
       <h2>WINNER'S BOX (VERIFIED SURVIVOR EXIT)</h2>
@@ -579,19 +711,106 @@ class TronArenaRenderer:
 <script>
   const ARENA_EVENTS = {json.dumps(ev_dicts)};
   const RECONSTRUCTED = {json.dumps(state)};
+  const canvas = document.getElementById("arenaCanvas");
+  const ctx = canvas.getContext("2d");
+  const slider = document.getElementById("seqSlider");
+  const seqLabel = document.getElementById("seqLabel");
 
-  const tbody = document.getElementById("hudBody");
-  RECONSTRUCTED.scoreboard.forEach(r => {{
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${{r.id}}</td>
-      <td class="state-${{r.state}}">${{r.state}}</td>
-      <td>${{Number(r.time_alive).toFixed(4)}}s</td>
-      <td>${{Number(r.certainty_score).toFixed(2)}}</td>
-      <td>$${{Number(r.budget_remaining).toFixed(4)}}</td>
-    `;
-    tbody.appendChild(tr);
-  }});
+  function renderUpTo(maxSeq) {{
+    seqLabel.textContent = `Event ${{maxSeq}} / ${{ARENA_EVENTS.length}}`;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Tron background grid
+    ctx.strokeStyle = "rgba(0, 240, 255, 0.08)";
+    ctx.lineWidth = 1;
+    for (let x = 0; x < canvas.width; x += 30) {{
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    }}
+    for (let y = 0; y < canvas.height; y += 30) {{
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+    }}
+
+    // Center Verified Main Line (trunk)
+    const midX = canvas.width / 2;
+    ctx.strokeStyle = "#00ff9d";
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(midX, 16); ctx.lineTo(midX, canvas.height - 16); ctx.stroke();
+
+    // Compute positions per branch from events up to maxSeq
+    const pos = {{}};
+    const branches = {{}};
+    let starterIdx = 0;
+    const starterLanes = [160, 310, 680];
+
+    ARENA_EVENTS.slice(0, maxSeq).forEach((evt, idx) => {{
+      const bid = evt.branch_id;
+      branches[bid] = evt.snapshot;
+      const y = 30 + Math.min(390, (idx / Math.max(1, ARENA_EVENTS.length)) * 390);
+      if (evt.event_type === "spawn") {{
+        const p = evt.snapshot.parent;
+        if (!p) {{
+          pos[bid] = {{ x: starterLanes[starterIdx % starterLanes.length], y: 24 }};
+          starterIdx++;
+        }} else if (pos[p]) {{
+          const offset = ((evt.seq % 5) - 2) * 42 || 35;
+          const cx = Math.max(40, Math.min(canvas.width - 40, pos[p].x + offset));
+          ctx.strokeStyle = "#00f0ff";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(pos[p].x, pos[p].y);
+          ctx.lineTo(cx, y);
+          ctx.stroke();
+          pos[bid] = {{ x: cx, y: y }};
+        }}
+      }} else if (evt.event_type === "merge") {{
+        const pa = evt.details.parent_a_id;
+        const pb = evt.details.parent_b_id;
+        const mx = midX + 36;
+        [pa, pb].forEach(pid => {{
+          if (pos[pid]) {{
+            ctx.strokeStyle = "#ffb84d";
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            ctx.moveTo(pos[pid].x, pos[pid].y);
+            ctx.lineTo(mx, y);
+            ctx.stroke();
+          }}
+        }});
+        pos[bid] = {{ x: mx, y: y }};
+      }} else if (evt.event_type === "fail" && pos[bid]) {{
+        ctx.strokeStyle = "#ff3366";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(pos[bid].x, pos[bid].y);
+        ctx.lineTo(midX, y);
+        ctx.stroke();
+        ctx.fillStyle = "#ff3366";
+        ctx.fillRect(midX - 5, y - 5, 10, 10);
+      }} else if ((evt.event_type === "pass" || evt.event_type === "winner_exit") && pos[bid]) {{
+        ctx.strokeStyle = "#00ff9d";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(pos[bid].x, pos[bid].y);
+        ctx.lineTo(midX, canvas.height - 20);
+        ctx.stroke();
+      }}
+    }});
+
+    // Update HUD table
+    const tbody = document.getElementById("hudBody");
+    tbody.innerHTML = "";
+    Object.values(branches).sort((a, b) => b.certainty_score - a.certainty_score).forEach(r => {{
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${{r.id}}</td>
+        <td class="state-${{r.state}}">${{r.state}}</td>
+        <td>${{Number(r.time_alive).toFixed(4)}}s</td>
+        <td>${{Number(r.certainty_score).toFixed(2)}}</td>
+        <td>$${{Number(r.budget_remaining).toFixed(4)}}</td>
+      `;
+      tbody.appendChild(tr);
+    }});
+  }}
 
   const wDiv = document.getElementById("winnerContent");
   if (RECONSTRUCTED.winners_box.length === 0) {{
@@ -605,20 +824,18 @@ class TronArenaRenderer:
     }});
   }}
 
-  // Draw Tron light-cycle paths on Canvas from RECONSTRUCTED
-  const canvas = document.getElementById("arenaCanvas");
-  const ctx = canvas.getContext("2d");
-  ctx.strokeStyle = "rgba(0, 240, 255, 0.08)";
-  for (let x = 0; x < canvas.width; x += 30) {{
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
-  }}
-  for (let y = 0; y < canvas.height; y += 30) {{
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
-  }}
-  // Center verified main line
-  ctx.strokeStyle = "#00ff9d";
-  ctx.lineWidth = 3;
-  ctx.beginPath(); ctx.moveTo(canvas.width / 2, 20); ctx.lineTo(canvas.width / 2, canvas.height - 20); ctx.stroke();
+  slider.addEventListener("input", e => renderUpTo( Number(e.target.value) ));
+  document.getElementById("playBtn").addEventListener("click", () => {{
+    let cur = 1;
+    const timer = setInterval(() => {{
+      slider.value = cur;
+      renderUpTo(cur);
+      cur++;
+      if (cur > ARENA_EVENTS.length) clearInterval(timer);
+    }}, 60);
+  }});
+
+  renderUpTo(ARENA_EVENTS.length);
 </script>
 </body>
 </html>

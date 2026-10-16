@@ -73,6 +73,7 @@ class TestPiece7ArenaFeedAndRenderer(unittest.TestCase):
         live_ascii = renderer.render_ascii(feed.events, problem=problem)
         self.assertIn("TRON ARENA", live_ascii)
         self.assertIn("IGNITION (TOP DROP)", live_ascii)
+        self.assertIn("2D TRON LIGHT-CYCLE GRID", live_ascii)
         self.assertIn("VERIFIED MAIN LINE", live_ascii)
         self.assertIn("SCOREBOARD HUD", live_ascii)
         self.assertIn("WINNER'S BOX", live_ascii)
@@ -95,6 +96,8 @@ class TestPiece7ArenaFeedAndRenderer(unittest.TestCase):
             html_text = html_path.read_text(encoding="utf-8")
             self.assertIn("WINNER'S BOX", html_text)
             self.assertIn("SCOREBOARD HUD", html_text)
+            self.assertIn("renderUpTo", html_text)
+            self.assertIn("seqSlider", html_text)
 
 
 if __name__ == "__main__":
