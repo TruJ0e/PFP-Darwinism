@@ -8,6 +8,7 @@ Tagline: "Nebius — survival of the fittest."
 from .backend import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
+    SUPER_MODEL,
     MockOpenAIClient,
     OpenAICompatibleClient,
     create_client,
@@ -31,10 +32,19 @@ from .branch_spawner import (
     MainHarness,
     MiniHarness,
 )
+from .alignment_detector import (
+    AlignmentCandidatePair,
+    AlignmentDetector,
+    AlignmentJudgeResult,
+    AlignmentVerdict,
+    compute_branch_embedding,
+    cosine_similarity,
+)
 
 __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
+    "SUPER_MODEL",
     "MockOpenAIClient",
     "OpenAICompatibleClient",
     "create_client",
@@ -51,4 +61,11 @@ __all__ = [
     "HarnessEvent",
     "MainHarness",
     "MiniHarness",
+    "AlignmentCandidatePair",
+    "AlignmentDetector",
+    "AlignmentJudgeResult",
+    "AlignmentVerdict",
+    "compute_branch_embedding",
+    "cosine_similarity",
 ]
+

@@ -431,7 +431,16 @@ class _MockChatCompletions:
             return json.dumps({"unjustified_leaps": leaps, "count": len(leaps)}), False
 
         # 3. NS (Natural Selection) blind variation prompt
-        if "natural selection" in lower or "blind variation" in lower or "ns_fanout" in lower:
+        if (
+            "ns_fanout" in lower
+            or (
+                ("natural selection" in lower or "blind variation" in lower)
+                and "extract_claims" not in lower
+                and "alignment_judge" not in lower
+                and "merge_synthesizer" not in lower
+                and "fail_judge" not in lower
+            )
+        ):
             pick = _NS_MUTATION_POOL[(self._call_count + choice_idx) % len(_NS_MUTATION_POOL)]
             return (
                 json.dumps(
@@ -489,10 +498,97 @@ class _MockChatCompletions:
                     False,
                 )
 
-        # 5. Compression / Directive summary or general step continuation
-        if "compress" in lower:
+        # 5. Compression / Directive summary
+        if "compress parent reasoning" in lower:
             digest = hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()[:8]
             return f"Compressed parent trace [{digest}]: evaluated SSH asymmetry hypotheses; narrowing active fork.", False
+
+        # 6. Piece 4: Claim extraction for a branch
+        if "extract_claims" in lower or "extract core claims" in lower:
+            claims: List[str] = []
+            if "firewall" in lower or "port 22" in lower or "hypothesis a" in lower:
+                claims.extend(
+                    [
+                        "Laptop outbound TCP/22 SYN succeeds due to stateful return path",
+                        "Inbound TCP/22 from desktop to laptop is blocked or unlistening on laptop",
+                    ]
+                )
+            if "sshd" in lower or "daemon" in lower or "hypothesis b" in lower:
+                claims.extend(
+                    [
+                        "Inbound TCP/22 from desktop to laptop is blocked or unlistening on laptop",
+                        "OpenSSH server daemon (sshd) must be enabled and listening on laptop LAN interface",
+                    ]
+                )
+            if "contradict" in lower or "port 22 is open and listening" in lower or "fail2ban" in lower:
+                claims.append(
+                    "Inbound TCP/22 is already open and sshd is actively accepting packets, but fail2ban drops desktop IP"
+                )
+            if "ipv6" in lower or "proxycommand" in lower or "vlan" in lower:
+                claims.append("Client-side DNS/routing or VLAN boundary isolates the two endpoints")
+            if not claims:
+                claims.append("Diagnose asymmetric SSH connectivity between desktop and laptop")
+            return json.dumps({"core_claims": claims}), False
+
+        # 7. Piece 4: Super judge alignment comparison
+        if "alignment_judge" in lower or "compare claim-by-claim" in lower:
+            parts = lower.split("branch b (")
+            part_a = parts[0]
+            part_b = parts[1] if len(parts) > 1 else ""
+
+            a_ingress = any(k in part_a for k in ("firewall", "sshd", "port 22", "hypothesis a", "hypothesis b"))
+            b_ingress = any(k in part_b for k in ("firewall", "sshd", "port 22", "hypothesis a", "hypothesis b"))
+            has_contradict = (
+                "contradict:" in lower
+                or "contradict_mode=true" in lower
+                or ("fail2ban" in part_a and b_ingress)
+                or ("fail2ban" in part_b and a_ingress)
+            )
+
+            if has_contradict:
+                return (
+                    json.dumps(
+                        {
+                            "verdict": "contradictory",
+                            "overlapping_claims": [],
+                            "contradictory_claims": [
+                                "Branch A claims inbound TCP/22 is blocked/unlistening while Branch B claims sshd is open and fail2ban drops after handshake"
+                            ],
+                            "disjoint_claims": [],
+                            "rationale": "Direct clash on whether laptop TCP/22 is listening vs actively banning after connection.",
+                        }
+                    ),
+                    False,
+                )
+            if (a_ingress and b_ingress) or "overlap_mode=true" in lower:
+                return (
+                    json.dumps(
+                        {
+                            "verdict": "overlap",
+                            "overlapping_claims": [
+                                "Inbound TCP/22 from desktop to laptop requires both active sshd listener and open host firewall rule on laptop"
+                            ],
+                            "contradictory_claims": [],
+                            "disjoint_claims": [
+                                "Check `ss -tlnp | grep :22` and `ufw status` on laptop"
+                            ],
+                            "rationale": "Complementary host-level diagnostics on laptop TCP/22 ingress; compatible and mergeable.",
+                        }
+                    ),
+                    False,
+                )
+            return (
+                json.dumps(
+                    {
+                        "verdict": "unrelated",
+                        "overlapping_claims": [],
+                        "contradictory_claims": [],
+                        "disjoint_claims": ["Orthogonal network/client hypotheses with no shared claims"],
+                        "rationale": "Claims address disjoint layers without overlap or contradiction.",
+                    }
+                ),
+                False,
+            )
 
         # Default reasoning continuation
         fork = _PLAUS_FORK_POOL[(self._call_count + choice_idx) % len(_PLAUS_FORK_POOL)]
