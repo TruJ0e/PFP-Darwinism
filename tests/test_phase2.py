@@ -11,7 +11,10 @@ from pfp import (
     AlignmentVerdict,
     BranchState,
     BudgetLedger,
+    FailJudge,
+    FalsifierAngle,
     InvalidStateTransitionError,
+    MainHarness,
     MergeSynthesizer,
     MockOpenAIClient,
     PFPTracker,
@@ -161,6 +164,108 @@ class TestPiece5MergeSynthesizer(unittest.TestCase):
         self.assertGreater(len(child.merge_provenance["p2"]), 0)
         self.assertEqual(child.merge_parents, ["p1", "p2"])
         self.assertGreaterEqual(child.merges_attracted, 1)
+
+
+class TestPiece6FailJudge(unittest.TestCase):
+    def test_rotated_angles_gauntlet_appeal_and_revocation(self) -> None:
+        client = MockOpenAIClient(force_cost_scale=1.0)
+        tracker = PFPTracker()
+        judge = FailJudge(client, tracker, gauntlet_rounds=3)
+
+        # 1. Verify attack style rotation (logic -> counterexample -> assumption_audit)
+        a1 = judge.next_angle()
+        a2 = judge.next_angle()
+        a3 = judge.next_angle()
+        self.assertEqual([a1, a2, a3], [FalsifierAngle.LOGIC, FalsifierAngle.COUNTEREXAMPLE, FalsifierAngle.ASSUMPTION_AUDIT])
+
+        # 2. 3-round Pass-readiness gauntlet on a solid branch -> transitions Possible -> Pass with provenance
+        tracker.register_branch(
+            "b_solid",
+            parent=None,
+            budget_remaining=0.05,
+            fork_under_exploration="Enable sshd and allow inbound TCP/22 on laptop firewall",
+            certainty_score=3.0,
+        )
+        outcomes = judge.run_pass_readiness_gauntlet("b_solid")
+        self.assertEqual(len(outcomes), 3)
+        self.assertTrue(all(o.survived for o in outcomes))
+        solid_rec = tracker.get("b_solid")
+        self.assertEqual(solid_rec.state, BranchState.PASS)
+        self.assertEqual(len(solid_rec.pass_provenance), 3)
+        self.assertEqual(
+            {p.falsifier_angle for p in solid_rec.pass_provenance},
+            {"logic", "counterexample", "assumption_audit"},
+        )
+
+        # 3. One appeal per kill with a different judge:
+        #    Branch with `force_fail=true` + `overturn_appeal=true` fails primary judge,
+        #    appeals to secondary judge (`super_judge_appeal_secondary`), and overturns the kill!
+        tracker.register_branch(
+            "b_appealable",
+            parent=None,
+            budget_remaining=0.05,
+            fork_under_exploration="force_fail=true overturn_appeal=true salvageable edge hypothesis",
+        )
+        out_appeal = judge.falsify_branch("b_appealable", schedule_trigger="background_sample")
+        self.assertTrue(out_appeal.survived)
+        self.assertTrue(out_appeal.appeal_attempted)
+        self.assertTrue(out_appeal.appeal_overturned)
+        self.assertNotEqual(out_appeal.judge_id, out_appeal.appeal_judge_id)
+        self.assertTrue(tracker.get("b_appealable").appeal_used)
+
+        # A second kill on the same branch has NO appeal left -> dies immediately (Fail)
+        out_second_kill = judge.falsify_branch(
+            "b_appealable",
+            schedule_trigger="background_sample",
+            extra_context="force_fail=true",
+        )
+        self.assertFalse(out_second_kill.survived)
+        self.assertFalse(out_second_kill.appeal_attempted)
+        self.assertEqual(tracker.get("b_appealable").state, BranchState.FAIL)
+
+        # 4. Revokable Pass + dependent re-verification:
+        #    Create dependent child of `b_solid`, then revoke `b_solid` and force dependent re-verification
+        tracker.register_branch(
+            "b_dep_child",
+            parent="b_solid",
+            budget_remaining=0.04,
+            fork_under_exploration="Dependent child relying on b_solid",
+        )
+        rev_res = judge.revoke_and_reverify_dependents(
+            "b_solid",
+            demote_to=BranchState.POSSIBLE,
+            reason="late_counterexample_at_t40s",
+            force_fail_dependents=True,
+        )
+        self.assertEqual(tracker.get("b_solid").state, BranchState.POSSIBLE)
+        self.assertIn("b_dep_child", rev_res["dependents_checked"])
+        self.assertEqual(tracker.get("b_dep_child").state, BranchState.FAIL)
+
+
+class TestPhase2EndToEndSelection(unittest.TestCase):
+    def test_end_to_end_align_merge_falsify_pass_fail(self) -> None:
+        client = MockOpenAIClient()
+        harness = MainHarness(
+            client=client,
+            starter_agents=3,
+            hard_cap_usd=2.00,
+            depth_dial=3,
+            k_probes=3,
+            gauntlet_rounds=3,
+            enable_selection=True,
+        )
+        summary = harness.run("A small business's SSH works laptop->desktop but not desktop->laptop.")
+
+        selection = summary["selection"]
+        self.assertGreater(len(selection["alignments_evaluated"]), 0)
+        self.assertGreater(len(selection["merges_performed"]), 0)
+        self.assertGreater(selection["falsifications_count"], 0)
+        self.assertGreater(len(summary["winners_box"]), 0)
+
+        states = {r["state"] for r in summary["scoreboard"]}
+        self.assertIn("Pass", states)
+        self.assertIn("Fail", states)
+        self.assertIn("Absorbed", states)
 
 
 if __name__ == "__main__":

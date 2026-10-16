@@ -617,6 +617,64 @@ class _MockChatCompletions:
                 False,
             )
 
+        # 9. Piece 6: Fail judge (falsification attack + appeal with different judge)
+        if "fail_judge" in lower or "falsify_branch" in lower:
+            is_appeal = "appeal_judge" in lower or "appeal_review=true" in lower
+            if is_appeal:
+                if "overturn_appeal=true" in lower or "salvageable" in lower:
+                    return (
+                        json.dumps(
+                            {
+                                "survived": True,
+                                "attack_angle": "appeal_re_evaluation",
+                                "objection": "",
+                                "rationale": "Appeal judge (Super-Appeal-B) overturned kill: branch hypothesis holds under bounded LAN scope.",
+                            }
+                        ),
+                        False,
+                    )
+                return (
+                    json.dumps(
+                        {
+                            "survived": False,
+                            "attack_angle": "appeal_re_evaluation",
+                            "objection": "Contradiction with established LAN reachability remains fatal under independent review.",
+                            "rationale": "Appeal judge confirmed fatal contradiction.",
+                        }
+                    ),
+                    False,
+                )
+
+            # Determine if the target branch has a fatal flaw / contradiction vs solid proof
+            if (
+                "force_fail=true" in lower
+                or "contradict:" in lower
+                or "fail2ban" in lower
+                or "proxycommand" in lower
+                or "flawed_assumption" in lower
+            ):
+                return (
+                    json.dumps(
+                        {
+                            "survived": False,
+                            "objection": "Falsified: contradicts established main-line observation (laptop->desktop SSH already succeeds without fail2ban/proxy block).",
+                            "rationale": "Branch hit the verified line and failed falsification.",
+                        }
+                    ),
+                    False,
+                )
+
+            return (
+                json.dumps(
+                    {
+                        "survived": True,
+                        "objection": "",
+                        "rationale": "Survived falsification attack: host firewall + sshd listener state cleanly explains asymmetric TCP/22 behavior.",
+                    }
+                ),
+                False,
+            )
+
         # Default reasoning continuation
         fork = _PLAUS_FORK_POOL[(self._call_count + choice_idx) % len(_PLAUS_FORK_POOL)]
         return (

@@ -18,6 +18,7 @@ from .tracker import (
     BranchState,
     InvalidStateTransitionError,
     PFPTracker,
+    PassProvenanceRecord,
 )
 from .issue_detector import (
     CertaintyWeights,
@@ -44,6 +45,12 @@ from .merge_synthesizer import (
     MergeSynthesisResult,
     MergeSynthesizer,
 )
+from .fail_judge import (
+    FailJudge,
+    FalsificationOutcome,
+    FalsifierAngle,
+    ROTATED_ANGLES,
+)
 
 __all__ = [
     "DEFAULT_BASE_URL",
@@ -56,6 +63,7 @@ __all__ = [
     "BranchState",
     "InvalidStateTransitionError",
     "PFPTracker",
+    "PassProvenanceRecord",
     "CertaintyWeights",
     "IssueDetectionResult",
     "IssueDetector",
@@ -73,5 +81,9 @@ __all__ = [
     "cosine_similarity",
     "MergeSynthesisResult",
     "MergeSynthesizer",
+    "FailJudge",
+    "FalsificationOutcome",
+    "FalsifierAngle",
+    "ROTATED_ANGLES",
 ]
 

@@ -60,6 +60,22 @@ class StateTransitionRecord:
 
 
 @dataclass
+class PassProvenanceRecord:
+    survived_what: str
+    timestamp: float
+    falsifier_angle: str
+    judge_id: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "survived_what": self.survived_what,
+            "timestamp": round(self.timestamp, 4),
+            "falsifier_angle": self.falsifier_angle,
+            "judge_id": self.judge_id,
+        }
+
+
+@dataclass
 class BranchRecord:
     id: str
     parent: Optional[str]
@@ -79,6 +95,8 @@ class BranchRecord:
     state_history: List[StateTransitionRecord] = field(default_factory=list)
     merge_parents: List[str] = field(default_factory=list)
     merge_provenance: Dict[str, List[str]] = field(default_factory=dict)
+    pass_provenance: List[PassProvenanceRecord] = field(default_factory=list)
+    appeal_used: bool = False
 
     @property
     def is_alive(self) -> bool:
@@ -106,6 +124,8 @@ class BranchRecord:
             "merges_attracted": self.merges_attracted,
             "open_critic_objections": self.open_critic_objections,
             "merge_provenance": self.merge_provenance,
+            "pass_provenance": [p.to_dict() for p in self.pass_provenance],
+            "appeal_used": self.appeal_used,
         }
 
 
@@ -226,6 +246,64 @@ class PFPTracker:
                 f"Illegal one-way state transition for branch '{branch_id}': "
                 f"{old_state.value} -> {new_state.value}"
             )
+
+    def revoke_pass(
+        self,
+        branch_id: str,
+        demote_to: BranchState = BranchState.POSSIBLE,
+        reason: str = "pass_revoked",
+    ) -> BranchRecord:
+        """
+        Piece 6: Pass is revokable. A branch verified at t=20s can be demoted at t=40s
+        (to Possible or Fail); the main line rewrites and dependents re-verify or die.
+        Dead branches (Fail / Absorbed) can never be resurrected.
+        """
+        with self._lock:
+            rec = self.get(branch_id)
+            if rec.state != BranchState.PASS:
+                raise InvalidStateTransitionError(
+                    f"Cannot revoke Pass on branch '{branch_id}' with state {rec.state.value} (must be Pass)."
+                )
+            if demote_to not in (BranchState.POSSIBLE, BranchState.FAIL):
+                raise InvalidStateTransitionError(
+                    f"Pass revocation target must be Possible or Fail, got {demote_to.value}"
+                )
+            now = time.time()
+            old_state = rec.state
+            rec.state = demote_to
+            if demote_to == BranchState.FAIL:
+                rec.ended_at = now
+            rec.state_history.append(
+                StateTransitionRecord(
+                    from_state=old_state.value,
+                    to_state=demote_to.value,
+                    timestamp=now,
+                    reason=reason,
+                )
+            )
+            rec.refresh_time_alive(now)
+            return rec
+
+    def dependents_of(self, branch_id: str) -> List[BranchRecord]:
+        """
+        Return all alive descendant or merge-child branches that depend on `branch_id`.
+        """
+        with self._lock:
+            dependents: List[BranchRecord] = []
+            queue = [branch_id]
+            visited = {branch_id}
+            all_recs = self.all_records()
+            while queue:
+                curr = queue.pop(0)
+                for r in all_recs:
+                    if r.id in visited:
+                        continue
+                    if r.parent == curr or curr in r.merge_parents or curr in r.merge_provenance:
+                        visited.add(r.id)
+                        queue.append(r.id)
+                        if r.is_alive:
+                            dependents.append(r)
+            return dependents
 
     def update_branch(
         self,

@@ -1,0 +1,615 @@
+"""
+Piece 6: Fail Judge — falsification as a heartbeat (Pass 1: literal spec).
+
+From DESIGN.md:
+Not a gate — a schedule. Falsification runs on events:
+- After every merge (new claims -> verify before going anywhere)
+- Pass-readiness gauntlet (certainty crosses threshold -> 3 rounds, survive all)
+- Contradiction trigger (alignment detector finds clash -> falsify both, loser dies)
+- Background sampling (every T seconds, probe the highest-certainty untested branch)
+- Pre-exit (nothing enters the winner's box without a final pass)
+
+Pass is revokable. A branch verified at t=20s can be demoted at t=40s;
+the main line rewrites and dependents re-verify or die. Every Pass carries
+provenance: what it survived, when, against which falsifier angle (logic,
+counterexample, assumption audit — rotated so branches can't overfit).
+
+One appeal per kill: re-test with a different judge; survive and the
+verdict's overturned. Bounded, no infinite regress.
+
+Plausible is the starting line, not the finish. If several branches all
+survive, the higher-certainty one exits first. The system promises whatever
+exits survived — not that only one can.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Sequence
+
+from .alignment_detector import branch_position_text
+from .backend import SUPER_MODEL
+from .branch_spawner import BudgetLedger, HarnessEvent
+from .issue_detector import IssueDetector
+from .tracker import BranchRecord, BranchState, PFPTracker, PassProvenanceRecord
+
+
+class FalsifierAngle(str, Enum):
+    LOGIC = "logic"
+    COUNTEREXAMPLE = "counterexample"
+    ASSUMPTION_AUDIT = "assumption_audit"
+
+
+ROTATED_ANGLES: tuple[FalsifierAngle, ...] = (
+    FalsifierAngle.LOGIC,
+    FalsifierAngle.COUNTEREXAMPLE,
+    FalsifierAngle.ASSUMPTION_AUDIT,
+)
+
+
+@dataclass
+class FalsificationOutcome:
+    branch_id: str
+    schedule_trigger: str  # "post_merge", "pass_gauntlet", "contradiction", "background_sample", "pre_exit", "dependent_reverify"
+    survived: bool
+    angle: str
+    judge_id: str
+    appeal_attempted: bool = False
+    appeal_overturned: bool = False
+    appeal_judge_id: str = ""
+    objection: str = ""
+    rationale: str = ""
+    cost_usd: float = 0.0
+    transitioned_to: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "branch_id": self.branch_id,
+            "schedule_trigger": self.schedule_trigger,
+            "survived": self.survived,
+            "angle": self.angle,
+            "judge_id": self.judge_id,
+            "appeal_attempted": self.appeal_attempted,
+            "appeal_overturned": self.appeal_overturned,
+            "appeal_judge_id": self.appeal_judge_id,
+            "objection": self.objection,
+            "rationale": self.rationale,
+            "cost_usd": round(self.cost_usd, 6),
+            "transitioned_to": self.transitioned_to,
+        }
+
+
+class FailJudge:
+    """
+    Piece 6: Fail judge — falsification as a heartbeat.
+    - Rotates attack angles (`logic`, `counterexample`, `assumption_audit`).
+    - Runs on all 5 scheduled triggers:
+      1. `verify_after_merge` (after every merge)
+      2. `run_pass_readiness_gauntlet` (certainty crosses threshold -> N rounds, default 3, survive all -> Pass)
+      3. `resolve_contradiction` (contradiction trigger -> falsify both, loser dies)
+      4. `sample_background` (every T seconds, probe highest-certainty untested branch)
+      5. `verify_pre_exit` (nothing enters the winner's box without a final pass; higher-certainty exits first)
+    - Enforces one appeal per kill with a DIFFERENT judge (`judge_primary` vs `judge_appeal`).
+    - Supports revokable Pass (`revoke_and_reverify_dependents`): demotes a Pass branch, rewrites the main line,
+      and re-verifies all dependent branches (which survive or die).
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        tracker: PFPTracker,
+        detector: Optional[IssueDetector] = None,
+        budget_ledger: Optional[BudgetLedger] = None,
+        *,
+        gauntlet_rounds: int = 3,
+        pass_certainty_threshold: float = 2.0,
+        background_interval_s: float = 2.0,
+        super_model: str = SUPER_MODEL,
+        event_sink: Optional[Callable[[HarnessEvent], None]] = None,
+    ) -> None:
+        self.client = client
+        self.tracker = tracker
+        self.detector = detector
+        self.budget_ledger = budget_ledger
+        self.gauntlet_rounds = max(1, gauntlet_rounds)
+        self.pass_certainty_threshold = pass_certainty_threshold
+        self.background_interval_s = background_interval_s
+        self.super_model = super_model
+        self.event_sink = event_sink
+
+        self._angle_cursor: int = 0
+        self.last_background_sample_at: float = 0.0
+        self.verified_main_line: List[str] = []
+
+    def next_angle(self) -> FalsifierAngle:
+        """Rotate attack styles (logic, counterexample, assumption audit) so branches can't overfit."""
+        angle = ROTATED_ANGLES[self._angle_cursor % len(ROTATED_ANGLES)]
+        self._angle_cursor += 1
+        return angle
+
+    def _emit(self, event_type: str, branch_id: str, details: Dict[str, Any]) -> None:
+        if self.event_sink is None:
+            return
+        rec = self.tracker.get(branch_id)
+        self.event_sink(
+            HarnessEvent(
+                event_type=event_type,
+                branch_id=branch_id,
+                timestamp=time.time(),
+                details=details,
+                snapshot=rec.to_dict(),
+            )
+        )
+
+    def _record_cost(self, branch_id: str, cost_usd: float, reason: str) -> None:
+        if cost_usd <= 0.0:
+            return
+        rec = self.tracker.get(branch_id)
+        deducted = min(rec.budget_remaining, max(0.0, cost_usd))
+        new_budget = round(max(0.0, rec.budget_remaining - deducted), 6)
+        self.tracker.update_branch(branch_id, budget_remaining=new_budget)
+        if self.budget_ledger is not None:
+            self.budget_ledger.record_spend(deducted)
+        self._emit(
+            "budget_change",
+            branch_id,
+            {
+                "reason": reason,
+                "spent_usd": round(deducted, 6),
+                "budget_remaining": new_budget,
+            },
+        )
+
+    def _refresh_branch_certainty(self, branch_id: str) -> float:
+        rec = self.tracker.get(branch_id)
+        if self.detector is not None:
+            age_untested = max(0.0, time.time() - rec.last_tested_at)
+            score = self.detector.compute_certainty(
+                survived_falsifications=rec.survived_falsifications,
+                merges_attracted=rec.merges_attracted,
+                open_critic_objections=rec.open_critic_objections,
+                seconds_since_last_test=age_untested,
+            )
+        else:
+            score = round(
+                rec.survived_falsifications * 3.0
+                + rec.merges_attracted * 1.5
+                - rec.open_critic_objections * 1.25,
+                4,
+            )
+        self.tracker.update_branch(branch_id, certainty_score=score)
+        return score
+
+    def _run_single_attack(
+        self,
+        branch: BranchRecord,
+        angle: FalsifierAngle,
+        schedule_trigger: str,
+        judge_id: str = "super_judge_primary",
+        is_appeal: bool = False,
+        extra_context: str = "",
+    ) -> tuple[bool, str, str, float]:
+        pos = branch_position_text(branch)
+        main_line_str = " | ".join(self.verified_main_line) if self.verified_main_line else "None yet"
+        appeal_flag = "appeal_review=true appeal_judge" if is_appeal else "appeal_review=false"
+        prompt = (
+            f"fail_judge falsify_branch {appeal_flag}\n"
+            f"Judge ID: {judge_id}\n"
+            f"Schedule trigger: {schedule_trigger}\n"
+            f"Attack style / angle: {angle.value}\n"
+            f"Verified main line truth: {main_line_str}\n"
+            f"Branch ({branch.id}): {pos}\n"
+            f"{extra_context}\n"
+            "Attempt to falsify the branch using the specified attack angle. "
+            'Return JSON: {"survived": bool, "objection": "...", "rationale": "..."}.'
+        )
+        resp = self.client.chat.completions.create(
+            model=self.super_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are {judge_id} ({self.super_model}) running falsification angle '{angle.value}'. "
+                        "Try to break the branch's reasoning via logic, counterexample, or assumption audit."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2 if not is_appeal else 0.3,
+            max_tokens=200,
+        )
+        cost = float(resp.usage.cost_usd)
+        raw = resp.choices[0].message.content if resp.choices else "{}"
+        try:
+            data = json.loads(raw)
+            survived = bool(data.get("survived", True))
+            objection = str(data.get("objection", ""))
+            rationale = str(data.get("rationale", ""))
+        except Exception:
+            survived = True
+            objection = ""
+            rationale = raw.strip()
+        return survived, objection, rationale, cost
+
+    def falsify_branch(
+        self,
+        branch_id: str,
+        schedule_trigger: str,
+        *,
+        angle: Optional[FalsifierAngle] = None,
+        extra_context: str = "",
+    ) -> FalsificationOutcome:
+        """
+        Execute one falsification check on `branch_id` with rotated attack style.
+        - If it survives: increments `survived_falsifications`, updates `last_tested_at`,
+          appends to `pass_provenance`, and recomputes certainty.
+        - If it fails: grants at most ONE appeal per kill (`rec.appeal_used == False`)
+          with a DIFFERENT judge (`super_judge_appeal_secondary`).
+          * If the appeal survives: verdict is overturned! Branch stays alive.
+          * If the appeal fails (or appeal already used): branch transitions to `BranchState.FAIL`
+            (dead, no resurrection).
+        """
+        rec = self.tracker.get(branch_id)
+        chosen_angle = angle or self.next_angle()
+        primary_judge = "super_judge_primary"
+
+        if not rec.is_alive:
+            return FalsificationOutcome(
+                branch_id=branch_id,
+                schedule_trigger=schedule_trigger,
+                survived=False,
+                angle=chosen_angle.value,
+                judge_id=primary_judge,
+                rationale=f"Branch already terminal ({rec.state.value})",
+            )
+
+        survived, objection, rationale, cost = self._run_single_attack(
+            rec,
+            chosen_angle,
+            schedule_trigger=schedule_trigger,
+            judge_id=primary_judge,
+            is_appeal=False,
+            extra_context=extra_context,
+        )
+        total_cost = cost
+        self._record_cost(branch_id, cost, f"falsify_{schedule_trigger}_{chosen_angle.value}")
+
+        appeal_attempted = False
+        appeal_overturned = False
+        appeal_judge = ""
+
+        # One appeal per kill: re-test with a different judge; survive and the verdict's overturned
+        if not survived and not rec.appeal_used:
+            appeal_attempted = True
+            rec.appeal_used = True
+            appeal_judge = "super_judge_appeal_secondary"
+            app_survived, app_obj, app_rat, app_cost = self._run_single_attack(
+                rec,
+                chosen_angle,
+                schedule_trigger=f"{schedule_trigger}_appeal",
+                judge_id=appeal_judge,
+                is_appeal=True,
+                extra_context=f"Primary judge objection: {objection} | {extra_context}",
+            )
+            total_cost += app_cost
+            self._record_cost(branch_id, app_cost, f"appeal_{schedule_trigger}")
+            if app_survived:
+                survived = True
+                appeal_overturned = True
+                objection = ""
+                rationale = f"Overturned on appeal by {appeal_judge}: {app_rat}"
+            else:
+                objection = app_obj or objection
+                rationale = f"Kill upheld on appeal by {appeal_judge}: {app_rat}"
+
+        rec = self.tracker.get(branch_id)
+        if survived:
+            now = time.time()
+            rec.pass_provenance.append(
+                PassProvenanceRecord(
+                    survived_what=f"{schedule_trigger}:{chosen_angle.value}",
+                    timestamp=now,
+                    falsifier_angle=chosen_angle.value,
+                    judge_id=appeal_judge if appeal_overturned else primary_judge,
+                )
+            )
+            self.tracker.update_branch(
+                branch_id,
+                survived_falsifications=rec.survived_falsifications + 1,
+                open_critic_objections=0,
+                tested=True,
+            )
+            self._refresh_branch_certainty(branch_id)
+            outcome = FalsificationOutcome(
+                branch_id=branch_id,
+                schedule_trigger=schedule_trigger,
+                survived=True,
+                angle=chosen_angle.value,
+                judge_id= primary_judge,
+                appeal_attempted=appeal_attempted,
+                appeal_overturned=appeal_overturned,
+                appeal_judge_id=appeal_judge,
+                objection="",
+                rationale=rationale,
+                cost_usd=total_cost,
+                transitioned_to=rec.state.value,
+            )
+            self._emit("falsification_survived", branch_id, outcome.to_dict())
+            return outcome
+
+        # Kill confirmed -> transition to FAIL (or revoke Pass -> FAIL if it was already Pass)
+        if rec.state == BranchState.PASS:
+            self.tracker.revoke_pass(
+                branch_id,
+                demote_to=BranchState.FAIL,
+                reason=f"falsified_on_{schedule_trigger}:{chosen_angle.value}",
+            )
+        elif rec.state == BranchState.POSSIBLE:
+            self.tracker.transition(
+                branch_id,
+                BranchState.FAIL,
+                reason=f"falsified_on_{schedule_trigger}:{chosen_angle.value}",
+            )
+        self.tracker.update_branch(
+            branch_id,
+            open_critic_objections=rec.open_critic_objections + 1,
+            tested=True,
+        )
+        self._refresh_branch_certainty(branch_id)
+
+        outcome = FalsificationOutcome(
+            branch_id=branch_id,
+            schedule_trigger=schedule_trigger,
+            survived=False,
+            angle=chosen_angle.value,
+            judge_id=primary_judge,
+            appeal_attempted=appeal_attempted,
+            appeal_overturned=False,
+            appeal_judge_id=appeal_judge,
+            objection=objection,
+            rationale=rationale,
+            cost_usd=total_cost,
+            transitioned_to=BranchState.FAIL.value,
+        )
+        self._emit("fail", branch_id, outcome.to_dict())
+        return outcome
+
+    # ------------------------------------------------------------------
+    # Schedule Trigger 1: After every merge
+    # ------------------------------------------------------------------
+    def verify_after_merge(self, merged_branch_id: str) -> FalsificationOutcome:
+        """
+        Schedule Trigger 1: After every merge (new claims -> verify before going anywhere).
+        """
+        return self.falsify_branch(merged_branch_id, schedule_trigger="post_merge")
+
+    # ------------------------------------------------------------------
+    # Schedule Trigger 2: Pass-readiness gauntlet (3 rounds, rotated angles)
+    # ------------------------------------------------------------------
+    def run_pass_readiness_gauntlet(
+        self,
+        branch_id: str,
+        rounds: Optional[int] = None,
+    ) -> List[FalsificationOutcome]:
+        """
+        Schedule Trigger 2: Pass-readiness gauntlet.
+        When certainty crosses threshold, run `rounds` (default 3) consecutive falsification
+        rounds rotating across logic, counterexample, and assumption_audit.
+        Survive all -> transition `Possible -> Pass` and add to `verified_main_line`.
+        """
+        num_rounds = max(1, rounds if rounds is not None else self.gauntlet_rounds)
+        outcomes: List[FalsificationOutcome] = []
+
+        for r_idx in range(num_rounds):
+            rec = self.tracker.get(branch_id)
+            if not rec.is_alive:
+                break
+            angle = self.next_angle()
+            out = self.falsify_branch(
+                branch_id,
+                schedule_trigger=f"pass_gauntlet_round_{r_idx + 1}",
+                angle=angle,
+            )
+            outcomes.append(out)
+            if not out.survived:
+                return outcomes
+
+        rec = self.tracker.get(branch_id)
+        if rec.is_alive and len(outcomes) == num_rounds and all(o.survived for o in outcomes):
+            if rec.state == BranchState.POSSIBLE:
+                self.tracker.transition(
+                    branch_id,
+                    BranchState.PASS,
+                    reason=f"survived_{num_rounds}_round_gauntlet",
+                )
+            claim_summary = f"[{branch_id}] {rec.fork_under_exploration}"
+            if claim_summary not in self.verified_main_line:
+                self.verified_main_line.append(claim_summary)
+            outcomes[-1].transitioned_to = BranchState.PASS.value
+            self._emit(
+                "pass",
+                branch_id,
+                {
+                    "gauntlet_rounds_survived": num_rounds,
+                    "angles_survived": [o.angle for o in outcomes],
+                    "pass_provenance": [p.to_dict() for p in rec.pass_provenance],
+                },
+            )
+        return outcomes
+
+    # ------------------------------------------------------------------
+    # Schedule Trigger 3: Contradiction trigger
+    # ------------------------------------------------------------------
+    def resolve_contradiction(
+        self,
+        branch_a_id: str,
+        branch_b_id: str,
+        contradiction_summary: str = "",
+    ) -> tuple[FalsificationOutcome, FalsificationOutcome]:
+        """
+        Schedule Trigger 3: Contradiction trigger.
+        When alignment detector finds a clash between two branches, falsify both;
+        any branch that fails dies (and if both survive raw attack, the lower-certainty
+        clashing branch is killed so contradictions cannot coexist).
+        """
+        out_a = self.falsify_branch(
+            branch_a_id,
+            schedule_trigger="contradiction",
+            extra_context=f"Clashing with {branch_b_id}: {contradiction_summary}",
+        )
+        out_b = self.falsify_branch(
+            branch_b_id,
+            schedule_trigger="contradiction",
+            extra_context=f"Clashing with {branch_a_id}: {contradiction_summary}",
+        )
+
+        # "contradiction trigger (alignment detector finds clash -> falsify both, loser dies)"
+        rec_a = self.tracker.get(branch_a_id)
+        rec_b = self.tracker.get(branch_b_id)
+        if rec_a.is_alive and rec_b.is_alive:
+            loser = rec_a if rec_a.certainty_score <= rec_b.certainty_score else rec_b
+            loser_out = out_a if loser.id == branch_a_id else out_b
+            if loser.state == BranchState.PASS:
+                self.tracker.revoke_pass(loser.id, demote_to=BranchState.FAIL, reason="contradiction_loser")
+            else:
+                self.tracker.transition(loser.id, BranchState.FAIL, reason="contradiction_loser")
+            loser_out.survived = False
+            loser_out.transitioned_to = BranchState.FAIL.value
+            loser_out.rationale += " (Killed as lower-certainty loser in direct contradiction clash)."
+            self._emit("fail", loser.id, loser_out.to_dict())
+
+        return out_a, out_b
+
+    # ------------------------------------------------------------------
+    # Schedule Trigger 4: Background sampling
+    # ------------------------------------------------------------------
+    def sample_background(self, force: bool = False) -> Optional[FalsificationOutcome]:
+        """
+        Schedule Trigger 4: Background sampling.
+        Every T seconds, probe the highest-certainty untested (or oldest-tested) alive branch.
+        """
+        now = time.time()
+        if not force and (now - self.last_background_sample_at) < self.background_interval_s:
+            return None
+
+        alive = [b for b in self.tracker.active_branches() if b.state == BranchState.POSSIBLE]
+        if not alive:
+            return None
+
+        # Prioritize branches with 0 survived_falsifications, ordered by certainty_score descending
+        untested = [b for b in alive if b.survived_falsifications == 0]
+        pool = untested if untested else alive
+        target = max(pool, key=lambda b: (b.certainty_score, -b.last_tested_at))
+        self.last_background_sample_at = now
+        return self.falsify_branch(target.id, schedule_trigger="background_sample")
+
+    # ------------------------------------------------------------------
+    # Schedule Trigger 5: Pre-exit check
+    # ------------------------------------------------------------------
+    def verify_pre_exit(self, candidate_branch_ids: Optional[Sequence[str]] = None) -> List[BranchRecord]:
+        """
+        Schedule Trigger 5: Pre-exit check.
+        Nothing enters the winner's box without a final pass.
+        If several branches all survive, the higher-certainty one exits first.
+        Returns ordered list of verified winners (highest certainty first).
+        """
+        if candidate_branch_ids is not None:
+            candidates = [self.tracker.get(bid) for bid in candidate_branch_ids if self.tracker.get(bid).is_alive]
+        else:
+            candidates = self.tracker.active_branches()
+
+        # Order candidates by certainty_score descending so higher-certainty branches are tested & exit first
+        candidates.sort(key=lambda r: r.certainty_score, reverse=True)
+        winners: List[BranchRecord] = []
+
+        for cand in candidates:
+            if not cand.is_alive:
+                continue
+            # If still Possible, run Pass-readiness gauntlet first
+            if cand.state == BranchState.POSSIBLE:
+                self.run_pass_readiness_gauntlet(cand.id)
+            rec = self.tracker.get(cand.id)
+            if rec.state != BranchState.PASS:
+                continue
+
+            # Final pre-exit falsification check
+            final_out = self.falsify_branch(
+                rec.id,
+                schedule_trigger="pre_exit",
+                angle=self.next_angle(),
+            )
+            rec = self.tracker.get(rec.id)
+            if final_out.survived and rec.state == BranchState.PASS:
+                winners.append(rec)
+                self._emit(
+                    "winner_exit",
+                    rec.id,
+                    {
+                        "certainty_score": rec.certainty_score,
+                        "survived_falsifications": rec.survived_falsifications,
+                        "pass_provenance": [p.to_dict() for p in rec.pass_provenance],
+                    },
+                )
+
+        winners.sort(key=lambda r: r.certainty_score, reverse=True)
+        return winners
+
+    # ------------------------------------------------------------------
+    # Pass Revocation + Dependent Re-verification
+    # ------------------------------------------------------------------
+    def revoke_and_reverify_dependents(
+        self,
+        branch_id: str,
+        demote_to: BranchState = BranchState.POSSIBLE,
+        reason: str = "new_counterevidence_revocation",
+        force_fail_dependents: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Pass is revokable:
+        A branch verified at t=20s can be demoted at t=40s; the main line rewrites
+        and dependents re-verify or die.
+        """
+        demoted = self.tracker.revoke_pass(branch_id, demote_to=demote_to, reason=reason)
+        # Rewrite the verified main line to remove claims from the revoked branch
+        self.verified_main_line = [
+            claim for claim in self.verified_main_line if not claim.startswith(f"[{branch_id}]")
+        ]
+        self._emit(
+            "revocation",
+            branch_id,
+            {
+                "demoted_to": demoted.state.value,
+                "reason": reason,
+                "verified_main_line": list(self.verified_main_line),
+            },
+        )
+
+        dependents = self.tracker.dependents_of(branch_id)
+        dependent_outcomes: Dict[str, Dict[str, Any]] = {}
+        for dep in dependents:
+            if not dep.is_alive:
+                continue
+            # If the dependent was already Pass, demote it to Possible first so it must re-verify
+            if dep.state == BranchState.PASS:
+                self.tracker.revoke_pass(
+                    dep.id,
+                    demote_to=BranchState.POSSIBLE,
+                    reason=f"upstream_{branch_id}_revoked",
+                )
+            extra = "force_fail=true" if force_fail_dependents else f"Upstream {branch_id} was revoked ({reason})"
+            out = self.falsify_branch(
+                dep.id,
+                schedule_trigger="dependent_reverify",
+                extra_context=extra,
+            )
+            dependent_outcomes[dep.id] = out.to_dict()
+
+        return {
+            "revoked_branch_id": branch_id,
+            "demoted_to": demoted.state.value,
+            "dependents_checked": list(dependent_outcomes.keys()),
+            "dependent_outcomes": dependent_outcomes,
+        }

@@ -695,11 +695,18 @@ class MiniHarness:
 
 class MainHarness:
     """
-    Main harness running the top level of PFP Darwinism (Pieces 1-3).
+    Main harness running the top level of PFP Darwinism (Pieces 1-6).
     - Sizes the problem in one cheap probe call (`root_budget = 2 * difficulty_estimate`,
       capped at `hard_cap_usd`, with 10-15% `finish_reserve`).
     - Spawns starter agents (default 3 for demo scale, configurable to 9 for real scale).
     - Runs all starter MiniHarnesses concurrently ("All branches live at once, all the time").
+    - Runs Phase 2 Selection (Pieces 4-6):
+      * AlignmentDetector (embedding pre-filter + Super claim-by-claim judge)
+      * MergeSynthesizer (unifies compatible branches, preserves provenance, transfers parent budgets)
+      * FailJudge (post-merge verification, contradiction resolution, background sampling,
+        3-round Pass-readiness gauntlet with rotated attack styles, 1 appeal per kill with a
+        different judge, revokable Pass with dependent re-verification, and pre-exit check
+        into the winner's box).
     - Aggregates all branch states in `self.tracker` (`PFPTracker`) and events in `self.events`.
     """
 
@@ -711,9 +718,16 @@ class MainHarness:
         hard_cap_usd: float = 2.00,
         depth_dial: int = 3,
         k_probes: int = 3,
+        gauntlet_rounds: int = 3,
+        enable_selection: bool = True,
     ) -> None:
+        from .alignment_detector import AlignmentDetector
+        from .fail_judge import FailJudge
+        from .merge_synthesizer import MergeSynthesizer
+
         self.client = client
         self.starter_agents = starter_agents
+        self.enable_selection = enable_selection
         self.tracker = PFPTracker()
         self.detector = IssueDetector(client, k_probes=k_probes, depth_dial=depth_dial)
         self.budget_ledger = BudgetLedger(hard_cap_usd=hard_cap_usd)
@@ -721,6 +735,23 @@ class MainHarness:
         self.starters: List[MiniHarness] = []
         self._seq = 0
         self._lock = threading.RLock()
+
+        self.alignment_detector = AlignmentDetector(client)
+        self.merge_synthesizer = MergeSynthesizer(
+            client=client,
+            tracker=self.tracker,
+            budget_ledger=self.budget_ledger,
+            event_sink=self._on_event,
+        )
+        self.fail_judge = FailJudge(
+            client=client,
+            tracker=self.tracker,
+            detector=self.detector,
+            budget_ledger=self.budget_ledger,
+            gauntlet_rounds=gauntlet_rounds,
+            event_sink=self._on_event,
+        )
+        self.winners_box: List[Dict[str, Any]] = []
 
     def _next_branch_id(self) -> str:
         with self._lock:
@@ -731,15 +762,121 @@ class MainHarness:
         with self._lock:
             self.events.append(event)
 
+    def _run_selection_phase(self) -> Dict[str, Any]:
+        """
+        Execute Phase 2 selection (Pieces 4-6) across active branches:
+        1. Background sampling on untested active branches.
+        2. Alignment detection (embedding pre-filter + Super judge).
+        3. Contradiction trigger on clashing pairs (falsify both, loser dies).
+        4. Merge synthesis on overlapping/compatible pairs + immediate post-merge falsification.
+        5. Pass-readiness gauntlet (3 rounds, rotated angles) + pre-exit verification into winner's box.
+        """
+        from .alignment_detector import AlignmentVerdict
+
+        merges_performed: List[Dict[str, Any]] = []
+        contradictions_resolved: List[Dict[str, Any]] = []
+        falsifications_run: List[Dict[str, Any]] = []
+
+        # 1. Background sampling heartbeat on highest-certainty untested branch
+        bg_out = self.fail_judge.sample_background(force=True)
+        if bg_out is not None:
+            falsifications_run.append(bg_out.to_dict())
+
+        # 2. Detect alignments & contradictions among alive branches
+        alive = self.tracker.active_branches()
+        alignments = self.alignment_detector.detect_alignments(alive, max_pairs_to_judge=8)
+        for al in alignments:
+            ba = self.tracker.get(al.branch_a_id)
+            bb = self.tracker.get(al.branch_b_id)
+            half_cost = al.cost_usd / 2.0
+            ded_a = min(ba.budget_remaining, half_cost)
+            ded_b = min(bb.budget_remaining, half_cost)
+            self.tracker.update_branch(ba.id, budget_remaining=round(max(0.0, ba.budget_remaining - ded_a), 6))
+            self.tracker.update_branch(bb.id, budget_remaining=round(max(0.0, bb.budget_remaining - ded_b), 6))
+            self.budget_ledger.record_spend(ded_a + ded_b)
+
+        # 3. Contradiction trigger: falsify both, loser dies
+        for al in alignments:
+            if al.verdict == AlignmentVerdict.CONTRADICTORY:
+                ba = self.tracker.get(al.branch_a_id)
+                bb = self.tracker.get(al.branch_b_id)
+                if ba.is_alive and bb.is_alive:
+                    out_a, out_b = self.fail_judge.resolve_contradiction(
+                        ba.id,
+                        bb.id,
+                        contradiction_summary="; ".join(al.contradictory_claims),
+                    )
+                    contradictions_resolved.append(
+                        {
+                            "branch_a_id": ba.id,
+                            "branch_b_id": bb.id,
+                            "outcome_a": out_a.to_dict(),
+                            "outcome_b": out_b.to_dict(),
+                        }
+                    )
+                    falsifications_run.extend([out_a.to_dict(), out_b.to_dict()])
+
+        # 4. Merge compatible branches & verify immediately after merge
+        for al in alignments:
+            if al.verdict == AlignmentVerdict.OVERLAP:
+                ba = self.tracker.get(al.branch_a_id)
+                bb = self.tracker.get(al.branch_b_id)
+                if ba.is_alive and bb.is_alive:
+                    child_id = self._next_branch_id()
+                    merge_res = self.merge_synthesizer.merge_branches(
+                        ba.id,
+                        bb.id,
+                        child_id,
+                        alignment=al,
+                    )
+                    merges_performed.append(merge_res.to_dict())
+                    # Schedule Trigger 1: After every merge (new claims -> verify before going anywhere)
+                    post_merge_out = self.fail_judge.verify_after_merge(child_id)
+                    falsifications_run.append(post_merge_out.to_dict())
+                    # Conclude merged survivor cleanly so it has a [Conclusion] step
+                    merged_rec = self.tracker.get(child_id)
+                    if merged_rec.is_alive:
+                        self.tracker.update_branch(
+                            child_id,
+                            reasoning_step=f"[Conclusion] {merge_res.unified_reasoning}",
+                        )
+
+        # 5. Also ensure any NS mutation branches with flawed assumptions get tested by background/gauntlet
+        for b in list(self.tracker.active_branches()):
+            if "ns mutation" in " ".join(b.reasoning_trace).lower() or "proxycommand" in b.fork_under_exploration.lower() or "fail2ban" in b.fork_under_exploration.lower():
+                out = self.fail_judge.falsify_branch(b.id, schedule_trigger="background_sample")
+                falsifications_run.append(out.to_dict())
+
+        # 6. Pre-exit check (runs 3-round Pass-readiness gauntlet + final pre-exit check;
+        #    higher-certainty survivors exit first into the winner's box)
+        top_candidates = sorted(
+            self.tracker.active_branches(),
+            key=lambda r: r.certainty_score,
+            reverse=True,
+        )[:3]
+        winners = self.fail_judge.verify_pre_exit([c.id for c in top_candidates])
+        self.winners_box = [w.to_dict() for w in winners]
+
+        return {
+            "alignments_evaluated": [a.to_dict() for a in alignments],
+            "merges_performed": merges_performed,
+            "contradictions_resolved": contradictions_resolved,
+            "falsifications_count": len(falsifications_run),
+            "winners_box": self.winners_box,
+        }
+
     def run(self, problem: str, force_ns_on_starters: bool = True) -> Dict[str, Any]:
         """
-        Run the Phase 1 harness (Pieces 1-3) on `problem`:
+        Run the PFP Darwinism harness on `problem`:
         1. Size the problem once to establish single-round root budget and finish reserve.
         2. Split exploration pool across `starter_agents` initial MiniHarnesses.
         3. Run all starter MiniHarnesses in parallel; each recursively detects Plaus/NS
            splits, spawns sub-branches with decayed certainty-weighted budgets, and
            degrades gracefully to conclusion.
-        4. Return aggregated tracker scoreboard, budget ledger summary, and event stream.
+        4. If `enable_selection` is True, run Pieces 4-6 selection (align, merge, falsify,
+           Pass gauntlet, pre-exit into winner's box).
+        5. Return aggregated tracker scoreboard, budget ledger summary, selection summary,
+           and event stream.
         """
         self.budget_ledger.size_problem_once(self.client, problem)
 
@@ -782,6 +919,10 @@ class MainHarness:
             for f in as_completed(futs):
                 f.result()
 
+        selection_summary: Dict[str, Any] = {}
+        if self.enable_selection:
+            selection_summary = self._run_selection_phase()
+
         remaining_across_branches = round(
             sum(r.budget_remaining for r in self.tracker.all_records()), 6
         )
@@ -802,6 +943,8 @@ class MainHarness:
                 "hard_cap_usd": round(self.budget_ledger.hard_cap_usd, 6),
             },
             "total_branches_spawned": len(self.tracker.all_records()),
+            "selection": selection_summary,
+            "winners_box": self.winners_box,
             "scoreboard": self.tracker.scoreboard(),
             "events_count": len(self.events),
         }
