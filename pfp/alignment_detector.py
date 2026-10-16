@@ -25,6 +25,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .backend import SUPER_MODEL
+from .jsonutil import as_str_list, parse_json_object
 from .tracker import BranchRecord
 
 
@@ -175,6 +176,8 @@ class AlignmentDetector:
         self.embedding_dim = embedding_dim
         self.super_model = super_model
         self._claims_cache: Dict[Tuple[str, int], List[str]] = {}
+        # Pairs already judged at their current trace versions — never pay Super twice for the same verdict
+        self._judged_pairs: set = set()
 
     def embedding_prefilter(
         self,
@@ -236,11 +239,11 @@ class AlignmentDetector:
             max_tokens=160,
         )
         cost = float(resp.usage.cost_usd)
-        raw = resp.choices[0].message.content if resp.choices else "{}"
-        try:
-            parsed = json.loads(raw)
-            claims = [str(c) for c in parsed.get("core_claims", []) if str(c).strip()]
-        except Exception:
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
+        parsed = parse_json_object(raw)
+        if parsed is not None:
+            claims = as_str_list(parsed.get("core_claims"))
+        else:
             claims = [pos_text[:160]] if pos_text else []
         if not claims:
             claims = [branch.fork_under_exploration or pos_text[:120]]
@@ -295,22 +298,22 @@ class AlignmentDetector:
             max_tokens=220,
         )
         total_cost = cost_a + cost_b + float(resp.usage.cost_usd)
-        raw = resp.choices[0].message.content if resp.choices else "{}"
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
 
-        try:
-            data = json.loads(raw)
-            v_str = str(data.get("verdict", "unrelated")).lower().strip()
+        data = parse_json_object(raw)
+        if data is not None:
+            v_str = str(data.get("verdict") or "unrelated").lower().strip()
             if v_str in ("overlap", "compatible", "alignable"):
                 verdict = AlignmentVerdict.OVERLAP
             elif v_str in ("contradictory", "contradiction", "clash"):
                 verdict = AlignmentVerdict.CONTRADICTORY
             else:
                 verdict = AlignmentVerdict.UNRELATED
-            overlapping = [str(x) for x in data.get("overlapping_claims", [])]
-            contradictory = [str(x) for x in data.get("contradictory_claims", [])]
-            disjoint = [str(x) for x in data.get("disjoint_claims", [])]
-            rationale = str(data.get("rationale", ""))
-        except Exception:
+            overlapping = as_str_list(data.get("overlapping_claims"))
+            contradictory = as_str_list(data.get("contradictory_claims"))
+            disjoint = as_str_list(data.get("disjoint_claims"))
+            rationale = str(data.get("rationale") or "")
+        else:
             verdict = AlignmentVerdict.UNRELATED
             overlapping, contradictory, disjoint = [], [], []
             rationale = raw.strip()
@@ -341,14 +344,21 @@ class AlignmentDetector:
         """
         by_id = {b.id: b for b in branches if b.is_alive}
         candidates = self.embedding_prefilter(list(by_id.values()))
-        shortlisted = [c for c in candidates if c.passed_prefilter][:max_pairs_to_judge]
 
         results: List[AlignmentJudgeResult] = []
-        for cand in shortlisted:
+        for cand in candidates:
+            if len(results) >= max_pairs_to_judge:
+                break
+            if not cand.passed_prefilter:
+                continue
             ba = by_id.get(cand.branch_a_id)
             bb = by_id.get(cand.branch_b_id)
             if ba is None or bb is None or not ba.is_alive or not bb.is_alive:
                 continue
+            pair_key = tuple(sorted([(ba.id, len(ba.reasoning_trace)), (bb.id, len(bb.reasoning_trace))]))
+            if pair_key in self._judged_pairs:
+                continue
+            self._judged_pairs.add(pair_key)
             res = self.judge_pair(ba, bb, cosine_sim=cand.cosine_similarity)
             results.append(res)
         return results

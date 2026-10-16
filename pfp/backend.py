@@ -18,10 +18,12 @@ import json
 import math
 import os
 import random
+import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
 DEFAULT_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
@@ -147,14 +149,90 @@ class ChatCompletionResponse:
         return self.to_dict()[key]
 
 
+class BackendError(RuntimeError):
+    """Raised when the live endpoint fails after all retries (carries HTTP status + body snippet)."""
+
+    def __init__(self, message: str, status: Optional[int] = None, body: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
+class HardCapExceededError(RuntimeError):
+    """Raised by `MeteredClient` when a call would start after true spend reached the hard cap."""
+
+
+# HTTP statuses worth retrying: rate limits and transient upstream failures.
+RETRYABLE_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+
 class _LiveChatCompletions:
     """OpenAI-compatible `client.chat.completions` implementation over HTTP."""
 
-    def __init__(self, base_url: str, api_key: str, default_model: str, timeout: float = 120.0):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        default_model: str,
+        timeout: float = 120.0,
+        max_retries: int = 3,
+        backoff_base_s: float = 0.5,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.default_model = default_model
         self.timeout = timeout
+        self.max_retries = max(0, int(max_retries))
+        self.backoff_base_s = max(0.0, backoff_base_s)
+        self._sleep = sleep
+
+    def _backoff_delay(self, attempt: int, retry_after: Optional[str]) -> float:
+        if retry_after:
+            try:
+                return min(60.0, max(0.0, float(retry_after)))
+            except ValueError:
+                pass
+        # Exponential backoff with full jitter so hundreds of parallel branches don't stampede
+        return random.uniform(0.0, self.backoff_base_s * (2 ** attempt))
+
+    def _post_with_retries(self, body: bytes) -> Dict[str, Any]:
+        last_error: Optional[BackendError] = None
+        for attempt in range(self.max_retries + 1):
+            req = urllib.request.Request(
+                f"{self.base_url}/chat/completions",
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            retry_after: Optional[str] = None
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return json.load(resp)
+            except urllib.error.HTTPError as exc:
+                snippet = ""
+                try:
+                    snippet = exc.read().decode("utf-8", "replace")[:500]
+                except Exception:
+                    pass
+                last_error = BackendError(
+                    f"HTTP {exc.code} from {self.base_url}/chat/completions: {snippet}",
+                    status=exc.code,
+                    body=snippet,
+                )
+                if exc.code not in RETRYABLE_STATUSES:
+                    raise last_error from exc
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                last_error = BackendError(f"Network error calling {self.base_url}: {exc}")
+            except json.JSONDecodeError as exc:
+                last_error = BackendError(f"Non-JSON response from {self.base_url}: {exc}")
+            if attempt < self.max_retries:
+                self._sleep(self._backoff_delay(attempt, retry_after))
+        assert last_error is not None
+        raise last_error
 
     def create(
         self,
@@ -183,16 +261,7 @@ class _LiveChatCompletions:
         payload.update(kwargs)
 
         body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            raw = json.load(resp)
+        raw = self._post_with_retries(body)
 
         choices: List[Choice] = []
         for idx, ch in enumerate(raw.get("choices", [])):
@@ -218,15 +287,16 @@ class _LiveChatCompletions:
                 Choice(
                     index=ch.get("index", idx),
                     message=ChatMessage(
-                        role=msg.get("role", "assistant"),
-                        content=msg.get("content", ""),
+                        role=msg.get("role") or "assistant",
+                        # Reasoning models may return null content with the answer in reasoning_content
+                        content=msg.get("content") or msg.get("reasoning_content") or "",
                     ),
-                    finish_reason=ch.get("finish_reason", "stop"),
+                    finish_reason=ch.get("finish_reason") or "stop",
                     logprobs=lp_obj,
                 )
             )
 
-        usage_raw = raw.get("usage", {})
+        usage_raw = raw.get("usage") or {}
         p_tok = int(usage_raw.get("prompt_tokens", 0))
         c_tok = int(usage_raw.get("completion_tokens", 0))
         t_tok = int(usage_raw.get("total_tokens", p_tok + c_tok))
@@ -262,6 +332,8 @@ class OpenAICompatibleClient:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         timeout: float = 120.0,
+        max_retries: int = 3,
+        backoff_base_s: float = 0.5,
     ):
         self.base_url = (base_url or get_base_url()).rstrip("/")
         self.api_key = api_key if api_key is not None else os.environ.get("NEBIUS_API_KEY", "")
@@ -273,8 +345,93 @@ class OpenAICompatibleClient:
                 api_key=self.api_key,
                 default_model=self.model,
                 timeout=timeout,
+                max_retries=max_retries,
+                backoff_base_s=backoff_base_s,
             )
         )
+
+
+class _MeteredCompletions:
+    def __init__(self, owner: "MeteredClient"):
+        self._owner = owner
+
+    def create(self, *args: Any, **kwargs: Any) -> Any:
+        return self._owner._metered_create(*args, **kwargs)
+
+
+class _MeteredChatNamespace:
+    def __init__(self, completions: _MeteredCompletions):
+        self.completions = completions
+
+
+class MeteredClient:
+    """
+    Ground-truth spend meter + safety rail around any OpenAI-compatible client.
+
+    - Every call's real `usage.cost_usd` is recorded, whether or not a branch
+      budget could cover it, so reported spend is the truth (not what the
+      ledger could afford).
+    - Hard cap: once true spend reaches `hard_cap_usd`, further calls raise
+      `HardCapExceededError` before any request is sent.
+    - `max_concurrent_calls` bounds in-flight requests across all parallel
+      mini-harnesses (hundreds of branches, one connection pool).
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        hard_cap_usd: Optional[float] = None,
+        max_concurrent_calls: int = 32,
+    ) -> None:
+        self.inner = inner
+        self.hard_cap_usd = hard_cap_usd
+        self.model = getattr(inner, "model", "")
+        self.base_url = getattr(inner, "base_url", "")
+        self.is_mock = getattr(inner, "is_mock", False)
+        self.total_cost_usd: float = 0.0
+        self.calls: int = 0
+        self.failed_calls: int = 0
+        self.cost_by_model: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent_calls)))
+        self.chat = _MeteredChatNamespace(_MeteredCompletions(self))
+
+    @property
+    def cap_reached(self) -> bool:
+        with self._lock:
+            return self.hard_cap_usd is not None and self.total_cost_usd >= self.hard_cap_usd
+
+    def _metered_create(self, *args: Any, **kwargs: Any) -> Any:
+        if self.cap_reached:
+            raise HardCapExceededError(
+                f"Hard cap ${self.hard_cap_usd:.4f} reached (spent ${self.total_cost_usd:.4f}); refusing new calls."
+            )
+        with self._slots:
+            try:
+                resp = self.inner.chat.completions.create(*args, **kwargs)
+            except Exception:
+                with self._lock:
+                    self.failed_calls += 1
+                raise
+        cost = float(getattr(getattr(resp, "usage", None), "cost_usd", 0.0) or 0.0)
+        model = str(kwargs.get("model") or self.model)
+        with self._lock:
+            self.calls += 1
+            self.total_cost_usd = round(self.total_cost_usd + cost, 8)
+            self.cost_by_model[model] = round(self.cost_by_model.get(model, 0.0) + cost, 8)
+        return resp
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "calls": self.calls,
+                "failed_calls": self.failed_calls,
+                "total_cost_usd": round(self.total_cost_usd, 6),
+                "cost_by_model": {k: round(v, 6) for k, v in self.cost_by_model.items()},
+                "hard_cap_usd": self.hard_cap_usd,
+                "cap_reached": self.hard_cap_usd is not None and self.total_cost_usd >= self.hard_cap_usd,
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +526,7 @@ class _MockChatCompletions:
         self.default_model = default_model
         self._rng = random.Random(seed)
         self._call_count = 0
+        self._count_lock = threading.Lock()
         self.force_cost_scale = force_cost_scale
 
     def _build_logprobs(self, high_entropy: bool) -> ChoiceLogprobs:
@@ -400,6 +558,9 @@ class _MockChatCompletions:
         choice_idx: int,
     ) -> tuple[str, bool]:
         lower = prompt_text.lower()
+        # Content-addressed choices: the same prompt always yields the same reply, no matter
+        # how parallel branches interleave — runs and replays are reproducible
+        digest = int(hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()[:8], 16)
 
         # 1. Difficulty estimation probe call
         if "difficulty_estimate" in lower or "size the problem" in lower:
@@ -408,7 +569,7 @@ class _MockChatCompletions:
                     {
                         "difficulty_tier": "medium",
                         "estimated_calls": 40,
-                        "difficulty_estimate_usd": 0.05,
+                        "difficulty_estimate_usd": 0.5,
                         "rationale": "Multi-hypothesis systems diagnostic requiring parallel fork exploration.",
                     }
                 ),
@@ -421,7 +582,7 @@ class _MockChatCompletions:
                 leaps: List[str] = []
             elif "ns mutation" in lower:
                 leaps = ["Assumes client-side override without packet capture verification"]
-            elif self._call_count % 3 == 0:
+            elif digest % 3 == 0:
                 leaps = [
                     "Assumes TCP port 22 is reachable without checking host firewall state",
                     "Skips daemon status check before testing authentication keys",
@@ -441,7 +602,7 @@ class _MockChatCompletions:
                 and "fail_judge" not in lower
             )
         ):
-            pick = _NS_MUTATION_POOL[(self._call_count + choice_idx) % len(_NS_MUTATION_POOL)]
+            pick = _NS_MUTATION_POOL[(digest + choice_idx) % len(_NS_MUTATION_POOL)]
             return (
                 json.dumps(
                     {
@@ -733,7 +894,7 @@ class _MockChatCompletions:
             )
 
         # Default reasoning continuation
-        fork = _PLAUS_FORK_POOL[(self._call_count + choice_idx) % len(_PLAUS_FORK_POOL)]
+        fork = _PLAUS_FORK_POOL[(digest + choice_idx) % len(_PLAUS_FORK_POOL)]
         return (
             json.dumps(
                 {
@@ -757,7 +918,9 @@ class _MockChatCompletions:
         n: int = 1,
         **kwargs: Any,
     ) -> ChatCompletionResponse:
-        self._call_count += 1
+        with self._count_lock:
+            self._call_count += 1
+            call_no = self._call_count
         target_model = model or self.default_model
         prompt_text = "\n".join(m.get("content", "") for m in messages)
 
@@ -782,7 +945,7 @@ class _MockChatCompletions:
         cost = estimate_call_cost_usd(prompt_tokens, total_out_tokens, target_model) * self.force_cost_scale
 
         return ChatCompletionResponse(
-            id=f"mockcmpl-{self._call_count:06d}",
+            id=f"mockcmpl-{call_no:06d}",
             model=target_model,
             choices=choices,
             usage=CompletionUsage(
@@ -831,6 +994,7 @@ def create_client(
     api_key: Optional[str] = None,
     seed: int = 42,
     force_cost_scale: float = 50.0,
+    max_retries: int = 3,
 ) -> OpenAICompatibleClient | MockOpenAIClient:
     """
     Factory returning an OpenAI-compatible client.
@@ -851,4 +1015,5 @@ def create_client(
         base_url=base_url,
         api_key=resolved_key,
         model=model,
+        max_retries=max_retries,
     )

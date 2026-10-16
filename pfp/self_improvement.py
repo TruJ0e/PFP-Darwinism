@@ -33,10 +33,13 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional
 
-from .arena import ArenaEvent
+from .arena import ARENA_LEVEL_EVENT_TYPES, ArenaEvent
 from .backend import SUPER_MODEL
+from .dials import DEFAULT_DIALS, resolve_dials, sanitize_dials, weights_from_dials
+from .issue_detector import _jaccard_similarity
+from .jsonutil import as_str_list, parse_json_object
 
 
 @dataclass
@@ -85,6 +88,8 @@ class EventLogMiner:
         total_spent_usd = 0.0
 
         for evt in ev_list:
+            if evt.event_type in ARENA_LEVEL_EVENT_TYPES:
+                continue
             branches[evt.branch_id] = copy.deepcopy(evt.snapshot)
             et = evt.event_type
             det = evt.details
@@ -135,6 +140,8 @@ class EventLogMiner:
                     "survived_falsifications": int(w.get("survived_falsifications", 0)),
                     "certainty_score": float(w.get("certainty_score", 0.0)),
                     "fork_shape": str(w.get("fork_under_exploration", "")),
+                    "solution": str(w.get("solution", "")),
+                    "origin": str(w.get("origin", "")),
                 }
             )
 
@@ -198,11 +205,14 @@ class RewriteProposition:
     prompt_changes: Dict[str, str] = field(default_factory=dict)
     self_assessment: Dict[str, Any] = field(default_factory=dict)
     anti_model_critique: List[Dict[str, Any]] = field(default_factory=list)
+    # Proposed dial changes that failed validation (unknown key, non-numeric, out of safe range)
+    rejected_dial_changes: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "summary": self.summary,
             "dial_changes": copy.deepcopy(self.dial_changes),
+            "rejected_dial_changes": copy.deepcopy(self.rejected_dial_changes),
             "prompt_changes": copy.deepcopy(self.prompt_changes),
             "self_assessment": copy.deepcopy(self.self_assessment),
             "anti_model_critique": copy.deepcopy(self.anti_model_critique),
@@ -301,14 +311,7 @@ class VersionRegistry:
         self.emergency_stopped: bool = False
         self.failed_experiments: List[Dict[str, Any]] = []
 
-        default_dials = initial_dials or {
-            "survived_falsifications_weight": 3.0,
-            "merges_attracted_weight": 1.5,
-            "open_critic_objections_weight": -1.25,
-            "age_without_testing_weight": -0.15,
-            "prefilter_threshold": 0.20,
-            "gauntlet_rounds": 3,
-        }
+        default_dials = initial_dials or dict(DEFAULT_DIALS)
         default_prompts = initial_prompts or {
             "plaus_probe_hint": "Explore diverse root-cause hypotheses across host and network layers.",
         }
@@ -406,6 +409,78 @@ class VersionRegistry:
         if adopt and self.pinned_version_id is None:
             self.active_version_id = vid
         return snap
+
+    # ------------------------------------------------------------------
+    # Persistence: the failsafe only protects across runs if it survives the process
+    # ------------------------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "format": "pfp-version-registry/1",
+            "degradation_threshold": self.degradation_threshold,
+            "active_version_id": self.active_version_id,
+            "pinned_version_id": self.pinned_version_id,
+            "pending_next_run_version_id": self.pending_next_run_version_id,
+            "failed_experiments": copy.deepcopy(self.failed_experiments),
+            "versions": [self._versions[vid].to_dict() for vid in self._version_order],
+        }
+
+    def save(self, path: str | Path) -> Path:
+        if self.run_in_progress:
+            raise RunBoundarySwitchError("Save the registry between runs, not mid-arena.")
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        tmp.replace(target)
+        return target
+
+    @classmethod
+    def load(cls, path: str | Path) -> "VersionRegistry":
+        """
+        Restore a saved registry. Every snapshot's SHA-256 is re-verified against its
+        recorded payload; a tampered or corrupted version refuses to load.
+        """
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        reg = cls.__new__(cls)
+        reg.degradation_threshold = float(raw.get("degradation_threshold", 0.15))
+        reg._versions = {}
+        reg._version_order = []
+        reg.run_in_progress = False
+        reg.emergency_stopped = False
+        reg.failed_experiments = list(raw.get("failed_experiments", []))
+        for v in raw.get("versions", []):
+            snap = VersionSnapshot(
+                version_id=str(v["version_id"]),
+                sha256_hash=str(v["sha256_hash"]),
+                created_at=float(v.get("created_at", 0.0)),
+                parent_version_id=v.get("parent_version_id"),
+                config_dials=dict(v.get("config_dials", {})),
+                prompts={str(k): str(val) for k, val in dict(v.get("prompts", {})).items()},
+                code_snapshot_hashes=dict(v.get("code_snapshot_hashes", {})),
+                proposition=dict(v.get("proposition", {})),
+                sandbox_result=dict(v.get("sandbox_result", {})),
+                status=str(v.get("status", "adopted")),
+            )
+            expected = cls._hash_payload(
+                snap.config_dials,
+                snap.prompts,
+                snap.code_snapshot_hashes,
+                snap.proposition,
+                snap.sandbox_result,
+            )
+            if expected != snap.sha256_hash:
+                raise ValueError(f"Version {snap.version_id} failed SHA-256 integrity check; refusing to load.")
+            reg._versions[snap.version_id] = snap
+            reg._version_order.append(snap.version_id)
+        if not reg._version_order:
+            raise ValueError("Registry file contains no versions.")
+        reg.active_version_id = str(raw.get("active_version_id") or reg._version_order[0])
+        reg.pinned_version_id = raw.get("pinned_version_id")
+        reg.pending_next_run_version_id = raw.get("pending_next_run_version_id")
+        for ref in (reg.active_version_id, reg.pinned_version_id, reg.pending_next_run_version_id):
+            if ref is not None and ref not in reg._versions:
+                raise ValueError(f"Registry references unknown version {ref}")
+        return reg
 
     def get_version(self, version_id: Optional[str] = None) -> VersionSnapshot:
         target = version_id or self.pinned_version_id or self.active_version_id
@@ -571,18 +646,74 @@ class SelfImprovementLoop:
         self.case_bank: List[Dict[str, Any]] = []
 
     def record_wins_for_recall(self, metrics: MinedArenaMetrics, problem: str) -> List[Dict[str, Any]]:
-        """Step 2 (Recall): store winning branch shapes in the case bank to seed future runs."""
+        """
+        Step 2 (Recall): store winning branch shapes in the case bank to seed future runs.
+        A repeated win for the same problem + shape updates the case (keeps the best
+        certainty, counts wins) instead of piling up duplicates.
+        """
         added: List[Dict[str, Any]] = []
         for shape in metrics.winning_branch_shapes:
+            existing = next(
+                (
+                    c
+                    for c in self.case_bank
+                    if c.get("problem") == problem and c.get("fork_shape") == shape["fork_shape"]
+                ),
+                None,
+            )
+            if existing is not None:
+                existing["certainty_score"] = max(float(existing.get("certainty_score", 0.0)), shape["certainty_score"])
+                existing["wins"] = int(existing.get("wins", 1)) + 1
+                continue
             entry = {
                 "problem": problem,
                 "fork_shape": shape["fork_shape"],
+                "solution": shape.get("solution", ""),
                 "is_merged_branch": shape["is_merged_branch"],
                 "certainty_score": shape["certainty_score"],
+                "wins": 1,
             }
             self.case_bank.append(entry)
             added.append(entry)
         return added
+
+    def recall(self, problem: str, k: int = 3, min_similarity: float = 0.15) -> List[Dict[str, Any]]:
+        """
+        Case-based recall: past wins on similar problems, best match first
+        (similarity to `problem`, then certainty). Distinct fork shapes only.
+        """
+        scored = []
+        for case in self.case_bank:
+            sim = _jaccard_similarity(problem, str(case.get("problem", "")))
+            if sim < min_similarity:
+                continue
+            scored.append((sim, float(case.get("certainty_score", 0.0)), case))
+        scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        seen: set = set()
+        out: List[Dict[str, Any]] = []
+        for sim, _, case in scored:
+            if case.get("fork_shape") in seen:
+                continue
+            seen.add(case.get("fork_shape"))
+            out.append(dict(case, similarity=round(sim, 4)))
+            if len(out) >= max(0, k):
+                break
+        return out
+
+    def save_case_bank(self, path: str | Path) -> Path:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.case_bank, indent=2), encoding="utf-8")
+        tmp.replace(target)
+        return target
+
+    def load_case_bank(self, path: str | Path) -> int:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            raise ValueError("Case bank file must contain a JSON list.")
+        self.case_bank = [dict(c) for c in raw if isinstance(c, dict) and c.get("fork_shape")]
+        return len(self.case_bank)
 
     def run_self_assessment(self, metrics: MinedArenaMetrics) -> Dict[str, Any]:
         """Step 3: Post-run self-assessment summary — what worked, what to improve."""
@@ -601,11 +732,14 @@ class SelfImprovementLoop:
             temperature=0.2,
             max_tokens=200,
         )
-        raw = resp.choices[0].message.content if resp.choices else "{}"
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {"what_worked": [raw.strip()], "what_to_improve": []}
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
+        data = parse_json_object(raw)
+        if data is None:
+            return {"what_worked": [raw.strip()[:400]] if raw.strip() else [], "what_to_improve": []}
+        return {
+            "what_worked": as_str_list(data.get("what_worked")),
+            "what_to_improve": as_str_list(data.get("what_to_improve")),
+        }
 
     def run_anti_model(self, metrics: MinedArenaMetrics) -> List[Dict[str, Any]]:
         """
@@ -632,12 +766,18 @@ class SelfImprovementLoop:
             temperature=0.2,
             max_tokens=220,
         )
-        raw = resp.choices[0].message.content if resp.choices else "{}"
-        try:
-            data = json.loads(raw)
-            return list(data.get("evidence_grounded_attacks", []))
-        except Exception:
-            return [{"target": "general", "evidence_seq": "log", "critique": raw.strip()}]
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
+        data = parse_json_object(raw)
+        if data is None:
+            return [{"target": "general", "evidence_seq": "log", "critique": raw.strip()[:400]}] if raw.strip() else []
+        attacks = data.get("evidence_grounded_attacks")
+        if not isinstance(attacks, list):
+            return []
+        # "Grounded in the event log (evidence), not vibes": drop attacks that cite no evidence
+        return [
+            a for a in attacks
+            if isinstance(a, dict) and str(a.get("evidence_seq") or "").strip() and str(a.get("critique") or "").strip()
+        ]
 
     def synthesize_proposition(
         self,
@@ -668,14 +808,21 @@ class SelfImprovementLoop:
             temperature=0.2,
             max_tokens=220,
         )
-        raw = resp.choices[0].message.content if resp.choices else "{}"
-        try:
-            data = json.loads(raw)
-            summary = str(data.get("summary", "Proposed dial and prompt refinement"))
-            dial_changes = dict(data.get("dial_changes", {}))
-            prompt_changes = {str(k): str(v) for k, v in data.get("prompt_changes", {}).items()}
-        except Exception:
-            summary = "Fallback proposition"
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
+        data = parse_json_object(raw)
+        rejected: Dict[str, str] = {}
+        if data is not None:
+            summary = str(data.get("summary") or "Proposed dial and prompt refinement")
+            proposed = data.get("dial_changes")
+            dial_changes, rejected = sanitize_dials(proposed if isinstance(proposed, dict) else {})
+            raw_prompts = data.get("prompt_changes")
+            prompt_changes = (
+                {str(k): str(v)[:1000] for k, v in raw_prompts.items() if str(v).strip()}
+                if isinstance(raw_prompts, dict)
+                else {}
+            )
+        else:
+            summary = "Fallback proposition (unparseable synthesis reply)"
             dial_changes = {}
             prompt_changes = {}
 
@@ -685,6 +832,7 @@ class SelfImprovementLoop:
             prompt_changes=prompt_changes,
             self_assessment=self_assessment,
             anti_model_critique=anti_model_critique,
+            rejected_dial_changes=rejected,
         )
 
     def run_sandbox_test(
@@ -692,32 +840,27 @@ class SelfImprovementLoop:
         candidate_dials: Dict[str, Any],
         test_problem: str = "Sandbox verification: SSH works laptop->desktop but not desktop->laptop.",
         baseline_score: float = 5.0,
+        candidate_prompts: Optional[Dict[str, str]] = None,
     ) -> SandboxResult:
         """
         Step 6: Run candidate dials/config against a test problem in an isolated sandbox
         harness before adopting.
         """
         from .branch_spawner import MainHarness
-        from .issue_detector import CertaintyWeights
 
+        dials = resolve_dials(candidate_dials)
         harness = MainHarness(
             client=self.client,
             starter_agents=2,
             hard_cap_usd=1.00,
             depth_dial=2,
             k_probes=2,
-            gauntlet_rounds=int(candidate_dials.get("gauntlet_rounds", 3)),
+            gauntlet_rounds=int(dials["gauntlet_rounds"]),
             enable_selection=True,
         )
-        harness.detector.weights = CertaintyWeights(
-            survived_falsifications=float(candidate_dials.get("survived_falsifications_weight", 3.0)),
-            merges_attracted=float(candidate_dials.get("merges_attracted_weight", 1.5)),
-            open_critic_objections=float(candidate_dials.get("open_critic_objections_weight", -1.25)),
-            age_without_testing=float(candidate_dials.get("age_without_testing_weight", -0.15)),
-        )
-        harness.alignment_detector.prefilter_threshold = float(
-            candidate_dials.get("prefilter_threshold", 0.20)
-        )
+        harness.detector.weights = weights_from_dials(dials)
+        harness.alignment_detector.prefilter_threshold = float(dials["prefilter_threshold"])
+        harness.detector.probe_hint = str((candidate_prompts or {}).get("plaus_probe_hint", ""))
 
         summary = harness.run(test_problem)
         winners = summary.get("winners_box", [])
@@ -758,13 +901,15 @@ class SelfImprovementLoop:
 
         cur_ver = self.registry.get_version()
         new_dials = copy.deepcopy(cur_ver.config_dials)
-        new_dials.update(proposition.dial_changes)
+        new_dials.update(proposition.dial_changes)  # already validated by sanitize_dials
         new_prompts = copy.deepcopy(cur_ver.prompts)
         new_prompts.update(proposition.prompt_changes)
 
         baseline_score = metrics.spend_efficiency.get("max_winner_certainty", 5.0)
         if run_sandbox:
-            sb_res = self.run_sandbox_test(new_dials, baseline_score=baseline_score)
+            sb_res = self.run_sandbox_test(
+                new_dials, baseline_score=baseline_score, candidate_prompts=new_prompts
+            )
         else:
             sb_res = SandboxResult(
                 coherent=True,

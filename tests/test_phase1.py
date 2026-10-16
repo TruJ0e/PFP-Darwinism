@@ -242,15 +242,23 @@ class TestPiece2BranchSpawnerAndBudget(unittest.TestCase):
         self.assertEqual(len(result["scoreboard"]), result["total_branches_spawned"])
         self.assertGreater(result["events_count"], 0)
 
-        # Verify strict budget conservation: total_spent + unspent_branch_budgets + finish_reserve_remaining <= root_budget
+        # Verify strict budget conservation. total_spent is the TRUE API spend (it must match
+        # the independent metering client); only overdraft — spend no budget or reserve
+        # covered — may exceed the root, and it is reported, never hidden.
         b = result["budget"]
+        self.assertAlmostEqual(b["total_spent_usd"], b["api_spend_usd"], places=5)
         total_accounted = (
             b["total_spent_usd"]
+            - b["overdraft_usd"]
             + b["unspent_branch_budgets_usd"]
             + b["finish_reserve_remaining_usd"]
         )
         self.assertLessEqual(total_accounted, b["root_budget_usd"] + 1e-4)
         self.assertLessEqual(b["root_budget_usd"], b["hard_cap_usd"])
+        self.assertLessEqual(b["api_spend_usd"], b["hard_cap_usd"])
+        # Demo scale (3 starters) runs (almost) entirely inside its root budget; the exact
+        # overdraft varies with thread interleaving, so bound it rather than pin it
+        self.assertLessEqual(b["overdraft_usd"], 0.10 * b["root_budget_usd"])
 
         # Verify no alive branch died mid-thought (all alive branches reached conclusion)
         for rec in harness.tracker.active_branches():

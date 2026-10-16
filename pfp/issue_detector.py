@@ -17,11 +17,12 @@ Refinements in Pass 2 (by what was meant):
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Set
+
+from .jsonutil import as_str_list, parse_json_object
 
 
 @dataclass
@@ -123,12 +124,13 @@ def compute_token_entropy_from_choice(choice: Any) -> float:
 
 
 def _parse_probe_json(raw_text: str, idx: int) -> ProbeContinuation:
-    try:
-        data = json.loads(raw_text)
+    raw_text = raw_text or ""
+    data = parse_json_object(raw_text)
+    if data is not None:
         fork_id = str(data.get("fork_id") or data.get("approach") or f"fork_{idx}")
         fork_desc = str(data.get("fork") or data.get("step") or data.get("approach") or raw_text[:80])
         reasoning = str(data.get("reasoning") or data.get("first_step") or raw_text)
-    except Exception:
+    else:
         fork_id = f"fork_{idx}"
         fork_desc = raw_text.strip()[:80]
         reasoning = raw_text.strip()
@@ -171,6 +173,8 @@ class IssueDetector:
         self.entropy_threshold = entropy_threshold
         self.depth_dial = depth_dial
         self.weights = weights or CertaintyWeights()
+        # Versioned prompt text from the Piece 8 registry (`plaus_probe_hint`); empty = no hint
+        self.probe_hint: str = ""
 
     def compute_certainty(
         self,
@@ -216,12 +220,12 @@ class IssueDetector:
             max_tokens=150,
         )
         cost = float(resp.usage.cost_usd)
-        raw = resp.choices[0].message.content if resp.choices else "{}"
-        try:
-            parsed = json.loads(raw)
-            leaps = [str(x) for x in parsed.get("unjustified_leaps", [])]
-        except Exception:
-            leaps = [raw.strip()] if raw.strip() else []
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
+        parsed = parse_json_object(raw)
+        if parsed is not None:
+            leaps = as_str_list(parsed.get("unjustified_leaps"))
+        else:
+            leaps = [raw.strip()[:240]] if raw.strip() else []
         return leaps, cost
 
     def _cluster_and_deduplicate(
@@ -306,7 +310,8 @@ class IssueDetector:
             f"probe_continuation depth={depth}\n"
             f"Fire K diverse continuations for problem: {problem}\n"
             f"Parent reasoning so far: {parent_reasoning}\n"
-            "Return JSON with fork_id, fork, and reasoning."
+            + (f"Guidance: {self.probe_hint}\n" if self.probe_hint else "")
+            + "Return JSON with fork_id, fork, and reasoning."
         )
         resp = self.client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],

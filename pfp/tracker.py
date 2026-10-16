@@ -97,10 +97,24 @@ class BranchRecord:
     merge_provenance: Dict[str, List[str]] = field(default_factory=dict)
     pass_provenance: List[PassProvenanceRecord] = field(default_factory=list)
     appeal_used: bool = False
+    # How the branch was born: "starter", "plaus", "ns", "merge" (drives arena colors + NS selection)
+    origin: str = "starter"
 
     @property
     def is_alive(self) -> bool:
         return self.state in (BranchState.POSSIBLE, BranchState.PASS)
+
+    @property
+    def last_step(self) -> str:
+        return self.reasoning_trace[-1] if self.reasoning_trace else ""
+
+    @property
+    def solution(self) -> str:
+        """The branch's latest conclusion (what the winner's box presents), else its fork."""
+        for step in reversed(self.reasoning_trace):
+            if step.startswith("[Conclusion]"):
+                return step[len("[Conclusion]"):].strip()
+        return self.fork_under_exploration
 
     def refresh_time_alive(self, now: Optional[float] = None) -> float:
         current = now if now is not None else time.time()
@@ -126,6 +140,9 @@ class BranchRecord:
             "merge_provenance": self.merge_provenance,
             "pass_provenance": [p.to_dict() for p in self.pass_provenance],
             "appeal_used": self.appeal_used,
+            "origin": self.origin,
+            "last_step": self.last_step[:240],
+            "solution": self.solution[:600],
         }
 
 
@@ -149,8 +166,12 @@ class PFPTracker:
         state: BranchState = BranchState.POSSIBLE,
         certainty_score: float = 0.0,
         depth: int = 0,
+        origin: str = "starter",
     ) -> BranchRecord:
         with self._lock:
+            if branch_id in self._records:
+                # Re-registering would silently resurrect / overwrite history — never allowed
+                raise ValueError(f"Branch id '{branch_id}' is already registered in the ledger.")
             now = time.time()
             rec = BranchRecord(
                 id=branch_id,
@@ -161,6 +182,7 @@ class PFPTracker:
                 budget_remaining=round(max(0.0, budget_remaining), 6),
                 fork_under_exploration=fork_under_exploration,
                 depth=depth,
+                origin=origin,
                 created_at=now,
                 last_tested_at=now,
                 state_history=[

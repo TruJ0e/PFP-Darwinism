@@ -21,7 +21,8 @@ from typing import Any, Callable, Dict, List, Optional
 from .alignment_detector import AlignmentJudgeResult, branch_position_text
 from .backend import SUPER_MODEL
 from .branch_spawner import BudgetLedger, HarnessEvent
-from .tracker import BranchRecord, BranchState, PFPTracker
+from .jsonutil import as_str_list, parse_json_object
+from .tracker import BranchState, PFPTracker
 
 
 @dataclass
@@ -148,10 +149,10 @@ class MergeSynthesizer:
             max_tokens=260,
         )
         synth_cost = float(resp.usage.cost_usd)
-        raw = resp.choices[0].message.content if resp.choices else "{}"
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
 
-        try:
-            data = json.loads(raw)
+        data = parse_json_object(raw)
+        if data is not None:
             unified_fork = str(
                 data.get("unified_fork")
                 or f"Merged({parent_a.fork_under_exploration} + {parent_b.fork_under_exploration})"
@@ -160,12 +161,14 @@ class MergeSynthesizer:
                 data.get("unified_reasoning")
                 or f"Unified synthesis of {branch_a_id} and {branch_b_id}"
             )
-            kept_claims = [str(x) for x in data.get("kept_claims", [])]
-            dropped_redundant = [str(x) for x in data.get("dropped_redundant", [])]
-            raw_prov = data.get("provenance", {})
-            prov_a = [str(x) for x in raw_prov.get("parent_a", raw_prov.get(branch_a_id, []))]
-            prov_b = [str(x) for x in raw_prov.get("parent_b", raw_prov.get(branch_b_id, []))]
-        except Exception:
+            kept_claims = as_str_list(data.get("kept_claims"))
+            dropped_redundant = as_str_list(data.get("dropped_redundant"))
+            raw_prov = data.get("provenance")
+            if not isinstance(raw_prov, dict):
+                raw_prov = {}
+            prov_a = as_str_list(raw_prov.get("parent_a", raw_prov.get(branch_a_id)))
+            prov_b = as_str_list(raw_prov.get("parent_b", raw_prov.get(branch_b_id)))
+        else:
             unified_fork = f"Merged({parent_a.fork_under_exploration} + {parent_b.fork_under_exploration})"
             unified_reasoning = raw.strip() or f"Unified {branch_a_id} + {branch_b_id}"
             kept_claims = []
@@ -193,10 +196,17 @@ class MergeSynthesizer:
         budget_b = parent_b.budget_remaining
         combined_parent_budget = round(budget_a + budget_b, 6)
 
-        # Deduct synthesis call cost from combined pool (or record on ledger)
+        # Deduct synthesis call cost from combined pool; the ledger records the full real
+        # cost (any part the parents could not cover is booked as overdraft)
         actual_synth_deducted = min(combined_parent_budget, max(0.0, synth_cost))
         if self.budget_ledger is not None:
-            self.budget_ledger.record_spend(actual_synth_deducted)
+            # Merging is selection work: a shortfall may be covered by the finish reserve
+            from_reserve = self.budget_ledger.cover_from_finish_reserve(
+                max(0.0, synth_cost) - actual_synth_deducted
+            )
+            self.budget_ledger.record_spend(
+                max(0.0, synth_cost), covered_usd=actual_synth_deducted + from_reserve
+            )
         child_budget = round(max(0.0, combined_parent_budget - actual_synth_deducted), 6)
 
         # Zero out parents' remaining budgets (transferred to child) and mark both ABSORBED (terminal)
@@ -240,6 +250,7 @@ class MergeSynthesizer:
             state=BranchState.POSSIBLE,
             certainty_score=initial_certainty,
             depth=child_depth,
+            origin="merge",
         )
         child_rec.merge_parents = [branch_a_id, branch_b_id]
         child_rec.merge_provenance = provenance

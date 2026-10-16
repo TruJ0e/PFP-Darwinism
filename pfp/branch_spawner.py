@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .issue_detector import IssueDetectionResult, IssueDetector, ProbeContinuation
+from .jsonutil import parse_json_object
 from .tracker import BranchRecord, BranchState, PFPTracker
 
 
@@ -108,9 +109,16 @@ class BudgetLedger:
         expected_agent_seconds: float = 20.0,
         estimated_cost_per_call_usd: float = 0.0005,
         high_certainty_threshold: float = 0.0,
+        verification_share: float = 0.3,
     ) -> None:
         if not (0.10 <= finish_reserve_ratio <= 0.15):
             raise ValueError("finish_reserve_ratio must be between 0.10 and 0.15 (10-15% of root).")
+        if not (0.0 <= verification_share < 1.0):
+            raise ValueError("verification_share must be in [0, 1).")
+        # Fraction of every branch's budget that exploration and child spawning can't touch:
+        # it pays for the branch's own falsification / alignment / merge (selection is not free)
+        self.verification_share = verification_share
+        self._cost_ema: Dict[str, float] = {}
         self.hard_cap_usd = hard_cap_usd
         self.depth_decay = depth_decay
         self.finish_reserve_ratio = finish_reserve_ratio
@@ -125,7 +133,10 @@ class BudgetLedger:
         self.initial_finish_reserve_usd: float = 0.0
         self.finish_reserve_usd: float = 0.0
         self.exploration_pool_usd: float = 0.0
+        # True API spend (every call, whether or not a branch budget could cover it)
         self.total_spent_usd: float = 0.0
+        # Spend no branch budget or reserve could cover — surfaced, never hidden
+        self.overdraft_usd: float = 0.0
         self._lock = threading.RLock()
 
     def size_problem_once(self, client: Any, problem: str) -> float:
@@ -170,10 +181,83 @@ class BudgetLedger:
             self.total_spent_usd = round(probe_cost, 6)
             return self.root_budget_usd
 
-    def record_spend(self, amount_usd: float) -> float:
+    def record_spend(self, amount_usd: float, covered_usd: Optional[float] = None) -> float:
+        """
+        Record a real API cost. `covered_usd` is the part paid from a branch budget
+        or reserve; anything above it is booked as overdraft so the run report
+        never understates spend.
+        """
         with self._lock:
-            self.total_spent_usd = round(self.total_spent_usd + max(0.0, amount_usd), 6)
+            amount = max(0.0, amount_usd)
+            covered = amount if covered_usd is None else min(amount, max(0.0, covered_usd))
+            self.total_spent_usd = round(self.total_spent_usd + amount, 6)
+            self.overdraft_usd = round(self.overdraft_usd + (amount - covered), 6)
             return self.total_spent_usd
+
+    def charge(
+        self,
+        tracker: PFPTracker,
+        branch_id: str,
+        cost_usd: float,
+        *,
+        allow_finish_reserve: bool = False,
+    ) -> Dict[str, float]:
+        """
+        Pay a real API cost on behalf of `branch_id`:
+        1. Deduct from the branch's own budget.
+        2. If `allow_finish_reserve` (verification / conclusion work), cover the
+           shortfall from the finish reserve — exploration never touches it.
+        3. Book whatever is still uncovered as overdraft.
+        Always records the full cost as spent.
+        """
+        cost = max(0.0, float(cost_usd))
+        with self._lock:
+            rec = tracker.get(branch_id)
+            from_branch = min(rec.budget_remaining, cost)
+            new_budget = round(max(0.0, rec.budget_remaining - from_branch), 6)
+            tracker.update_branch(branch_id, budget_remaining=new_budget)
+            shortfall = round(cost - from_branch, 8)
+            from_reserve = 0.0
+            if shortfall > 0.0 and allow_finish_reserve and self.finish_reserve_usd > 0.0:
+                from_reserve = round(min(self.finish_reserve_usd, shortfall), 6)
+                self.finish_reserve_usd = round(self.finish_reserve_usd - from_reserve, 6)
+            self.record_spend(cost, covered_usd=from_branch + from_reserve)
+            return {
+                "cost_usd": round(cost, 6),
+                "from_branch_usd": round(from_branch, 6),
+                "from_finish_reserve_usd": round(from_reserve, 6),
+                "overdraft_usd": round(max(0.0, cost - from_branch - from_reserve), 6),
+                "budget_remaining": new_budget,
+            }
+
+    def cover_from_finish_reserve(self, amount_usd: float) -> float:
+        """Pay up to `amount_usd` of selection work from the finish reserve; returns what was granted."""
+        with self._lock:
+            granted = round(min(self.finish_reserve_usd, max(0.0, amount_usd)), 6)
+            self.finish_reserve_usd = round(self.finish_reserve_usd - granted, 6)
+            return granted
+
+    def return_to_finish_reserve(self, amount_usd: float) -> float:
+        """Idle branch budget flowing back to the finish reserve (never creates money)."""
+        with self._lock:
+            self.finish_reserve_usd = round(self.finish_reserve_usd + max(0.0, amount_usd), 6)
+            return self.finish_reserve_usd
+
+    def observe_call_cost(self, kind: str, cost_usd: float) -> None:
+        """Learn what each kind of call really costs (EMA) so affordability checks track reality."""
+        if cost_usd <= 0.0:
+            return
+        with self._lock:
+            prev = self._cost_ema.get(kind)
+            self._cost_ema[kind] = cost_usd if prev is None else round(0.7 * prev + 0.3 * cost_usd, 8)
+
+    def estimate_call_cost(self, kind: str) -> float:
+        with self._lock:
+            return self._cost_ema.get(kind, self.estimated_cost_per_call_usd)
+
+    def protected_budget(self, initial_budget: float) -> float:
+        """The verification share of a branch's initial budget (never spent on exploration)."""
+        return max(self.conclusion_reserve_usd, round(initial_budget * self.verification_share, 6))
 
     def compute_ns_cadence(self, branch_budget: float) -> float:
         """
@@ -263,6 +347,17 @@ class BudgetLedger:
             return granted
 
 
+def _conclusion_text(raw: str) -> str:
+    """Models often answer the conclusion prompt in JSON; surface the conclusion itself."""
+    data = parse_json_object(raw)
+    if data is not None:
+        for key in ("conclusion", "solution", "answer", "unified_reasoning", "reasoning"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return raw.strip()
+
+
 def compress_parent_reasoning(client: Any, reasoning_trace: Sequence[str]) -> tuple[str, float]:
     """
     Produce compressed parent reasoning for a child branch's Directive packet.
@@ -312,8 +407,12 @@ class MiniHarness:
         event_sink: Callable[[HarnessEvent], None],
         branch_counter: Callable[[], str],
         initial_certainty: float = 0.0,
+        origin: str = "starter",
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.branch_id = branch_id
+        self.origin = origin
+        self.should_stop: Callable[[], bool] = should_stop or (lambda: False)
         self.parent_id = parent_id
         self.problem = problem
         self.directive = directive
@@ -326,6 +425,8 @@ class MiniHarness:
         self.branch_counter = branch_counter
 
         self.initial_budget: float = max(1e-6, directive.budget)
+        # Verification share: exploration and child spawning never touch it (see BudgetLedger)
+        self.protected_usd: float = budget_ledger.protected_budget(directive.budget)
         self.children: List[MiniHarness] = []
         self.ns_cadence_s: float = self.budget_ledger.compute_ns_cadence(directive.budget)
         self.last_ns_tick: float = time.time()
@@ -344,6 +445,7 @@ class MiniHarness:
             state=self.directive.state,
             certainty_score=initial_certainty,
             depth=self.depth,
+            origin=origin,
         )
         if self.directive.parent_reasoning_compressed:
             self.tracker.update_branch(
@@ -371,18 +473,22 @@ class MiniHarness:
         )
         self.event_sink(evt)
 
-    def _spend(self, cost_usd: float, reason: str) -> float:
+    def _can_afford(self, kind: str) -> bool:
+        """Exploration is affordable only from budget above the protected verification share."""
         rec = self.tracker.get(self.branch_id)
-        actual_deducted = min(rec.budget_remaining, max(0.0, cost_usd))
-        new_budget = round(max(0.0, rec.budget_remaining - actual_deducted), 6)
-        self.budget_ledger.record_spend(actual_deducted)
-        self.tracker.update_branch(self.branch_id, budget_remaining=new_budget)
+        return rec.budget_remaining - self.protected_usd >= self.budget_ledger.estimate_call_cost(kind)
+
+    def _spend(self, cost_usd: float, reason: str, kind: Optional[str] = None) -> float:
+        self.budget_ledger.observe_call_cost(kind or reason, cost_usd)
+        charged = self.budget_ledger.charge(self.tracker, self.branch_id, cost_usd)
+        new_budget = charged["budget_remaining"]
         self.ns_cadence_s = self.budget_ledger.compute_ns_cadence(new_budget)
         self._emit(
             "budget_change",
             {
                 "reason": reason,
-                "spent_usd": round(actual_deducted, 6),
+                "spent_usd": charged["cost_usd"],
+                "overdraft_usd": charged["overdraft_usd"],
                 "budget_remaining": round(new_budget, 6),
                 "ns_cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
             },
@@ -399,7 +505,7 @@ class MiniHarness:
         ratio = current_budget / self.initial_budget
         can_fund_child = (
             self.budget_ledger.max_fundable_siblings(
-                max(0.0, current_budget - self.budget_ledger.conclusion_reserve_usd),
+                max(0.0, current_budget - self.protected_usd),
                 apply_depth_decay=True,
             )
             >= 1
@@ -468,8 +574,9 @@ class MiniHarness:
         if not forks or self.spawns_stopped:
             return []
 
-        # Hold back conclusion_reserve_usd on the parent so the parent never dies mid-thought
-        spendable_for_branching = max(0.0, rec.budget_remaining - self.budget_ledger.conclusion_reserve_usd)
+        # Hold back the protected verification share on the parent so it can still conclude
+        # and face falsification — the parent never dies mid-thought
+        spendable_for_branching = max(0.0, rec.budget_remaining - self.protected_usd)
         max_kids = self.budget_ledger.max_fundable_siblings(spendable_for_branching, apply_depth_decay=True)
         if max_kids <= 0:
             self._evaluate_graceful_degradation(rec.budget_remaining)
@@ -481,10 +588,10 @@ class MiniHarness:
 
         compressed, comp_cost = compress_parent_reasoning(self.client, rec.reasoning_trace)
         if comp_cost > 0:
-            self._spend(comp_cost, "directive_compression")
+            self._spend(comp_cost, "directive_compression", kind="compress")
 
         rec = self.tracker.get(self.branch_id)
-        spendable_for_branching = max(0.0, rec.budget_remaining - self.budget_ledger.conclusion_reserve_usd)
+        spendable_for_branching = max(0.0, rec.budget_remaining - self.protected_usd)
         sibling_scores = [rec.certainty_score + f.support_score for f in ordered_forks]
         child_budgets = self.budget_ledger.split_among_siblings(
             parent_budget=spendable_for_branching,
@@ -535,6 +642,8 @@ class MiniHarness:
                 event_sink=self.event_sink,
                 branch_counter=self.branch_counter,
                 initial_certainty=round(fork.support_score, 4),
+                origin=trigger,
+                should_stop=self.should_stop,
             )
             child.tracker.update_branch(
                 child_id,
@@ -597,15 +706,16 @@ class MiniHarness:
                     "content": (
                         f"Conclude branch reasoning for problem: {self.problem}\n"
                         f"Fork: {self.directive.fork_exploring}\n"
-                        f"Trace: {' | '.join(rec.reasoning_trace)}"
+                        f"Trace: {' | '.join(rec.reasoning_trace)}\n"
+                        "State this branch's concrete conclusion (the solution it proposes) in 1-3 sentences."
                     ),
                 }
             ],
             temperature=0.3,
             max_tokens=160,
         )
-        self._spend(float(resp.usage.cost_usd), "run_to_conclusion")
-        content = resp.choices[0].message.content if resp.choices else ""
+        self._spend(float(resp.usage.cost_usd), "run_to_conclusion", kind="conclude")
+        content = _conclusion_text((resp.choices[0].message.content if resp.choices else "") or "")
         self.conclusion_text = content
         self.concluded = True
         self.tracker.update_branch(
@@ -624,11 +734,15 @@ class MiniHarness:
         if killed:
             self._emit("kill", {"reason": reason})
             return
+        if self.should_stop():
+            # Emergency stop kills the run; the ledger keeps the branch as-is for post-mortem
+            self._emit("kill", {"reason": "emergency_stop"})
+            return
 
         rec = self.tracker.get(self.branch_id)
         stage = self._evaluate_graceful_degradation(rec.budget_remaining)
 
-        if stage == "exploitation_only":
+        if stage == "exploitation_only" or not self._can_afford("plaus"):
             self._run_to_conclusion()
             return
 
@@ -641,12 +755,16 @@ class MiniHarness:
             depth=self.depth,
             known_forks=known_forks,
         )
-        self._spend(plaus_res.cost_usd, "plaus_issue_detection")
+        self._spend(plaus_res.cost_usd, "plaus_issue_detection", kind="plaus")
         cluster_bonus = plaus_res.distinct_forks[0].support_score if plaus_res.distinct_forks else 0.0
         self._refresh_certainty(
             open_objections=len(plaus_res.unjustified_leaps),
             support_bonus=cluster_bonus,
         )
+
+        if self.should_stop():
+            self._emit("kill", {"reason": "emergency_stop"})
+            return
 
         if plaus_res.should_split and not self.spawns_stopped:
             children = self._spawn_children_from_forks(plaus_res.distinct_forks, trigger="plaus")
@@ -658,6 +776,12 @@ class MiniHarness:
                     self.branch_id,
                     reasoning_step=f"[Clustered flow] {plaus_res.merged_continuation}",
                 )
+            # An unseeded starter has no fork of its own yet: the cluster it flows along is its fork
+            if self.directive.fork_exploring.startswith("starter_agent_") and plaus_res.distinct_forks:
+                self.tracker.update_branch(
+                    self.branch_id,
+                    fork_under_exploration=plaus_res.distinct_forks[0].fork_description,
+                )
 
         # 2. Check NS (natural selection) blind fan-out cadence if still in exploration stage
         rec = self.tracker.get(self.branch_id)
@@ -666,6 +790,8 @@ class MiniHarness:
         if (
             not self.ns_stopped
             and not self.spawns_stopped
+            and not self.should_stop()
+            and self._can_afford("ns")
             and (force_ns_check or elapsed_since_ns >= self.ns_cadence_s)
         ):
             self.last_ns_tick = now
@@ -676,7 +802,7 @@ class MiniHarness:
                 fanout_count=1,
                 known_forks=self.tracker.known_forks_in_lineage(self.branch_id),
             )
-            self._spend(ns_res.cost_usd, "ns_blind_variation")
+            self._spend(ns_res.cost_usd, "ns_blind_variation", kind="ns")
             self._emit(
                 "ns_tick",
                 {
@@ -689,7 +815,7 @@ class MiniHarness:
                 self._run_children_parallel(ns_children)
 
         # 3. Conclude this branch cleanly so nothing dies mid-thought
-        if not self.concluded and self.tracker.get(self.branch_id).is_alive:
+        if not self.concluded and not self.should_stop() and self.tracker.get(self.branch_id).is_alive:
             self._run_to_conclusion()
 
 
@@ -700,13 +826,15 @@ class MainHarness:
       capped at `hard_cap_usd`, with 10-15% `finish_reserve`).
     - Spawns starter agents (default 3 for demo scale, configurable to 9 for real scale).
     - Runs all starter MiniHarnesses concurrently ("All branches live at once, all the time").
-    - Runs Phase 2 Selection (Pieces 4-6):
+    - Runs Phase 2 Selection (Pieces 4-6) in repeated rounds until the arena settles:
       * AlignmentDetector (embedding pre-filter + Super claim-by-claim judge)
       * MergeSynthesizer (unifies compatible branches, preserves provenance, transfers parent budgets)
       * FailJudge (post-merge verification, contradiction resolution, background sampling,
         3-round Pass-readiness gauntlet with rotated attack styles, 1 appeal per kill with a
         different judge, revokable Pass with dependent re-verification, and pre-exit check
         into the winner's box).
+    - Safety rails: every model call goes through a `MeteredClient` (true spend, hard cap,
+      bounded concurrency); `emergency_stop()` (or the registry's emergency stop) kills the run.
     - Aggregates all branch states in `self.tracker` (`PFPTracker`) and events in `self.events`.
     """
 
@@ -722,37 +850,54 @@ class MainHarness:
         enable_selection: bool = True,
         version_registry: Optional[Any] = None,
         seed_cases: Optional[Sequence[Dict[str, Any]]] = None,
+        selection_rounds: int = 3,
+        max_concurrent_calls: int = 32,
+        max_winners: int = 3,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
+        from .backend import MeteredClient
         from .fail_judge import FailJudge
-        from .issue_detector import CertaintyWeights
         from .merge_synthesizer import MergeSynthesizer
 
-        self.client = client
+        if starter_agents < 1:
+            raise ValueError("starter_agents must be >= 1")
+        if hard_cap_usd <= 0:
+            raise ValueError("hard_cap_usd must be > 0")
+
+        self.raw_client = client
+        self.client = MeteredClient(
+            client,
+            hard_cap_usd=hard_cap_usd,
+            max_concurrent_calls=max_concurrent_calls,
+        )
         self.starter_agents = starter_agents
         self.enable_selection = enable_selection
         self.version_registry = version_registry
         self.seed_cases: List[Dict[str, Any]] = list(seed_cases or [])
+        self.selection_rounds = max(1, int(selection_rounds))
+        self.max_winners = max(1, int(max_winners))
         self.tracker = PFPTracker()
-        self.detector = IssueDetector(client, k_probes=k_probes, depth_dial=depth_dial)
+        self.detector = IssueDetector(self.client, k_probes=k_probes, depth_dial=depth_dial)
         self.budget_ledger = BudgetLedger(hard_cap_usd=hard_cap_usd)
         self.events: List[HarnessEvent] = []
         self.arena_feed = ArenaFeed()
         self.arena_renderer = TronArenaRenderer()
         self.starters: List[MiniHarness] = []
+        self.halted_reason: Optional[str] = None
         self._seq = 0
         self._lock = threading.RLock()
+        self._stop_event = threading.Event()
 
-        self.alignment_detector = AlignmentDetector(client)
+        self.alignment_detector = AlignmentDetector(self.client)
         self.merge_synthesizer = MergeSynthesizer(
-            client=client,
+            client=self.client,
             tracker=self.tracker,
             budget_ledger=self.budget_ledger,
             event_sink=self._on_event,
         )
         self.fail_judge = FailJudge(
-            client=client,
+            client=self.client,
             tracker=self.tracker,
             detector=self.detector,
             budget_ledger=self.budget_ledger,
@@ -760,22 +905,33 @@ class MainHarness:
             event_sink=self._on_event,
         )
         self.winners_box: List[Dict[str, Any]] = []
-        self._certainty_weights_cls = CertaintyWeights
 
+    # ------------------------------------------------------------------
+    # Run-boundary configuration + safety rails
+    # ------------------------------------------------------------------
     def _apply_active_version_dials(self) -> Optional[str]:
+        """Lock the active registry version at the run boundary and apply its (validated) dials + prompts."""
+        from .dials import resolve_dials, weights_from_dials
+
         if self.version_registry is None:
             return None
         snap = self.version_registry.begin_run()
-        dials = snap.config_dials
-        self.detector.weights = self._certainty_weights_cls(
-            survived_falsifications=float(dials.get("survived_falsifications_weight", 3.0)),
-            merges_attracted=float(dials.get("merges_attracted_weight", 1.5)),
-            open_critic_objections=float(dials.get("open_critic_objections_weight", -1.25)),
-            age_without_testing=float(dials.get("age_without_testing_weight", -0.15)),
-        )
-        self.alignment_detector.prefilter_threshold = float(dials.get("prefilter_threshold", 0.20))
-        self.fail_judge.gauntlet_rounds = int(dials.get("gauntlet_rounds", self.fail_judge.gauntlet_rounds))
+        dials = resolve_dials(snap.config_dials)
+        self.detector.weights = weights_from_dials(dials)
+        self.alignment_detector.prefilter_threshold = float(dials["prefilter_threshold"])
+        self.fail_judge.gauntlet_rounds = int(dials["gauntlet_rounds"])
+        self.detector.probe_hint = str(snap.prompts.get("plaus_probe_hint", ""))
         return snap.version_id
+
+    def emergency_stop(self) -> None:
+        """Kill the live run: no new model calls start in any branch; selection is skipped."""
+        self._stop_event.set()
+
+    def _should_stop(self) -> bool:
+        if self._stop_event.is_set():
+            return True
+        reg = self.version_registry
+        return bool(reg is not None and getattr(reg, "emergency_stopped", False))
 
     def _next_branch_id(self) -> str:
         with self._lock:
@@ -787,111 +943,254 @@ class MainHarness:
             self.events.append(event)
             self.arena_feed.ingest_harness_event(event)
 
+    def _emit_halt(self, reason: str, detail: str) -> None:
+        """Arena-level event (not tied to a branch) so renderers can show why the run stopped."""
+        self._on_event(
+            HarnessEvent(
+                event_type="halt",
+                branch_id="arena",
+                timestamp=time.time(),
+                details={"reason": reason, "detail": detail},
+                snapshot={"id": "arena", "state": "Halted"},
+            )
+        )
+
     def render_arena(self, problem: str = "") -> str:
         return self.arena_renderer.render_ascii(self.arena_feed.events, problem=problem)
+
+    # ------------------------------------------------------------------
+    # Selection (Pieces 4-6)
+    # ------------------------------------------------------------------
+    def _charge_alignment(self, al: Any) -> None:
+        """Split a judge call's real cost across the two branches it compared (verification work)."""
+        half_cost = al.cost_usd / 2.0
+        for bid in (al.branch_a_id, al.branch_b_id):
+            charged = self.budget_ledger.charge(self.tracker, bid, half_cost, allow_finish_reserve=True)
+            self._emit_budget(bid, "alignment_judge", charged)
+
+    def _emit_budget(self, branch_id: str, reason: str, charged: Dict[str, float]) -> None:
+        self._on_event(
+            HarnessEvent(
+                event_type="budget_change",
+                branch_id=branch_id,
+                timestamp=time.time(),
+                details={
+                    "reason": reason,
+                    "spent_usd": charged["cost_usd"],
+                    "from_finish_reserve_usd": charged["from_finish_reserve_usd"],
+                    "overdraft_usd": charged["overdraft_usd"],
+                    "budget_remaining": charged["budget_remaining"],
+                },
+                snapshot=self.tracker.get(branch_id).to_dict(),
+            )
+        )
+
+    def _split_parent_ids(self) -> set:
+        return {r.parent for r in self.tracker.all_records() if r.parent and r.origin != "merge"}
+
+    def _reclaim_split_parent_budgets(self) -> float:
+        """
+        A branch that split handed its flow to its children; its idle budget would
+        otherwise sit unused while verification overdraws. Return it to the finish
+        reserve, which pays for selection (falsification, alignment, pre-exit).
+        """
+        reclaimed = 0.0
+        split_parents = self._split_parent_ids()
+        for rec in self.tracker.all_records():
+            if rec.id not in split_parents or rec.budget_remaining <= 0.0:
+                continue
+            amount = rec.budget_remaining
+            self.tracker.update_branch(rec.id, budget_remaining=0.0)
+            self.budget_ledger.return_to_finish_reserve(amount)
+            reclaimed += amount
+            self._on_event(
+                HarnessEvent(
+                    event_type="budget_change",
+                    branch_id=rec.id,
+                    timestamp=time.time(),
+                    details={
+                        "reason": "returned_to_finish_reserve",
+                        "returned_usd": round(amount, 6),
+                        "budget_remaining": 0.0,
+                    },
+                    snapshot=self.tracker.get(rec.id).to_dict(),
+                )
+            )
+        return round(reclaimed, 6)
+
+    @staticmethod
+    def _solution_key(rec: BranchRecord) -> str:
+        return " ".join(rec.fork_under_exploration.lower().split())
 
     def _run_selection_phase(self) -> Dict[str, Any]:
         """
         Execute Phase 2 selection (Pieces 4-6) across active branches:
-        1. Background sampling on untested active branches.
-        2. Alignment detection (embedding pre-filter + Super judge).
-        3. Contradiction trigger on clashing pairs (falsify both, loser dies).
-        4. Merge synthesis on overlapping/compatible pairs + immediate post-merge falsification.
-        5. Pass-readiness gauntlet (3 rounds, rotated angles) + pre-exit verification into winner's box.
+        1. Background sampling on the highest-certainty untested branch.
+        2. Repeated rounds (until nothing merges or clashes, max `selection_rounds`):
+           alignment detection -> contradiction trigger (falsify both, loser dies) ->
+           merge synthesis + immediate post-merge falsification. Merged children can
+           merge again next round, so cooperation compounds.
+        3. Natural selection on blind variation: every untested NS-born branch faces
+           the falsifier before anything exits.
+        4. Pass-readiness gauntlet + pre-exit verification into the winner's box
+           (higher certainty exits first; duplicate solutions collapse to one entry).
         """
         from .alignment_detector import AlignmentVerdict
 
         merges_performed: List[Dict[str, Any]] = []
         contradictions_resolved: List[Dict[str, Any]] = []
         falsifications_run: List[Dict[str, Any]] = []
+        alignments_evaluated: List[Dict[str, Any]] = []
+        rounds_run = 0
+        reclaimed_usd = self._reclaim_split_parent_budgets()
 
-        # 1. Background sampling heartbeat on highest-certainty untested branch
         bg_out = self.fail_judge.sample_background(force=True)
         if bg_out is not None:
             falsifications_run.append(bg_out.to_dict())
 
-        # 2. Detect alignments & contradictions among alive branches
-        alive = self.tracker.active_branches()
-        alignments = self.alignment_detector.detect_alignments(alive, max_pairs_to_judge=8)
-        for al in alignments:
-            ba = self.tracker.get(al.branch_a_id)
-            bb = self.tracker.get(al.branch_b_id)
-            half_cost = al.cost_usd / 2.0
-            ded_a = min(ba.budget_remaining, half_cost)
-            ded_b = min(bb.budget_remaining, half_cost)
-            self.tracker.update_branch(ba.id, budget_remaining=round(max(0.0, ba.budget_remaining - ded_a), 6))
-            self.tracker.update_branch(bb.id, budget_remaining=round(max(0.0, bb.budget_remaining - ded_b), 6))
-            self.budget_ledger.record_spend(ded_a + ded_b)
+        for round_idx in range(self.selection_rounds):
+            if self._should_stop():
+                break
+            # Graceful degradation at arena level: once the root budget is spent, no further
+            # cooperation rounds — only the finish (pre-exit verification) remains
+            if round_idx > 0 and self.budget_ledger.total_spent_usd >= self.budget_ledger.root_budget_usd:
+                break
+            rounds_run += 1
+            alignments = self.alignment_detector.detect_alignments(
+                self.tracker.active_branches(), max_pairs_to_judge=8
+            )
+            for al in alignments:
+                self._charge_alignment(al)
+                alignments_evaluated.append(al.to_dict())
 
-        # 3. Contradiction trigger: falsify both, loser dies
-        for al in alignments:
-            if al.verdict == AlignmentVerdict.CONTRADICTORY:
+            changed = False
+            for al in alignments:
+                if al.verdict != AlignmentVerdict.CONTRADICTORY:
+                    continue
                 ba = self.tracker.get(al.branch_a_id)
                 bb = self.tracker.get(al.branch_b_id)
-                if ba.is_alive and bb.is_alive:
-                    out_a, out_b = self.fail_judge.resolve_contradiction(
-                        ba.id,
-                        bb.id,
-                        contradiction_summary="; ".join(al.contradictory_claims),
-                    )
-                    contradictions_resolved.append(
-                        {
-                            "branch_a_id": ba.id,
-                            "branch_b_id": bb.id,
-                            "outcome_a": out_a.to_dict(),
-                            "outcome_b": out_b.to_dict(),
-                        }
-                    )
-                    falsifications_run.extend([out_a.to_dict(), out_b.to_dict()])
+                if not (ba.is_alive and bb.is_alive):
+                    continue
+                out_a, out_b = self.fail_judge.resolve_contradiction(
+                    ba.id,
+                    bb.id,
+                    contradiction_summary="; ".join(al.contradictory_claims),
+                )
+                contradictions_resolved.append(
+                    {
+                        "branch_a_id": ba.id,
+                        "branch_b_id": bb.id,
+                        "outcome_a": out_a.to_dict(),
+                        "outcome_b": out_b.to_dict(),
+                    }
+                )
+                falsifications_run.extend([out_a.to_dict(), out_b.to_dict()])
+                changed = True
 
-        # 4. Merge compatible branches & verify immediately after merge
-        for al in alignments:
-            if al.verdict == AlignmentVerdict.OVERLAP:
+            for al in alignments:
+                if al.verdict != AlignmentVerdict.OVERLAP:
+                    continue
                 ba = self.tracker.get(al.branch_a_id)
                 bb = self.tracker.get(al.branch_b_id)
-                if ba.is_alive and bb.is_alive:
-                    child_id = self._next_branch_id()
-                    merge_res = self.merge_synthesizer.merge_branches(
-                        ba.id,
-                        bb.id,
+                if not (ba.is_alive and bb.is_alive):
+                    continue
+                child_id = self._next_branch_id()
+                merge_res = self.merge_synthesizer.merge_branches(ba.id, bb.id, child_id, alignment=al)
+                merges_performed.append(merge_res.to_dict())
+                changed = True
+                # Schedule Trigger 1: after every merge (new claims -> verify before going anywhere)
+                post_merge_out = self.fail_judge.verify_after_merge(child_id)
+                falsifications_run.append(post_merge_out.to_dict())
+                if self.tracker.get(child_id).is_alive:
+                    self.tracker.update_branch(
                         child_id,
-                        alignment=al,
+                        reasoning_step=f"[Conclusion] {merge_res.unified_reasoning}",
                     )
-                    merges_performed.append(merge_res.to_dict())
-                    # Schedule Trigger 1: After every merge (new claims -> verify before going anywhere)
-                    post_merge_out = self.fail_judge.verify_after_merge(child_id)
-                    falsifications_run.append(post_merge_out.to_dict())
-                    # Conclude merged survivor cleanly so it has a [Conclusion] step
-                    merged_rec = self.tracker.get(child_id)
-                    if merged_rec.is_alive:
-                        self.tracker.update_branch(
-                            child_id,
-                            reasoning_step=f"[Conclusion] {merge_res.unified_reasoning}",
-                        )
+            if not changed:
+                break
 
-        # 5. Also ensure any NS mutation branches with flawed assumptions get tested by background/gauntlet
-        for b in list(self.tracker.active_branches()):
-            if "ns mutation" in " ".join(b.reasoning_trace).lower() or "proxycommand" in b.fork_under_exploration.lower() or "fail2ban" in b.fork_under_exploration.lower():
-                out = self.fail_judge.falsify_branch(b.id, schedule_trigger="background_sample")
-                falsifications_run.append(out.to_dict())
+        # Blind variation must face selection: NS-born branches never exit untested
+        if not self._should_stop():
+            for b in list(self.tracker.active_branches()):
+                if b.origin == "ns" and b.state == BranchState.POSSIBLE and b.survived_falsifications == 0:
+                    out = self.fail_judge.falsify_branch(b.id, schedule_trigger="background_sample")
+                    falsifications_run.append(out.to_dict())
 
-        # 6. Pre-exit check (runs 3-round Pass-readiness gauntlet + final pre-exit check;
-        #    higher-certainty survivors exit first into the winner's box)
-        top_candidates = sorted(
-            self.tracker.active_branches(),
-            key=lambda r: r.certainty_score,
-            reverse=True,
-        )[:3]
-        winners = self.fail_judge.verify_pre_exit([c.id for c in top_candidates])
+        # Pre-exit: frontier branches only (a branch that split handed its flow to its
+        # children — the river splits around the rock), distinct solutions, highest certainty first
+        winners: List[BranchRecord] = []
+        if not self._should_stop():
+            split_parents = self._split_parent_ids()
+            seen: set = set()
+            top_candidates: List[BranchRecord] = []
+            frontier = [r for r in self.tracker.active_branches() if r.id not in split_parents]
+            for rec in sorted(frontier, key=lambda r: r.certainty_score, reverse=True):
+                key = self._solution_key(rec)
+                if key in seen:
+                    continue
+                seen.add(key)
+                top_candidates.append(rec)
+                if len(top_candidates) >= self.max_winners:
+                    break
+            winners = self.fail_judge.verify_pre_exit([c.id for c in top_candidates])
         self.winners_box = [w.to_dict() for w in winners]
 
         return {
-            "alignments_evaluated": [a.to_dict() for a in alignments],
+            "rounds_run": rounds_run,
+            "reclaimed_to_finish_reserve_usd": reclaimed_usd,
+            "alignments_evaluated": alignments_evaluated,
             "merges_performed": merges_performed,
             "contradictions_resolved": contradictions_resolved,
             "falsifications_count": len(falsifications_run),
             "winners_box": self.winners_box,
         }
+
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
+    def _spawn_starters(self, problem: str) -> None:
+        starter_scores = [
+            float(self.seed_cases[idx].get("certainty_score", 0.0)) * 0.25
+            if idx < len(self.seed_cases)
+            else 0.0
+            for idx in range(self.starter_agents)
+        ]
+        starter_budgets = self.budget_ledger.split_among_siblings(
+            parent_budget=self.budget_ledger.exploration_pool_usd,
+            certainty_scores=starter_scores,
+            apply_depth_decay=False,
+        )
+        for idx, s_budget in enumerate(starter_budgets):
+            b_id = self._next_branch_id()
+            if idx < len(self.seed_cases):
+                seed_fork = str(self.seed_cases[idx].get("fork_shape", f"starter_agent_{idx + 1}"))
+                seed_prefix = f"Root arena entry — seeded from recalled win: {seed_fork}"
+            else:
+                seed_fork = f"starter_agent_{idx + 1}"
+                seed_prefix = "Root arena entry — starter agent."
+            directive = Directive(
+                parent_reasoning_compressed=seed_prefix,
+                fork_exploring=seed_fork,
+                state=BranchState.POSSIBLE,
+                budget=s_budget,
+            )
+            self.starters.append(
+                MiniHarness(
+                    branch_id=b_id,
+                    parent_id=None,
+                    problem=problem,
+                    directive=directive,
+                    depth=0,
+                    client=self.client,
+                    tracker=self.tracker,
+                    detector=self.detector,
+                    budget_ledger=self.budget_ledger,
+                    event_sink=self._on_event,
+                    branch_counter=self._next_branch_id,
+                    origin="starter",
+                    should_stop=self._should_stop,
+                )
+            )
 
     def run(self, problem: str, force_ns_on_starters: bool = True) -> Dict[str, Any]:
         """
@@ -906,69 +1205,39 @@ class MainHarness:
         5. If `enable_selection` is True, run Pieces 4-6 selection (align, merge, falsify,
            Pass gauntlet, pre-exit into winner's box).
         6. Unlock run boundary on `version_registry` and return full summary.
+        A hard-cap hit or emergency stop halts the run cleanly (`halted_reason`), never mid-write.
         """
+        from .backend import HardCapExceededError
+
+        if not problem or not problem.strip():
+            raise ValueError("problem must be a non-empty string")
+
         active_version_id = self._apply_active_version_dials()
+        selection_summary: Dict[str, Any] = {}
         try:
-            self.budget_ledger.size_problem_once(self.client, problem)
+            try:
+                self.budget_ledger.size_problem_once(self.client, problem)
+                self._spawn_starters(problem)
 
-            starter_scores = [
-                float(self.seed_cases[idx]["certainty_score"]) * 0.25
-                if idx < len(self.seed_cases)
-                else 0.0
-                for idx in range(self.starter_agents)
-            ]
-            starter_budgets = self.budget_ledger.split_among_siblings(
-                parent_budget=self.budget_ledger.exploration_pool_usd,
-                certainty_scores=starter_scores,
-                apply_depth_decay=False,
-            )
+                # All starter branches live at once in parallel
+                with ThreadPoolExecutor(max_workers=max(1, len(self.starters))) as pool:
+                    futs = [pool.submit(mini.step, force_ns_on_starters) for mini in self.starters]
+                    for f in as_completed(futs):
+                        f.result()
 
-            for idx, s_budget in enumerate(starter_budgets):
-                b_id = self._next_branch_id()
-                if idx < len(self.seed_cases):
-                    seed_fork = str(self.seed_cases[idx].get("fork_shape", f"starter_agent_{idx + 1}"))
-                    seed_prefix = f"Root arena entry — seeded from recalled win: {seed_fork}"
-                else:
-                    seed_fork = f"starter_agent_{idx + 1}"
-                    seed_prefix = "Root arena entry — starter agent."
-
-                directive = Directive(
-                    parent_reasoning_compressed=seed_prefix,
-                    fork_exploring=seed_fork,
-                    state=BranchState.POSSIBLE,
-                    budget=s_budget,
-                )
-                mini = MiniHarness(
-                    branch_id=b_id,
-                    parent_id=None,
-                    problem=problem,
-                    directive=directive,
-                    depth=0,
-                    client=self.client,
-                    tracker=self.tracker,
-                    detector=self.detector,
-                    budget_ledger=self.budget_ledger,
-                    event_sink=self._on_event,
-                    branch_counter=self._next_branch_id,
-                )
-                self.starters.append(mini)
-
-            # All starter branches live at once in parallel
-            with ThreadPoolExecutor(max_workers=max(1, len(self.starters))) as pool:
-                futs = [
-                    pool.submit(mini.step, force_ns_on_starters)
-                    for mini in self.starters
-                ]
-                for f in as_completed(futs):
-                    f.result()
-
-            selection_summary: Dict[str, Any] = {}
-            if self.enable_selection:
-                selection_summary = self._run_selection_phase()
+                if self.enable_selection and not self._should_stop():
+                    selection_summary = self._run_selection_phase()
+            except HardCapExceededError as exc:
+                self.halted_reason = "hard_cap"
+                self._emit_halt("hard_cap", str(exc))
+            if self.halted_reason is None and self._should_stop():
+                self.halted_reason = "emergency_stop"
+                self._emit_halt("emergency_stop", "Emergency stop killed the run; rollback applies next run.")
 
             remaining_across_branches = round(
                 sum(r.budget_remaining for r in self.tracker.all_records()), 6
             )
+            meter = self.client.stats()
 
             return {
                 "problem": problem,
@@ -977,6 +1246,7 @@ class MainHarness:
                 "is_mock": getattr(self.client, "is_mock", False),
                 "active_version_id": active_version_id,
                 "seeded_starters_count": min(self.starter_agents, len(self.seed_cases)),
+                "halted_reason": self.halted_reason,
                 "budget": {
                     "difficulty_estimate_usd": round(self.budget_ledger.difficulty_estimate_usd, 6),
                     "root_budget_usd": round(self.budget_ledger.root_budget_usd, 6),
@@ -984,11 +1254,16 @@ class MainHarness:
                     "finish_reserve_remaining_usd": round(self.budget_ledger.finish_reserve_usd, 6),
                     "exploration_pool_usd": round(self.budget_ledger.exploration_pool_usd, 6),
                     "total_spent_usd": round(self.budget_ledger.total_spent_usd, 6),
+                    "overdraft_usd": round(self.budget_ledger.overdraft_usd, 6),
                     "unspent_branch_budgets_usd": remaining_across_branches,
                     "hard_cap_usd": round(self.budget_ledger.hard_cap_usd, 6),
+                    "api_calls": meter["calls"],
+                    "api_spend_usd": meter["total_cost_usd"],
+                    "api_spend_by_model": meter["cost_by_model"],
                 },
                 "total_branches_spawned": len(self.tracker.all_records()),
                 "selection": selection_summary,
+                "verified_main_line": list(self.fail_judge.verified_main_line),
                 "winners_box": self.winners_box,
                 "scoreboard": self.tracker.scoreboard(),
                 "events_count": len(self.events),

@@ -24,9 +24,8 @@ exits survived — not that only one can.
 
 from __future__ import annotations
 
-import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -34,6 +33,7 @@ from .alignment_detector import branch_position_text
 from .backend import SUPER_MODEL
 from .branch_spawner import BudgetLedger, HarnessEvent
 from .issue_detector import IssueDetector
+from .jsonutil import coerce_bool, parse_json_object
 from .tracker import BranchRecord, BranchState, PFPTracker, PassProvenanceRecord
 
 
@@ -64,12 +64,15 @@ class FalsificationOutcome:
     rationale: str = ""
     cost_usd: float = 0.0
     transitioned_to: Optional[str] = None
+    # Judge reply had no usable verdict: no survival credit, no kill, no appeal consumed
+    inconclusive: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "branch_id": self.branch_id,
             "schedule_trigger": self.schedule_trigger,
             "survived": self.survived,
+            "inconclusive": self.inconclusive,
             "angle": self.angle,
             "judge_id": self.judge_id,
             "appeal_attempted": self.appeal_attempted,
@@ -166,21 +169,37 @@ class FailJudge:
         )
 
     def _record_cost(self, branch_id: str, cost_usd: float, reason: str) -> None:
+        """
+        Pay a judge call's real cost. Falsification is verification work, so a branch
+        whose own budget is spent may draw on the finish reserve; anything beyond that
+        is booked as overdraft on the ledger (never silently dropped).
+        """
         if cost_usd <= 0.0:
             return
-        rec = self.tracker.get(branch_id)
-        deducted = min(rec.budget_remaining, max(0.0, cost_usd))
-        new_budget = round(max(0.0, rec.budget_remaining - deducted), 6)
-        self.tracker.update_branch(branch_id, budget_remaining=new_budget)
         if self.budget_ledger is not None:
-            self.budget_ledger.record_spend(deducted)
+            charged = self.budget_ledger.charge(
+                self.tracker, branch_id, cost_usd, allow_finish_reserve=True
+            )
+        else:
+            rec = self.tracker.get(branch_id)
+            from_branch = min(rec.budget_remaining, cost_usd)
+            new_budget = round(max(0.0, rec.budget_remaining - from_branch), 6)
+            self.tracker.update_branch(branch_id, budget_remaining=new_budget)
+            charged = {
+                "cost_usd": round(cost_usd, 6),
+                "from_finish_reserve_usd": 0.0,
+                "overdraft_usd": round(cost_usd - from_branch, 6),
+                "budget_remaining": new_budget,
+            }
         self._emit(
             "budget_change",
             branch_id,
             {
                 "reason": reason,
-                "spent_usd": round(deducted, 6),
-                "budget_remaining": new_budget,
+                "spent_usd": charged["cost_usd"],
+                "from_finish_reserve_usd": charged["from_finish_reserve_usd"],
+                "overdraft_usd": charged["overdraft_usd"],
+                "budget_remaining": charged["budget_remaining"],
             },
         )
 
@@ -212,7 +231,8 @@ class FailJudge:
         judge_id: str = "super_judge_primary",
         is_appeal: bool = False,
         extra_context: str = "",
-    ) -> tuple[bool, str, str, float]:
+    ) -> tuple[Optional[bool], str, str, float]:
+        """Returns (survived, objection, rationale, cost); survived is None when the reply had no verdict."""
         pos = branch_position_text(branch)
         main_line_str = " | ".join(self.verified_main_line) if self.verified_main_line else "None yet"
         appeal_flag = "appeal_review=true appeal_judge" if is_appeal else "appeal_review=false"
@@ -243,16 +263,14 @@ class FailJudge:
             max_tokens=200,
         )
         cost = float(resp.usage.cost_usd)
-        raw = resp.choices[0].message.content if resp.choices else "{}"
-        try:
-            data = json.loads(raw)
-            survived = bool(data.get("survived", True))
-            objection = str(data.get("objection", ""))
-            rationale = str(data.get("rationale", ""))
-        except Exception:
-            survived = True
-            objection = ""
-            rationale = raw.strip()
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
+        data = parse_json_object(raw)
+        if data is None:
+            # Fail closed: an unreadable verdict is neither a survival nor a kill
+            return None, "", f"Unparseable judge reply: {raw.strip()[:200]}", cost
+        survived = coerce_bool(data.get("survived"), None)
+        objection = str(data.get("objection") or "")
+        rationale = str(data.get("rationale") or "")
         return survived, objection, rationale, cost
 
     def falsify_branch(
@@ -298,6 +316,21 @@ class FailJudge:
         total_cost = cost
         self._record_cost(branch_id, cost, f"falsify_{schedule_trigger}_{chosen_angle.value}")
 
+        if survived is None:
+            outcome = FalsificationOutcome(
+                branch_id=branch_id,
+                schedule_trigger=schedule_trigger,
+                survived=False,
+                angle=chosen_angle.value,
+                judge_id=primary_judge,
+                rationale=rationale,
+                cost_usd=total_cost,
+                transitioned_to=self.tracker.get(branch_id).state.value,
+                inconclusive=True,
+            )
+            self._emit("falsification_inconclusive", branch_id, outcome.to_dict())
+            return outcome
+
         appeal_attempted = False
         appeal_overturned = False
         appeal_judge = ""
@@ -317,7 +350,7 @@ class FailJudge:
             )
             total_cost += app_cost
             self._record_cost(branch_id, app_cost, f"appeal_{schedule_trigger}")
-            if app_survived:
+            if app_survived is True:
                 survived = True
                 appeal_overturned = True
                 objection = ""
@@ -362,7 +395,8 @@ class FailJudge:
             return outcome
 
         # Kill confirmed -> transition to FAIL (or revoke Pass -> FAIL if it was already Pass)
-        if rec.state == BranchState.PASS:
+        was_pass = rec.state == BranchState.PASS
+        if was_pass:
             self.tracker.revoke_pass(
                 branch_id,
                 demote_to=BranchState.FAIL,
@@ -396,6 +430,13 @@ class FailJudge:
             transitioned_to=BranchState.FAIL.value,
         )
         self._emit("fail", branch_id, outcome.to_dict())
+        if was_pass:
+            # A verified branch died: the main line rewrites and dependents re-verify or die
+            self._rewrite_main_line_and_reverify(
+                branch_id,
+                demoted_to=BranchState.FAIL,
+                reason=f"falsified_on_{schedule_trigger}:{chosen_angle.value}",
+            )
         return outcome
 
     # ------------------------------------------------------------------
@@ -436,6 +477,7 @@ class FailJudge:
             )
             outcomes.append(out)
             if not out.survived:
+                # Killed, or inconclusive (no verdict = no Pass; branch stays Possible)
                 return outcomes
 
         rec = self.tracker.get(branch_id)
@@ -493,14 +535,20 @@ class FailJudge:
         if rec_a.is_alive and rec_b.is_alive:
             loser = rec_a if rec_a.certainty_score <= rec_b.certainty_score else rec_b
             loser_out = out_a if loser.id == branch_a_id else out_b
-            if loser.state == BranchState.PASS:
+            loser_was_pass = loser.state == BranchState.PASS
+            if loser_was_pass:
                 self.tracker.revoke_pass(loser.id, demote_to=BranchState.FAIL, reason="contradiction_loser")
             else:
                 self.tracker.transition(loser.id, BranchState.FAIL, reason="contradiction_loser")
             loser_out.survived = False
+            loser_out.inconclusive = False
             loser_out.transitioned_to = BranchState.FAIL.value
             loser_out.rationale += " (Killed as lower-certainty loser in direct contradiction clash)."
             self._emit("fail", loser.id, loser_out.to_dict())
+            if loser_was_pass:
+                self._rewrite_main_line_and_reverify(
+                    loser.id, demoted_to=BranchState.FAIL, reason="contradiction_loser"
+                )
 
         return out_a, out_b
 
@@ -594,7 +642,27 @@ class FailJudge:
         and dependents re-verify or die.
         """
         demoted = self.tracker.revoke_pass(branch_id, demote_to=demote_to, reason=reason)
-        # Rewrite the verified main line to remove claims from the revoked branch
+        return self._rewrite_main_line_and_reverify(
+            branch_id,
+            demoted_to=demoted.state,
+            reason=reason,
+            force_fail_dependents=force_fail_dependents,
+        )
+
+    def _rewrite_main_line_and_reverify(
+        self,
+        branch_id: str,
+        *,
+        demoted_to: BranchState,
+        reason: str,
+        force_fail_dependents: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Shared tail of every Pass loss (manual revocation, killed in pre-exit,
+        contradiction loser): drop the branch's claim from the verified main line,
+        append a `revocation` event (history never rewrites), then make every
+        alive dependent re-verify or die.
+        """
         self.verified_main_line = [
             claim for claim in self.verified_main_line if not claim.startswith(f"[{branch_id}]")
         ]
@@ -602,7 +670,7 @@ class FailJudge:
             "revocation",
             branch_id,
             {
-                "demoted_to": demoted.state.value,
+                "demoted_to": demoted_to.value,
                 "reason": reason,
                 "verified_main_line": list(self.verified_main_line),
             },
@@ -630,7 +698,7 @@ class FailJudge:
 
         return {
             "revoked_branch_id": branch_id,
-            "demoted_to": demoted.state.value,
+            "demoted_to": demoted_to.value,
             "dependents_checked": list(dependent_outcomes.keys()),
             "dependent_outcomes": dependent_outcomes,
         }

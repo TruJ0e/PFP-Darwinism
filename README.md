@@ -1,1 +1,150 @@
-# PFP-Darwanism-
+# PFP Darwinism
+
+**Pass, Fail, Possible — survival of the fittest reasoning.**
+*"Nebius — survival of the fittest."*
+
+A reasoning flow drops into an arena and falls. Wherever its continuations
+genuinely disagree, it **branches** into parallel sub-agents; those branch again
+at their own forks. Branches that contradict established truth **crash into the
+verified main line** and die. Branches whose ideas align **merge** — cooperation,
+not just competition. Whatever survives repeated, rotated falsification exits
+into the **winner's box** with its proof trail.
+
+Built for the Nebius x NVIDIA Global AI Hackathon on NVIDIA Nemotron models via
+Nebius Token Factory. Full design: [`DESIGN.md`](DESIGN.md).
+
+![arena](https://img.shields.io/badge/arena-Tron%20light--cycle-00f0ff) ![deps](https://img.shields.io/badge/runtime%20deps-stdlib%20only-00ff9d)
+
+---
+
+## Quick start
+
+```bash
+# No key needed: the mock backend speaks the exact OpenAI-compatible interface
+python run_arena.py --mock --html-out arena_out/arena.html --stream-out arena_out/run.jsonl
+
+# Open arena_out/arena.html — scrub, play, hover branches.
+#   arena.html#seq=120  opens at event 120
+#   arena.html#play     autoplays from ignition (demo-video capture)
+```
+
+Live on Nebius Token Factory:
+
+```bash
+export NEBIUS_API_KEY=...                       # Token Factory key
+export NEBIUS_BASE_URL=https://api.tokenfactory.nebius.com/v1   # default
+export NEBIUS_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B        # default (fan-out workhorse)
+python run_arena.py --hard-cap 2.00 --state-dir .pfp_state --html-out arena_out/arena.html
+```
+
+`--state-dir` persists the version registry and the case bank, so each run starts
+seeded with past wins on similar problems, on whichever config version is active
+or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--starters` | 3 | starter agents (3 demo, 9 real) |
+| `--hard-cap` | 2.00 | absolute USD ceiling on true API spend |
+| `--depth-dial` | 3 | bounds branch count per split |
+| `--k-probes` | 3 | blind continuations per divergence check |
+| `--gauntlet-rounds` | 3 | rotated falsification rounds to earn Pass |
+| `--selection-rounds` | 3 | align → clash → merge rounds (merged children can merge again) |
+| `--state-dir` | — | persist registry + case bank across runs |
+| `--no-improve` | off | skip the Piece 8 post-run loop |
+| `--max-retries` | 3 | live retries on 429/5xx/network errors |
+
+Exit code is `0` for a completed run and `2` if the run halted (hard cap or emergency stop).
+
+## How it maps to the design
+
+| Piece | Module | What it does |
+|---|---|---|
+| 1. Issue detector | `pfp/issue_detector.py` | K blind high-temperature probes; a split *is* the issue. Plaus (divergence + logprob entropy + critic leaps) and NS (blind variation on a budget-derived cadence). Novelty exhaustion across the whole lineage. |
+| 2. Branch spawner | `pfp/branch_spawner.py` | Directives, recursive mini-harnesses running in parallel, single-round budget: root = 2 × difficulty (capped), ×0.5 depth decay, certainty-weighted sibling split with a floor, 10–15% finish reserve, graceful degradation (NS slows → stops → no spawns → conclude). |
+| 3. PFP tracker | `pfp/tracker.py` | Thread-safe ledger; one-way transitions, no resurrection, transition history, lineage/DAG queries. |
+| 4. Alignment detector | `pfp/alignment_detector.py` | Cheap embedding pre-filter (recall) → Super claim-by-claim judge: overlap / contradictory / unrelated. |
+| 5. Merge synthesizer | `pfp/merge_synthesizer.py` | Super unifies aligned branches with per-parent provenance; parents are absorbed and their budgets transfer to the child, which starts Possible. |
+| 6. Fail judge | `pfp/fail_judge.py` | Falsification on a schedule (post-merge, Pass gauntlet, contradiction, background, pre-exit), rotated angles, one appeal per kill with a different judge, revokable Pass that rewrites the main line and re-verifies dependents. |
+| 7. Arena feed | `pfp/arena.py`, `pfp/arena_html.py` | Append-only event stream (JSONL in/out). ASCII renderer and a self-contained HTML/Canvas Tron player are pure functions of the stream. |
+| 8. Self-improvement | `pfp/self_improvement.py`, `pfp/dials.py` | Mine the log → recall past wins → self-assessment → evidence-grounded anti-model → proposition → sandbox → hashed version registry with auto-revert, pin, run-boundary switching, emergency stop. |
+
+Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
+(`nvidia/nemotron-3-super-120b-a12b`) for alignment, merge and falsification.
+
+## Safety rails and honest accounting
+
+- **True spend, not affordable spend.** Every model call goes through
+  `MeteredClient`; the ledger records each call's real cost. Cost a branch can't
+  cover is drawn from the finish reserve (verification work only) or reported as
+  `overdraft_usd` — never dropped. `total_spent_usd == api_spend_usd` is tested.
+- **Hard cap is enforced**, not advisory: once true spend reaches `--hard-cap`,
+  no new call starts; the run halts cleanly with `halted_reason: "hard_cap"`
+  and a `halt` event in the arena feed.
+- **Selection is paid for.** Each branch keeps a protected verification share
+  (30% by default) that exploration and child spawning can't touch; split
+  parents' idle budgets return to the finish reserve when selection begins.
+- **Exploration degrades on real costs.** The ledger learns per-call-kind costs;
+  a branch that can't afford another probe concludes instead of overdrawing.
+- **Emergency stop** (`MainHarness.emergency_stop()` or
+  `VersionRegistry.emergency_stop()`) kills a live run; rollback applies next run.
+
+## Live-model robustness
+
+- Model replies are parsed with `pfp/jsonutil.py`: code fences, leading prose and
+  `<think>` blocks are handled; `"survived": "false"` is false (plain
+  `bool("false")` would be true).
+- **Falsification fails closed.** A judge reply with no readable verdict is
+  *inconclusive*: no survival credit, no kill, no appeal consumed, and no Pass.
+- HTTP: exponential backoff with jitter on 408/409/425/429/5xx and network
+  errors, `Retry-After` honored, non-retryable errors raised immediately with
+  status and body; reasoning-model `reasoning_content` fallback.
+- Bounded concurrency (`max_concurrent_calls`, default 32) across all branches.
+
+## Self-improvement guardrails
+
+- Proposed dial changes are untrusted input: `pfp/dials.py` rejects unknown
+  keys, non-numeric values, NaN/inf, and anything outside the safe envelope
+  (e.g. `gauntlet_rounds: 0`, rewarding open objections). Rejections are
+  recorded on the proposition for the anti-model.
+- Versioned prompts are live: `plaus_probe_hint` from the active version is
+  injected into every probe, and into the sandbox run.
+- `VersionRegistry.save/load` persists the failsafe; every snapshot's SHA-256 is
+  re-verified on load, so a tampered version refuses to load.
+- Anti-model attacks that cite no event-log evidence are dropped.
+
+## The arena player
+
+`--html-out` writes one self-contained file (no network, no dependencies):
+right-angle light-cycle trails per starter lineage, NS mutations in violet,
+merges converging in gold, red crash sparks where branches hit the verified main
+line (which glows brighter with every Pass), survivors riding down into the
+winner's box. The scoreboard HUD, event feed and winner's box are all
+scrub-aware: drag the slider and a Pass revoked later leaves the box. Space =
+play/pause, ←/→ = step, Home/End. All stream text is rendered as text, never
+HTML, and the embedded JSON can't break out of its `<script>`.
+
+## Tests
+
+```bash
+pip install -e ".[dev]"      # optional; stdlib-only at runtime
+python -m pytest -q
+```
+
+The suite runs fully offline against the deterministic, content-addressed mock
+(same prompt → same reply regardless of thread interleaving) and a local fake
+HTTP server for the live client.
+
+## Repository layout
+
+```
+pfp/                 the package (pieces 1–8 + backend, json + dial helpers, HTML player)
+run_arena.py         full pipeline CLI (pieces 1–8)
+run_phase1.py        pieces 1–3 only, JSON summary
+spike.py             Token Factory parallel fan-out economics probe
+tests/               offline test suite
+DESIGN.md            the design this implements
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

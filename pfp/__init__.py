@@ -1,5 +1,6 @@
 """
-PFP Darwinism — Phase 1 Core Harness (Pieces 1–3 + OpenAI-compatible Backend).
+PFP Darwinism — all eight pieces: split, spawn, track, align, merge, falsify,
+arena feed + Tron renderer, self-improvement loop + failsafe registry.
 
 Pass, Fail, Possible — survival of the fittest reasoning.
 Tagline: "Nebius — survival of the fittest."
@@ -9,10 +10,14 @@ from .backend import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
     SUPER_MODEL,
+    BackendError,
+    HardCapExceededError,
+    MeteredClient,
     MockOpenAIClient,
     OpenAICompatibleClient,
     create_client,
 )
+from .jsonutil import coerce_bool, extract_json, parse_json_object
 from .tracker import (
     BranchRecord,
     BranchState,
@@ -51,7 +56,10 @@ from .fail_judge import (
     FalsifierAngle,
     ROTATED_ANGLES,
 )
+from .dials import DEFAULT_DIALS, DIAL_BOUNDS, sanitize_dials
 from .arena import (
+    ARENA_LEVEL_EVENT_TYPES,
+    CANONICAL_EVENT_TYPES,
     AppendOnlyViolationError,
     ArenaEvent,
     ArenaFeed,
@@ -72,9 +80,20 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
     "SUPER_MODEL",
+    "BackendError",
+    "HardCapExceededError",
+    "MeteredClient",
     "MockOpenAIClient",
     "OpenAICompatibleClient",
     "create_client",
+    "coerce_bool",
+    "extract_json",
+    "parse_json_object",
+    "DEFAULT_DIALS",
+    "DIAL_BOUNDS",
+    "sanitize_dials",
+    "ARENA_LEVEL_EVENT_TYPES",
+    "CANONICAL_EVENT_TYPES",
     "BranchRecord",
     "BranchState",
     "InvalidStateTransitionError",

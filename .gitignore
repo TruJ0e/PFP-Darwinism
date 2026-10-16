@@ -5,3 +5,9 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# Run artifacts
+arena_out/
+.pfp_state/
+*.egg-info/
+build/
