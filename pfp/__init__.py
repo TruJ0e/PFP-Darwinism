@@ -51,6 +51,12 @@ from .fail_judge import (
     FalsifierAngle,
     ROTATED_ANGLES,
 )
+from .arena import (
+    AppendOnlyViolationError,
+    ArenaEvent,
+    ArenaFeed,
+    TronArenaRenderer,
+)
 
 __all__ = [
     "DEFAULT_BASE_URL",
@@ -85,5 +91,9 @@ __all__ = [
     "FalsificationOutcome",
     "FalsifierAngle",
     "ROTATED_ANGLES",
+    "AppendOnlyViolationError",
+    "ArenaEvent",
+    "ArenaFeed",
+    "TronArenaRenderer",
 ]
 

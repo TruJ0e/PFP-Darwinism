@@ -722,6 +722,7 @@ class MainHarness:
         enable_selection: bool = True,
     ) -> None:
         from .alignment_detector import AlignmentDetector
+        from .arena import ArenaFeed, TronArenaRenderer
         from .fail_judge import FailJudge
         from .merge_synthesizer import MergeSynthesizer
 
@@ -732,6 +733,8 @@ class MainHarness:
         self.detector = IssueDetector(client, k_probes=k_probes, depth_dial=depth_dial)
         self.budget_ledger = BudgetLedger(hard_cap_usd=hard_cap_usd)
         self.events: List[HarnessEvent] = []
+        self.arena_feed = ArenaFeed()
+        self.arena_renderer = TronArenaRenderer()
         self.starters: List[MiniHarness] = []
         self._seq = 0
         self._lock = threading.RLock()
@@ -761,6 +764,10 @@ class MainHarness:
     def _on_event(self, event: HarnessEvent) -> None:
         with self._lock:
             self.events.append(event)
+            self.arena_feed.ingest_harness_event(event)
+
+    def render_arena(self, problem: str = "") -> str:
+        return self.arena_renderer.render_ascii(self.arena_feed.events, problem=problem)
 
     def _run_selection_phase(self) -> Dict[str, Any]:
         """
