@@ -149,10 +149,17 @@ def branch_position_text(record: BranchRecord) -> str:
 
 class AlignmentDetector:
     """
-    Piece 4: Alignment detector — spotting mergeable branches.
+    Piece 4: Alignment detector — spotting mergeable branches (Pass 2: intent & refinement).
     Stage 1: Embedding pre-filter (cheap cosine similarity on branch positions, recall-oriented).
     Stage 2: Super judge call (`nvidia/nemotron-3-super-120b-a12b`) extracting core claims
              and comparing claim-by-claim into overlap/compatible, contradictory, or unrelated.
+
+    Refinements in Pass 2 (by what was meant):
+    - Claim extraction cache keyed by `(branch_id, len(reasoning_trace))` so inspecting `K`
+      candidate pairs doesn't re-invoke Super claim extraction redundantly on the same branch state.
+    - Cross-subtree / non-identical fork preference so sibling branches exploring the exact
+      same fork aren't redundantly re-judged after already clustering, while cross-subtree
+      convergent branches (cooperation across starter trees) are prioritized.
     """
 
     def __init__(
@@ -160,13 +167,14 @@ class AlignmentDetector:
         client: Any,
         *,
         prefilter_threshold: float = 0.20,
-        embedding_dim: int = 64,
+        embedding_dim: int = 128,
         super_model: str = SUPER_MODEL,
     ) -> None:
         self.client = client
         self.prefilter_threshold = prefilter_threshold
         self.embedding_dim = embedding_dim
         self.super_model = super_model
+        self._claims_cache: Dict[Tuple[str, int], List[str]] = {}
 
     def embedding_prefilter(
         self,
@@ -201,8 +209,13 @@ class AlignmentDetector:
 
     def extract_claims(self, branch: BranchRecord) -> Tuple[List[str], float]:
         """
-        Extract core claims from a branch's position via the Super model.
+        Extract core claims from a branch's position via the Super model, using
+        a trace-versioned cache to avoid duplicate Super calls on the same branch state.
         """
+        cache_key = (branch.id, len(branch.reasoning_trace))
+        if cache_key in self._claims_cache:
+            return list(self._claims_cache[cache_key]), 0.0
+
         pos_text = branch_position_text(branch)
         resp = self.client.chat.completions.create(
             model=self.super_model,
@@ -231,6 +244,7 @@ class AlignmentDetector:
             claims = [pos_text[:160]] if pos_text else []
         if not claims:
             claims = [branch.fork_under_exploration or pos_text[:120]]
+        self._claims_cache[cache_key] = list(claims)
         return claims, cost
 
     def judge_pair(

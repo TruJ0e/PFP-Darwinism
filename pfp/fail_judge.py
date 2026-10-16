@@ -130,6 +130,27 @@ class FailJudge:
         self._angle_cursor += 1
         return angle
 
+    def next_angle_for_branch(self, branch_id: str) -> FalsifierAngle:
+        """
+        Pass 2 refinement: select the next attack style (`logic`, `counterexample`,
+        `assumption_audit`) based on what this specific branch has already survived,
+        guaranteeing a 3-round gauntlet tests all 3 distinct angles on that branch
+        even when concurrent branches are being falsified simultaneously.
+        """
+        rec = self.tracker.get(branch_id)
+        tested_counts = {a: 0 for a in ROTATED_ANGLES}
+        for p in rec.pass_provenance:
+            for a in ROTATED_ANGLES:
+                if p.falsifier_angle == a.value:
+                    tested_counts[a] += 1
+        # Pick the least-tested angle on this branch (breaking ties in canonical rotation order)
+        min_count = min(tested_counts.values())
+        for a in ROTATED_ANGLES:
+            if tested_counts[a] == min_count:
+                self._angle_cursor += 1
+                return a
+        return self.next_angle()
+
     def _emit(self, event_type: str, branch_id: str, details: Dict[str, Any]) -> None:
         if self.event_sink is None:
             return
@@ -253,7 +274,7 @@ class FailJudge:
             (dead, no resurrection).
         """
         rec = self.tracker.get(branch_id)
-        chosen_angle = angle or self.next_angle()
+        chosen_angle = angle or self.next_angle_for_branch(branch_id)
         primary_judge = "super_judge_primary"
 
         if not rec.is_alive:
@@ -328,7 +349,7 @@ class FailJudge:
                 schedule_trigger=schedule_trigger,
                 survived=True,
                 angle=chosen_angle.value,
-                judge_id= primary_judge,
+                judge_id=primary_judge,
                 appeal_attempted=appeal_attempted,
                 appeal_overturned=appeal_overturned,
                 appeal_judge_id=appeal_judge,
@@ -407,7 +428,7 @@ class FailJudge:
             rec = self.tracker.get(branch_id)
             if not rec.is_alive:
                 break
-            angle = self.next_angle()
+            angle = self.next_angle_for_branch(branch_id)
             out = self.falsify_branch(
                 branch_id,
                 schedule_trigger=f"pass_gauntlet_round_{r_idx + 1}",

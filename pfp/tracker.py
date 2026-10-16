@@ -371,17 +371,30 @@ class PFPTracker:
 
     def known_forks_in_lineage(self, branch_id: str) -> List[str]:
         """
-        Return all fork descriptions already explored in the ancestor chain and
-        immediate siblings of `branch_id` so novelty exhaustion prevents redundant remixes.
+        Return all fork descriptions already explored in the ancestor chain (including
+        all `merge_parents` DAG lineages) and immediate siblings of `branch_id` so
+        novelty exhaustion prevents redundant remixes after merges too.
         """
         with self._lock:
             forks: List[str] = []
-            for anc in self.lineage(branch_id):
-                if anc.fork_under_exploration:
-                    forks.append(anc.fork_under_exploration)
-                for sib in self.children_of(anc.parent):
+            queue: List[str] = [branch_id]
+            visited = set()
+            while queue:
+                curr_id = queue.pop(0)
+                if curr_id in visited or curr_id not in self._records:
+                    continue
+                visited.add(curr_id)
+                rec = self._records[curr_id]
+                if rec.fork_under_exploration and rec.fork_under_exploration not in forks:
+                    forks.append(rec.fork_under_exploration)
+                for sib in self.children_of(rec.parent):
                     if sib.fork_under_exploration and sib.fork_under_exploration not in forks:
                         forks.append(sib.fork_under_exploration)
+                if rec.parent is not None:
+                    queue.append(rec.parent)
+                for mp in rec.merge_parents:
+                    if mp not in visited:
+                        queue.append(mp)
             return forks
 
     def scoreboard(self) -> List[Dict[str, Any]]:
