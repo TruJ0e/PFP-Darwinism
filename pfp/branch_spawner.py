@@ -720,15 +720,20 @@ class MainHarness:
         k_probes: int = 3,
         gauntlet_rounds: int = 3,
         enable_selection: bool = True,
+        version_registry: Optional[Any] = None,
+        seed_cases: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
         from .fail_judge import FailJudge
+        from .issue_detector import CertaintyWeights
         from .merge_synthesizer import MergeSynthesizer
 
         self.client = client
         self.starter_agents = starter_agents
         self.enable_selection = enable_selection
+        self.version_registry = version_registry
+        self.seed_cases: List[Dict[str, Any]] = list(seed_cases or [])
         self.tracker = PFPTracker()
         self.detector = IssueDetector(client, k_probes=k_probes, depth_dial=depth_dial)
         self.budget_ledger = BudgetLedger(hard_cap_usd=hard_cap_usd)
@@ -755,6 +760,22 @@ class MainHarness:
             event_sink=self._on_event,
         )
         self.winners_box: List[Dict[str, Any]] = []
+        self._certainty_weights_cls = CertaintyWeights
+
+    def _apply_active_version_dials(self) -> Optional[str]:
+        if self.version_registry is None:
+            return None
+        snap = self.version_registry.begin_run()
+        dials = snap.config_dials
+        self.detector.weights = self._certainty_weights_cls(
+            survived_falsifications=float(dials.get("survived_falsifications_weight", 3.0)),
+            merges_attracted=float(dials.get("merges_attracted_weight", 1.5)),
+            open_critic_objections=float(dials.get("open_critic_objections_weight", -1.25)),
+            age_without_testing=float(dials.get("age_without_testing_weight", -0.15)),
+        )
+        self.alignment_detector.prefilter_threshold = float(dials.get("prefilter_threshold", 0.20))
+        self.fail_judge.gauntlet_rounds = int(dials.get("gauntlet_rounds", self.fail_judge.gauntlet_rounds))
+        return snap.version_id
 
     def _next_branch_id(self) -> str:
         with self._lock:
@@ -875,83 +896,103 @@ class MainHarness:
     def run(self, problem: str, force_ns_on_starters: bool = True) -> Dict[str, Any]:
         """
         Run the PFP Darwinism harness on `problem`:
-        1. Size the problem once to establish single-round root budget and finish reserve.
-        2. Split exploration pool across `starter_agents` initial MiniHarnesses.
-        3. Run all starter MiniHarnesses in parallel; each recursively detects Plaus/NS
+        1. Lock active version in `version_registry` (if attached) at the run boundary.
+        2. Size the problem once to establish single-round root budget and finish reserve.
+        3. Split exploration pool across `starter_agents` initial MiniHarnesses (seeded with
+           any recalled winning branch shapes from `seed_cases`).
+        4. Run all starter MiniHarnesses in parallel; each recursively detects Plaus/NS
            splits, spawns sub-branches with decayed certainty-weighted budgets, and
            degrades gracefully to conclusion.
-        4. If `enable_selection` is True, run Pieces 4-6 selection (align, merge, falsify,
+        5. If `enable_selection` is True, run Pieces 4-6 selection (align, merge, falsify,
            Pass gauntlet, pre-exit into winner's box).
-        5. Return aggregated tracker scoreboard, budget ledger summary, selection summary,
-           and event stream.
+        6. Unlock run boundary on `version_registry` and return full summary.
         """
-        self.budget_ledger.size_problem_once(self.client, problem)
+        active_version_id = self._apply_active_version_dials()
+        try:
+            self.budget_ledger.size_problem_once(self.client, problem)
 
-        starter_scores = [0.0 for _ in range(self.starter_agents)]
-        starter_budgets = self.budget_ledger.split_among_siblings(
-            parent_budget=self.budget_ledger.exploration_pool_usd,
-            certainty_scores=starter_scores,
-            apply_depth_decay=False,
-        )
-
-        for idx, s_budget in enumerate(starter_budgets):
-            b_id = self._next_branch_id()
-            directive = Directive(
-                parent_reasoning_compressed="Root arena entry — starter agent.",
-                fork_exploring=f"starter_agent_{idx + 1}",
-                state=BranchState.POSSIBLE,
-                budget=s_budget,
-            )
-            mini = MiniHarness(
-                branch_id=b_id,
-                parent_id=None,
-                problem=problem,
-                directive=directive,
-                depth=0,
-                client=self.client,
-                tracker=self.tracker,
-                detector=self.detector,
-                budget_ledger=self.budget_ledger,
-                event_sink=self._on_event,
-                branch_counter=self._next_branch_id,
-            )
-            self.starters.append(mini)
-
-        # All starter branches live at once in parallel
-        with ThreadPoolExecutor(max_workers=max(1, len(self.starters))) as pool:
-            futs = [
-                pool.submit(mini.step, force_ns_on_starters)
-                for mini in self.starters
+            starter_scores = [
+                float(self.seed_cases[idx]["certainty_score"]) * 0.25
+                if idx < len(self.seed_cases)
+                else 0.0
+                for idx in range(self.starter_agents)
             ]
-            for f in as_completed(futs):
-                f.result()
+            starter_budgets = self.budget_ledger.split_among_siblings(
+                parent_budget=self.budget_ledger.exploration_pool_usd,
+                certainty_scores=starter_scores,
+                apply_depth_decay=False,
+            )
 
-        selection_summary: Dict[str, Any] = {}
-        if self.enable_selection:
-            selection_summary = self._run_selection_phase()
+            for idx, s_budget in enumerate(starter_budgets):
+                b_id = self._next_branch_id()
+                if idx < len(self.seed_cases):
+                    seed_fork = str(self.seed_cases[idx].get("fork_shape", f"starter_agent_{idx + 1}"))
+                    seed_prefix = f"Root arena entry — seeded from recalled win: {seed_fork}"
+                else:
+                    seed_fork = f"starter_agent_{idx + 1}"
+                    seed_prefix = "Root arena entry — starter agent."
 
-        remaining_across_branches = round(
-            sum(r.budget_remaining for r in self.tracker.all_records()), 6
-        )
+                directive = Directive(
+                    parent_reasoning_compressed=seed_prefix,
+                    fork_exploring=seed_fork,
+                    state=BranchState.POSSIBLE,
+                    budget=s_budget,
+                )
+                mini = MiniHarness(
+                    branch_id=b_id,
+                    parent_id=None,
+                    problem=problem,
+                    directive=directive,
+                    depth=0,
+                    client=self.client,
+                    tracker=self.tracker,
+                    detector=self.detector,
+                    budget_ledger=self.budget_ledger,
+                    event_sink=self._on_event,
+                    branch_counter=self._next_branch_id,
+                )
+                self.starters.append(mini)
 
-        return {
-            "problem": problem,
-            "model": getattr(self.client, "model", ""),
-            "base_url": getattr(self.client, "base_url", ""),
-            "is_mock": getattr(self.client, "is_mock", False),
-            "budget": {
-                "difficulty_estimate_usd": round(self.budget_ledger.difficulty_estimate_usd, 6),
-                "root_budget_usd": round(self.budget_ledger.root_budget_usd, 6),
-                "initial_finish_reserve_usd": round(self.budget_ledger.initial_finish_reserve_usd, 6),
-                "finish_reserve_remaining_usd": round(self.budget_ledger.finish_reserve_usd, 6),
-                "exploration_pool_usd": round(self.budget_ledger.exploration_pool_usd, 6),
-                "total_spent_usd": round(self.budget_ledger.total_spent_usd, 6),
-                "unspent_branch_budgets_usd": remaining_across_branches,
-                "hard_cap_usd": round(self.budget_ledger.hard_cap_usd, 6),
-            },
-            "total_branches_spawned": len(self.tracker.all_records()),
-            "selection": selection_summary,
-            "winners_box": self.winners_box,
-            "scoreboard": self.tracker.scoreboard(),
-            "events_count": len(self.events),
-        }
+            # All starter branches live at once in parallel
+            with ThreadPoolExecutor(max_workers=max(1, len(self.starters))) as pool:
+                futs = [
+                    pool.submit(mini.step, force_ns_on_starters)
+                    for mini in self.starters
+                ]
+                for f in as_completed(futs):
+                    f.result()
+
+            selection_summary: Dict[str, Any] = {}
+            if self.enable_selection:
+                selection_summary = self._run_selection_phase()
+
+            remaining_across_branches = round(
+                sum(r.budget_remaining for r in self.tracker.all_records()), 6
+            )
+
+            return {
+                "problem": problem,
+                "model": getattr(self.client, "model", ""),
+                "base_url": getattr(self.client, "base_url", ""),
+                "is_mock": getattr(self.client, "is_mock", False),
+                "active_version_id": active_version_id,
+                "seeded_starters_count": min(self.starter_agents, len(self.seed_cases)),
+                "budget": {
+                    "difficulty_estimate_usd": round(self.budget_ledger.difficulty_estimate_usd, 6),
+                    "root_budget_usd": round(self.budget_ledger.root_budget_usd, 6),
+                    "initial_finish_reserve_usd": round(self.budget_ledger.initial_finish_reserve_usd, 6),
+                    "finish_reserve_remaining_usd": round(self.budget_ledger.finish_reserve_usd, 6),
+                    "exploration_pool_usd": round(self.budget_ledger.exploration_pool_usd, 6),
+                    "total_spent_usd": round(self.budget_ledger.total_spent_usd, 6),
+                    "unspent_branch_budgets_usd": remaining_across_branches,
+                    "hard_cap_usd": round(self.budget_ledger.hard_cap_usd, 6),
+                },
+                "total_branches_spawned": len(self.tracker.all_records()),
+                "selection": selection_summary,
+                "winners_box": self.winners_box,
+                "scoreboard": self.tracker.scoreboard(),
+                "events_count": len(self.events),
+            }
+        finally:
+            if self.version_registry is not None and self.version_registry.run_in_progress:
+                self.version_registry.end_run()

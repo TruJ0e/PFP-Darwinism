@@ -117,6 +117,30 @@ class TestPiece8SelfImprovementAndRegistry(unittest.TestCase):
         reg.restore_version(v3.version_id)
         self.assertEqual(reg.get_version().version_id, v3.version_id)
 
+    def test_multi_run_seeded_evolution_and_registry_lifecycle(self) -> None:
+        client = MockOpenAIClient()
+        reg = VersionRegistry()
+        loop = SelfImprovementLoop(client=client, registry=reg)
+        problem = "A small business's SSH works laptop->desktop but not desktop->laptop."
+
+        # Run 1 (unseeded baseline)
+        h1 = MainHarness(client=client, starter_agents=3, version_registry=reg, seed_cases=loop.case_bank)
+        s1 = h1.run(problem)
+        self.assertEqual(s1["seeded_starters_count"], 0)
+        self.assertFalse(reg.run_in_progress)
+
+        # Post-run improvement mines Run 1, populates recall case_bank, and adopts v2 in registry
+        imp = loop.run_post_run_improvement(h1.arena_feed.events, problem=problem, run_sandbox=True)
+        v2_id = imp["active_version_id"]
+        self.assertGreater(len(loop.case_bank), 0)
+
+        # Run 2 starts seeded with recalled wins from Run 1 and uses active v2 configuration
+        h2 = MainHarness(client=client, starter_agents=3, version_registry=reg, seed_cases=loop.case_bank)
+        s2 = h2.run(problem)
+        self.assertEqual(s2["active_version_id"], v2_id)
+        self.assertGreater(s2["seeded_starters_count"], 0)
+        self.assertGreater(len(s2["winners_box"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
