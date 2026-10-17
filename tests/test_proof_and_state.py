@@ -110,6 +110,23 @@ def test_report_handles_empty_and_halted_streams():
     assert "HALTED: hard\\_cap" in render_proof_markdown(report)
 
 
+def test_proof_report_never_certifies_a_non_pass_exit():
+    possible = {"id": "premature", "parent": None, "state": "Possible"}
+    report = build_proof_report([_ev(0, "winner_exit", "premature", possible)])
+    assert report["winners"] == []
+
+
+@pytest.mark.parametrize("terminal_event,terminal_state", [("fail", "Fail"), ("kill", "Fail")])
+def test_later_terminal_state_evicts_an_earlier_winner(terminal_event, terminal_state):
+    passed = {"id": "once-good", "parent": None, "state": "Pass"}
+    terminal = dict(passed, state=terminal_state)
+    events = [
+        _ev(0, "winner_exit", "once-good", passed),
+        _ev(1, terminal_event, "once-good", terminal),
+    ]
+    assert build_proof_report(events)["winners"] == []
+
+
 def test_ancestry_is_cycle_safe():
     events = [
         _ev(0, "spawn", "a", {"id": "a", "parent": "b", "state": "Possible"}),
@@ -178,6 +195,47 @@ def test_malformed_registry_refuses_to_load(tmp_path, payload):
     path.write_text(payload, encoding="utf-8")
     with pytest.raises(ValueError):
         VersionRegistry.load(path)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("active_version_id", "v999_redirected"),
+    ("pinned_version_id", "v999_redirected"),
+    ("degradation_threshold", 999.0),
+    ("failed_experiments", [{"reason": "history erased"}]),
+])
+def test_registry_v2_detects_control_plane_tampering(tmp_path, field, value):
+    path = tmp_path / "registry.json"
+    VersionRegistry().save(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["format"] == "pfp-version-registry/2"
+    assert len(raw["integrity_sha256"]) == 64
+    raw[field] = value
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="control-plane integrity"):
+        VersionRegistry.load(path)
+
+
+def test_registry_rejects_duplicate_ids_even_with_valid_envelope(tmp_path):
+    path = tmp_path / "registry.json"
+    registry = VersionRegistry()
+    raw = registry.to_dict()
+    raw["versions"].append(dict(raw["versions"][0]))
+    raw["integrity_sha256"] = registry._registry_digest(raw)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="Duplicate"):
+        VersionRegistry.load(path)
+
+
+def test_v1_registry_loads_and_upgrades_on_save(tmp_path):
+    path = tmp_path / "registry.json"
+    registry = VersionRegistry()
+    raw = registry.to_dict()
+    raw["format"] = "pfp-version-registry/1"
+    raw.pop("integrity_sha256")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = VersionRegistry.load(path)
+    loaded.save(path)
+    assert json.loads(path.read_text(encoding="utf-8"))["format"] == "pfp-version-registry/2"
 
 
 def test_cli_refuses_corrupt_registry_before_spending(tmp_path, monkeypatch):

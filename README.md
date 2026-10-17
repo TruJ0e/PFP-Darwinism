@@ -154,7 +154,10 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - Versioned prompts are live: `plaus_probe_hint` from the active version is
   injected into every probe, and into the sandbox run.
 - `VersionRegistry.save/load` persists the failsafe; every snapshot's SHA-256 is
-  re-verified on load, so a tampered version refuses to load.
+  re-verified on load, and the v2 registry envelope also covers the active,
+  pinned and pending pointers, version order, failed-experiment history and
+  degradation threshold. A v1 file is accepted and upgraded on its next save;
+  control-plane edits, duplicate IDs and broken parent chains fail closed.
 - Anti-model attacks that cite no event-log evidence are dropped.
 - The case bank is untrusted on load too: cases without a fork shape are dropped,
   non-numeric / non-finite / negative certainty becomes 0 (it would otherwise
@@ -163,6 +166,9 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - A malformed registry refuses to load instead of half-loading; every persisted
   artifact (stream, HTML, registry, case bank, summary, report) is written via
   `pfp/fsutil.py`: temp file → fsync → atomic replace.
+- Winner certification is state-derived: `winner_exit` only counts with a Pass
+  snapshot, and any later non-Pass state evicts the claim from replay and proof
+  reports. A UI event cannot manufacture a certified result.
 
 ## The arena player
 

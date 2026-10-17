@@ -416,8 +416,8 @@ class VersionRegistry:
     # Persistence: the failsafe only protects across runs if it survives the process
     # ------------------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "format": "pfp-version-registry/1",
+        payload = {
+            "format": "pfp-version-registry/2",
             "degradation_threshold": self.degradation_threshold,
             "active_version_id": self.active_version_id,
             "pinned_version_id": self.pinned_version_id,
@@ -425,6 +425,21 @@ class VersionRegistry:
             "failed_experiments": copy.deepcopy(self.failed_experiments),
             "versions": [self._versions[vid].to_dict() for vid in self._version_order],
         }
+        payload["integrity_sha256"] = self._registry_digest(payload)
+        return payload
+
+    @staticmethod
+    def _registry_digest(payload: Dict[str, Any]) -> str:
+        """Hash every persisted control-plane field, excluding the digest itself."""
+        unsigned = {k: v for k, v in payload.items() if k != "integrity_sha256"}
+        canonical = json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def save(self, path: str | Path) -> Path:
         if self.run_in_progress:
@@ -441,8 +456,16 @@ class VersionRegistry:
         if not isinstance(raw, dict) or not isinstance(raw.get("versions", []), list):
             raise ValueError("Registry file must contain a JSON object with a 'versions' list.")
         try:
+            fmt = raw.get("format", "pfp-version-registry/1")
+            if fmt not in ("pfp-version-registry/1", "pfp-version-registry/2"):
+                raise ValueError(f"Unsupported registry format: {fmt!r}")
+            if fmt == "pfp-version-registry/2":
+                recorded = raw.get("integrity_sha256")
+                expected = cls._registry_digest(raw)
+                if not isinstance(recorded, str) or recorded != expected:
+                    raise ValueError("Registry control-plane integrity check failed; refusing to load.")
             return cls._from_raw(raw)
-        except (KeyError, TypeError, AttributeError) as exc:
+        except (KeyError, TypeError, AttributeError, OverflowError) as exc:
             # A hand-edited or truncated registry must refuse to load, never half-load.
             raise ValueError(f"Malformed registry: {type(exc).__name__}: {exc}") from exc
 
@@ -450,12 +473,19 @@ class VersionRegistry:
     def _from_raw(cls, raw: Dict[str, Any]) -> "VersionRegistry":
         reg = cls.__new__(cls)
         reg.degradation_threshold = float(raw.get("degradation_threshold", 0.15))
+        if not math.isfinite(reg.degradation_threshold) or reg.degradation_threshold < 0.0:
+            raise ValueError("Registry degradation_threshold must be finite and non-negative.")
         reg._versions = {}
         reg._version_order = []
         reg.run_in_progress = False
         reg.emergency_stopped = False
-        reg.failed_experiments = list(raw.get("failed_experiments", []))
+        failed = raw.get("failed_experiments", [])
+        if not isinstance(failed, list) or any(not isinstance(item, dict) for item in failed):
+            raise ValueError("Registry failed_experiments must be a list of objects.")
+        reg.failed_experiments = copy.deepcopy(failed)
         for v in raw.get("versions", []):
+            if not isinstance(v, dict):
+                raise ValueError("Every registry version must be an object.")
             snap = VersionSnapshot(
                 version_id=str(v["version_id"]),
                 sha256_hash=str(v["sha256_hash"]),
@@ -477,6 +507,15 @@ class VersionRegistry:
             )
             if expected != snap.sha256_hash:
                 raise ValueError(f"Version {snap.version_id} failed SHA-256 integrity check; refusing to load.")
+            if not snap.version_id or snap.version_id in reg._versions:
+                raise ValueError(f"Duplicate or empty registry version id: {snap.version_id!r}")
+            if not math.isfinite(snap.created_at):
+                raise ValueError(f"Version {snap.version_id} has a non-finite creation timestamp.")
+            if snap.parent_version_id is not None and snap.parent_version_id not in reg._versions:
+                raise ValueError(
+                    f"Version {snap.version_id} references a missing or out-of-order parent "
+                    f"{snap.parent_version_id!r}."
+                )
             reg._versions[snap.version_id] = snap
             reg._version_order.append(snap.version_id)
         if not reg._version_order:
@@ -767,7 +806,10 @@ class SelfImprovementLoop:
         }
 
     def save_case_bank(self, path: str | Path) -> Path:
-        return atomic_write_text(Path(path), json.dumps(self.case_bank, indent=2))
+        cleaned = [case for case in (self.sanitize_case(c) for c in self.case_bank) if case is not None]
+        self.case_bank = cleaned
+        self._trim_case_bank()
+        return atomic_write_text(Path(path), json.dumps(self.case_bank, indent=2, allow_nan=False))
 
     def load_case_bank(self, path: str | Path) -> int:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))

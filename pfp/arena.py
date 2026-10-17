@@ -437,6 +437,7 @@ class TronArenaRenderer:
                         "objection": evt.details.get("objection", "Hit the verified main line"),
                     }
                 )
+                winners_box = [w for w in winners_box if w.get("id") != bid]
             elif evt.event_type == "pass":
                 passes.append(
                     {
@@ -457,12 +458,23 @@ class TronArenaRenderer:
                 # Remove revoked branch from winners_box if present
                 winners_box = [w for w in winners_box if w.get("id") != bid]
             elif evt.event_type == "winner_exit":
-                if not any(w.get("id") == bid for w in winners_box):
+                # A winner is a proof claim, not merely a UI placement. Never let a
+                # malformed/custom stream certify Possible/Fail/Absorbed state.
+                if snap.get("state") == "Pass" and not any(w.get("id") == bid for w in winners_box):
                     winners_box.append(snap)
+            elif evt.event_type == "kill":
+                winners_box = [w for w in winners_box if w.get("id") != bid]
             elif evt.event_type == "ns_tick":
                 ns_ticks += 1
             elif evt.event_type == "budget_change":
                 budget_changes += 1
+
+        # Final state is authoritative. This also handles custom event types carrying a
+        # later non-Pass snapshot without relying on a specific eviction event name.
+        winners_box = [
+            w for w in winners_box
+            if branches.get(str(w.get("id", "")), {}).get("state") == "Pass"
+        ]
 
         # Build Scoreboard HUD ordered by state priority (Pass > Possible > Absorbed > Fail) and certainty
         state_rank = {"Pass": 3, "Possible": 2, "Absorbed": 1, "Fail": 0}
