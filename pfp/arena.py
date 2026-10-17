@@ -195,6 +195,7 @@ class ArenaFeed:
     @classmethod
     def from_jsonl(cls, jsonl_text: str) -> "ArenaFeed":
         feed = cls()
+        expected_seq = 1
         for line in jsonl_text.splitlines():
             stripped = line.strip()
             if not stripped:
@@ -202,8 +203,17 @@ class ArenaFeed:
             raw = json.loads(stripped)
             with feed._lock:
                 evt = ArenaEvent.from_dict(raw)
-                feed._seq = max(feed._seq, evt.seq)
+                if evt.seq != expected_seq:
+                    raise AppendOnlyViolationError(
+                        f"Arena replay sequence must be contiguous: expected {expected_seq}, got {evt.seq}."
+                    )
+                if not evt.snapshot or "id" not in evt.snapshot or "state" not in evt.snapshot:
+                    raise ValueError(
+                        f"Arena event {evt.seq} lacks the required full branch snapshot ('id', 'state')."
+                    )
+                feed._seq = evt.seq
                 list.append(feed._events, evt)
+                expected_seq += 1
         return feed
 
     @classmethod

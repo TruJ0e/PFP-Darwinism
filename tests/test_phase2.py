@@ -270,7 +270,7 @@ class TestPhase2EndToEndSelection(unittest.TestCase):
         # Verify DAG merge lineage novelty includes both merged parents' forks
         for m in selection["merges_performed"]:
             cid = m["child_branch_id"]
-            pa = tracker_fork = harness.tracker.get(m["parent_a_id"]).fork_under_exploration
+            pa = harness.tracker.get(m["parent_a_id"]).fork_under_exploration
             pb = harness.tracker.get(m["parent_b_id"]).fork_under_exploration
             known = harness.tracker.known_forks_in_lineage(cid)
             self.assertIn(pa, known)

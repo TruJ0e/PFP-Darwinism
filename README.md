@@ -77,9 +77,12 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   `MeteredClient`; the ledger records each call's real cost. Cost a branch can't
   cover is drawn from the finish reserve (verification work only) or reported as
   `overdraft_usd` — never dropped. `total_spent_usd == api_spend_usd` is tested.
-- **Hard cap is enforced**, not advisory: once true spend reaches `--hard-cap`,
-  no new call starts; the run halts cleanly with `halted_reason: "hard_cap"`
-  and a `halt` event in the arena feed.
+- **Hard cap is enforced**, not advisory: every call atomically reserves a
+  conservative upper-bound cost before it enters the parallel request pool.
+  A call that would exceed `--hard-cap` (including spend already in flight) is
+  refused; the run halts cleanly with `halted_reason: "hard_cap"` and a `halt`
+  event in the arena feed. Unknown model IDs use the highest known catalog rate
+  instead of an optimistic cheap-model fallback.
 - **Selection is paid for.** Each branch keeps a protected verification share
   (30% by default) that exploration and child spawning can't touch; split
   parents' idle budgets return to the finish reserve when selection begins.
@@ -132,7 +135,9 @@ python -m pytest -q
 
 The suite runs fully offline against the deterministic, content-addressed mock
 (same prompt → same reply regardless of thread interleaving) and a local fake
-HTTP server for the live client.
+HTTP server for the live client. It also stress-tests concurrent cap admission
+and rejects replay logs with sequence gaps, duplicate sequence numbers, or
+missing branch snapshots.
 
 ## Repository layout
 

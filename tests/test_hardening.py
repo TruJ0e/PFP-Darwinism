@@ -6,6 +6,7 @@ selection correctness, Piece 8 persistence/validation, and arena renderer safety
 from __future__ import annotations
 
 import contextlib
+import concurrent.futures
 import io
 import json
 import tempfile
@@ -17,6 +18,7 @@ from typing import Any, Callable, Dict, List
 
 import run_arena
 from pfp import (
+    AppendOnlyViolationError,
     ArenaFeed,
     BackendError,
     BranchState,
@@ -28,6 +30,7 @@ from pfp import (
     MeteredClient,
     MockOpenAIClient,
     OpenAICompatibleClient,
+    SUPER_MODEL,
     PFPTracker,
     SelfImprovementLoop,
     TronArenaRenderer,
@@ -283,16 +286,45 @@ class TestLiveClient(unittest.TestCase):
 # Safety rails: true spend metering, hard cap, emergency stop
 # ---------------------------------------------------------------------------
 class TestSafetyRails(unittest.TestCase):
+    def test_parallel_calls_reserve_budget_atomically(self) -> None:
+        """Fan-out cannot stampede through the cap while earlier calls are in flight."""
+        metered = MeteredClient(
+            ScriptedClient(["{}"] * 20),
+            hard_cap_usd=0.001,
+            max_concurrent_calls=20,
+        )
+        successes = 0
+        refusals = 0
+
+        def call_once() -> bool:
+            try:
+                metered.chat.completions.create(
+                    model=SUPER_MODEL,
+                    messages=[{"role": "user", "content": "x" * 200}],
+                    max_tokens=256,
+                )
+                return True
+            except HardCapExceededError:
+                return False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+            for accepted in pool.map(lambda _: call_once(), range(20)):
+                successes += int(accepted)
+                refusals += int(not accepted)
+
+        self.assertGreater(successes, 0)
+        self.assertGreater(refusals, 0)
+        self.assertEqual(metered.stats()["in_flight_reserved_usd"], 0.0)
+
     def test_metered_client_refuses_calls_past_hard_cap(self) -> None:
         metered = MeteredClient(ScriptedClient(["{}"] * 5), hard_cap_usd=0.0025)
         metered.chat.completions.create(messages=[{"role": "user", "content": "a"}])
         metered.chat.completions.create(messages=[{"role": "user", "content": "b"}])
-        metered.chat.completions.create(messages=[{"role": "user", "content": "c"}])
         with self.assertRaises(HardCapExceededError):
-            metered.chat.completions.create(messages=[{"role": "user", "content": "d"}])
+            metered.chat.completions.create(messages=[{"role": "user", "content": "c"}])
         stats = metered.stats()
-        self.assertEqual(stats["calls"], 3)
-        self.assertTrue(stats["cap_reached"])
+        self.assertEqual(stats["calls"], 2)
+        self.assertLessEqual(stats["total_cost_usd"], 0.0025)
 
     def test_ledger_spend_matches_independent_meter(self) -> None:
         harness = MainHarness(client=MockOpenAIClient(), starter_agents=3)
@@ -519,6 +551,18 @@ class TestPiece8Hardening(unittest.TestCase):
 # Arena renderer safety + scale
 # ---------------------------------------------------------------------------
 class TestArenaRendering(unittest.TestCase):
+    def test_replay_rejects_gaps_duplicates_and_missing_snapshots(self) -> None:
+        valid = {
+            "seq": 1, "event_type": "spawn", "branch_id": "b1", "timestamp": 1.0,
+            "details": {}, "snapshot": {"id": "b1", "state": "Possible"},
+        }
+        duplicate = dict(valid)
+        with self.assertRaises(AppendOnlyViolationError):
+            ArenaFeed.from_jsonl("\n".join((json.dumps(valid), json.dumps(duplicate))))
+        missing = dict(valid, snapshot={"id": "b1"})
+        with self.assertRaises(ValueError):
+            ArenaFeed.from_jsonl(json.dumps(missing))
+
     def test_html_player_escapes_hostile_stream_content(self) -> None:
         feed = ArenaFeed()
         evil = '</script><img src=x onerror=alert(1)> __EVENTS_JSON__'

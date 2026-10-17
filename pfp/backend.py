@@ -34,7 +34,13 @@ MODEL_PRICING_PER_1M: Dict[str, tuple[float, float]] = {
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B": (0.06, 0.24),
     "nvidia/nemotron-3-super-120b-a12b": (0.30, 0.90),
 }
-DEFAULT_PRICING_PER_1M = (0.06, 0.24)
+# Unknown models must not silently get the cheapest known price: that would make
+# the hard-cap preflight optimistic.  Use the most expensive catalog rates as a
+# conservative fallback (callers can add a catalog entry for exact accounting).
+DEFAULT_PRICING_PER_1M = (
+    max(rate[0] for rate in MODEL_PRICING_PER_1M.values()),
+    max(rate[1] for rate in MODEL_PRICING_PER_1M.values()),
+)
 
 
 def get_base_url() -> str:
@@ -393,6 +399,7 @@ class MeteredClient:
         self.calls: int = 0
         self.failed_calls: int = 0
         self.cost_by_model: Dict[str, float] = {}
+        self._reserved_cost_usd: float = 0.0
         self._lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent_calls)))
         self.chat = _MeteredChatNamespace(_MeteredCompletions(self))
@@ -400,23 +407,56 @@ class MeteredClient:
     @property
     def cap_reached(self) -> bool:
         with self._lock:
-            return self.hard_cap_usd is not None and self.total_cost_usd >= self.hard_cap_usd
+            return self.hard_cap_usd is not None and (
+                self.total_cost_usd + self._reserved_cost_usd >= self.hard_cap_usd
+            )
+
+    @staticmethod
+    def _prompt_token_upper_bound(messages: Any) -> int:
+        """Conservative preflight bound: a token cannot exceed its UTF-8 byte input."""
+        if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+            return 1024
+        total = 1024  # protocol/template overhead across providers
+        for message in messages:
+            if isinstance(message, dict):
+                total += len(str(message.get("role", "")).encode("utf-8"))
+                total += len(str(message.get("content", "")).encode("utf-8"))
+                total += 64
+            else:
+                total += len(str(message).encode("utf-8")) + 64
+        return total
+
+    def _reserve_call(self, kwargs: Dict[str, Any]) -> float:
+        model = str(kwargs.get("model") or self.model)
+        prompt_bound = self._prompt_token_upper_bound(kwargs.get("messages", []))
+        completion_bound = max(0, int(kwargs.get("max_tokens", 256)))
+        n = max(1, int(kwargs.get("n", 1)))
+        reservation = estimate_call_cost_usd(prompt_bound, completion_bound * n, model)
+        with self._lock:
+            projected = self.total_cost_usd + self._reserved_cost_usd + reservation
+            if self.hard_cap_usd is not None and projected > self.hard_cap_usd:
+                raise HardCapExceededError(
+                    f"Hard cap ${self.hard_cap_usd:.4f} would be exceeded by a new call "
+                    f"(spent ${self.total_cost_usd:.4f}, in-flight reserve "
+                    f"${self._reserved_cost_usd:.4f}, call reserve ${reservation:.4f}); refusing it."
+                )
+            self._reserved_cost_usd += reservation
+        return reservation
 
     def _metered_create(self, *args: Any, **kwargs: Any) -> Any:
-        if self.cap_reached:
-            raise HardCapExceededError(
-                f"Hard cap ${self.hard_cap_usd:.4f} reached (spent ${self.total_cost_usd:.4f}); refusing new calls."
-            )
-        with self._slots:
-            try:
+        reservation = self._reserve_call(kwargs)
+        try:
+            with self._slots:
                 resp = self.inner.chat.completions.create(*args, **kwargs)
-            except Exception:
-                with self._lock:
-                    self.failed_calls += 1
-                raise
+        except Exception:
+            with self._lock:
+                self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - reservation)
+                self.failed_calls += 1
+            raise
         cost = float(getattr(getattr(resp, "usage", None), "cost_usd", 0.0) or 0.0)
         model = str(kwargs.get("model") or self.model)
         with self._lock:
+            self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - reservation)
             self.calls += 1
             self.total_cost_usd = round(self.total_cost_usd + cost, 8)
             self.cost_by_model[model] = round(self.cost_by_model.get(model, 0.0) + cost, 8)
@@ -428,6 +468,7 @@ class MeteredClient:
                 "calls": self.calls,
                 "failed_calls": self.failed_calls,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                "in_flight_reserved_usd": round(self._reserved_cost_usd, 6),
                 "cost_by_model": {k: round(v, 6) for k, v in self.cost_by_model.items()},
                 "hard_cap_usd": self.hard_cap_usd,
                 "cap_reached": self.hard_cap_usd is not None and self.total_cost_usd >= self.hard_cap_usd,

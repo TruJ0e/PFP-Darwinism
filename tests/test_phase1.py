@@ -218,12 +218,12 @@ class TestPiece2BranchSpawnerAndBudget(unittest.TestCase):
 
         # Finish reserve protection: branches with open critic objections cannot touch finish reserve
         tracker = PFPTracker()
-        unready = tracker.register_branch("u1", None, 0.0005, "fork_a", certainty_score=1.0)
+        tracker.register_branch("u1", None, 0.0005, "fork_a", certainty_score=1.0)
         tracker.update_branch("u1", open_critic_objections=1)
         self.assertEqual(ledger.draw_from_finish_reserve(tracker.get("u1"), 0.002), 0.0)
 
         # Near-conclusion branch (high certainty, 0 open critic objections) CAN draw from finish reserve
-        ready = tracker.register_branch("r1", None, 0.0005, "fork_b", certainty_score=1.0)
+        tracker.register_branch("r1", None, 0.0005, "fork_b", certainty_score=1.0)
         tracker.update_branch("r1", open_critic_objections=0)
         drawn = ledger.draw_from_finish_reserve(tracker.get("r1"), 0.002)
         self.assertEqual(drawn, 0.002)
