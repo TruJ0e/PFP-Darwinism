@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: python -m pyflakes pfp tests run_arena.py run_phase1.py spike.py
+      - name: Test
+        run: python -m pytest -q
+      - name: Mock arena smoke (live == replay proof trail)
+        shell: bash
+        run: |
+          python run_arena.py --mock --quiet --no-improve --stream-out out/run.jsonl --html-out out/arena.html --report-out out/proof.json
+          python run_arena.py --replay out/run.jsonl --quiet --report-out out/replay.json
+          python -c "import json; a=json.load(open('out/proof.json')); b=json.load(open('out/replay.json')); [d.pop(k, None) for d in (a, b) for k in ('spend', 'problem')]; assert a == b, 'replay report diverged'; assert a['winners'], 'no winners'"

@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .arena import ARENA_LEVEL_EVENT_TYPES, ArenaEvent
 from .backend import SUPER_MODEL
+from .fsutil import atomic_write_text
 from .dials import DEFAULT_DIALS, resolve_dials, sanitize_dials, weights_from_dials
 from .issue_detector import _jaccard_similarity
 from .jsonutil import as_str_list, parse_json_object
@@ -427,12 +429,7 @@ class VersionRegistry:
     def save(self, path: str | Path) -> Path:
         if self.run_in_progress:
             raise RunBoundarySwitchError("Save the registry between runs, not mid-arena.")
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
-        tmp.replace(target)
-        return target
+        return atomic_write_text(Path(path), json.dumps(self.to_dict(), indent=2))
 
     @classmethod
     def load(cls, path: str | Path) -> "VersionRegistry":
@@ -441,6 +438,16 @@ class VersionRegistry:
         recorded payload; a tampered or corrupted version refuses to load.
         """
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or not isinstance(raw.get("versions", []), list):
+            raise ValueError("Registry file must contain a JSON object with a 'versions' list.")
+        try:
+            return cls._from_raw(raw)
+        except (KeyError, TypeError, AttributeError) as exc:
+            # A hand-edited or truncated registry must refuse to load, never half-load.
+            raise ValueError(f"Malformed registry: {type(exc).__name__}: {exc}") from exc
+
+    @classmethod
+    def _from_raw(cls, raw: Dict[str, Any]) -> "VersionRegistry":
         reg = cls.__new__(cls)
         reg.degradation_threshold = float(raw.get("degradation_threshold", 0.15))
         reg._versions = {}
@@ -617,6 +624,12 @@ class VersionRegistry:
         }
 
 
+# Case-bank limits (recall memory is persisted and fed back into prompts and budgets).
+CASE_TEXT_LIMIT = 1200
+CASE_PROBLEM_LIMIT = 4000
+CASE_CERTAINTY_CEILING = 1000.0
+
+
 class SelfImprovementLoop:
     """
     Piece 8: Full 6-step Self-Improvement Loop + Failsafe integration.
@@ -639,7 +652,10 @@ class SelfImprovementLoop:
         *,
         super_model: str = SUPER_MODEL,
         sandbox_hard_cap_usd: float = 1.00,
+        max_cases: int = 500,
     ) -> None:
+        if max_cases < 1:
+            raise ValueError("max_cases must be >= 1")
         if sandbox_hard_cap_usd <= 0:
             raise ValueError("sandbox_hard_cap_usd must be > 0")
         self.client = client
@@ -648,6 +664,7 @@ class SelfImprovementLoop:
         self.miner = EventLogMiner()
         self.super_model = super_model
         self.case_bank: List[Dict[str, Any]] = []
+        self.max_cases = int(max_cases)
 
     def record_wins_for_recall(self, metrics: MinedArenaMetrics, problem: str) -> List[Dict[str, Any]]:
         """
@@ -679,6 +696,7 @@ class SelfImprovementLoop:
             }
             self.case_bank.append(entry)
             added.append(entry)
+        self._trim_case_bank()
         return added
 
     def recall(self, problem: str, k: int = 3, min_similarity: float = 0.15) -> List[Dict[str, Any]]:
@@ -704,19 +722,60 @@ class SelfImprovementLoop:
                 break
         return out
 
+    def _trim_case_bank(self) -> None:
+        """Bound recall memory: keep the most-proven cases (wins, then certainty), drop the rest."""
+        if len(self.case_bank) <= self.max_cases:
+            return
+        ranked = sorted(
+            range(len(self.case_bank)),
+            key=lambda i: (int(self.case_bank[i].get("wins", 1)), float(self.case_bank[i].get("certainty_score", 0.0))),
+            reverse=True,
+        )
+        keep = set(ranked[: self.max_cases])
+        self.case_bank = [c for i, c in enumerate(self.case_bank) if i in keep]
+
+    @staticmethod
+    def sanitize_case(raw: Any) -> Optional[Dict[str, Any]]:
+        """
+        A case bank on disk is untrusted: it seeds starter budgets and prompts next run.
+        Non-finite or negative certainty would poison the certainty-weighted budget split
+        (inf/NaN shares), and unbounded strings would bloat every seeded prompt.
+        Returns the cleaned case, or None if it is unusable.
+        """
+        if not isinstance(raw, dict):
+            return None
+        fork = " ".join(str(raw.get("fork_shape") or "").split())[:CASE_TEXT_LIMIT]
+        if not fork:
+            return None
+        try:
+            certainty = float(raw.get("certainty_score", 0.0))
+        except (TypeError, ValueError):
+            certainty = 0.0
+        if not math.isfinite(certainty) or certainty < 0.0:
+            certainty = 0.0
+        try:
+            wins = int(raw.get("wins", 1))
+        except (TypeError, ValueError, OverflowError):
+            wins = 1
+        return {
+            "problem": str(raw.get("problem") or "")[:CASE_PROBLEM_LIMIT],
+            "fork_shape": fork,
+            "solution": str(raw.get("solution") or "")[:CASE_TEXT_LIMIT],
+            "is_merged_branch": raw.get("is_merged_branch") is True,
+            "certainty_score": min(certainty, CASE_CERTAINTY_CEILING),
+            "wins": max(1, wins),
+        }
+
     def save_case_bank(self, path: str | Path) -> Path:
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(json.dumps(self.case_bank, indent=2), encoding="utf-8")
-        tmp.replace(target)
-        return target
+        return atomic_write_text(Path(path), json.dumps(self.case_bank, indent=2))
 
     def load_case_bank(self, path: str | Path) -> int:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(raw, list):
             raise ValueError("Case bank file must contain a JSON list.")
-        self.case_bank = [dict(c) for c in raw if isinstance(c, dict) and c.get("fork_shape")]
+        cleaned = (self.sanitize_case(c) for c in raw)
+        self.case_bank = [c for c in cleaned if c is not None]
+        self._trim_case_bank()
         return len(self.case_bank)
 
     def run_self_assessment(self, metrics: MinedArenaMetrics) -> Dict[str, Any]:

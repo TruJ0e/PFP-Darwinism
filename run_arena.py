@@ -32,6 +32,8 @@ from pfp import (
     VersionRegistry,
     create_client,
 )
+from pfp.fsutil import atomic_write_text
+from pfp.proof_report import write_proof_report
 
 DEFAULT_PROBLEM = (
     "A small business's SSH works laptop->desktop but not desktop->laptop. "
@@ -43,6 +45,13 @@ def _positive_int(text: str) -> int:
     val = int(text)
     if val < 1:
         raise argparse.ArgumentTypeError("must be >= 1")
+    return val
+
+
+def _non_negative_int(text: str) -> int:
+    val = int(text)
+    if val < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
     return val
 
 
@@ -66,6 +75,8 @@ def _replay(args: argparse.Namespace) -> int:
         print(renderer.render_ascii(feed.events, problem=problem))
     if args.html_out:
         renderer.export_html_arena(feed.events, Path(args.html_out), problem=problem)
+    if args.report_out:
+        write_proof_report(feed.events, Path(args.report_out), problem=problem)
     print(f"[pfp] REPLAY | {len(feed)} events from {args.replay}", file=sys.stderr)
     return 0
 
@@ -117,9 +128,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Print JSON summary in addition to Tron Arena view")
     parser.add_argument("--quiet", action="store_true", help="Do not print the ASCII arena")
     parser.add_argument("--mock", action="store_true", help="Force mock backend even if NEBIUS_API_KEY is set")
-    parser.add_argument("--max-retries", type=int, default=3, help="Live backend retries on 429/5xx/network errors")
+    parser.add_argument("--max-retries", type=_non_negative_int, default=3, help="Live backend retries on 429/5xx/network errors")
     parser.add_argument("--max-concurrent", type=_positive_int, default=32, help="Max in-flight model calls")
     parser.add_argument("--summary-out", type=str, default="", help="Optional path to write the run summary JSON")
+    parser.add_argument(
+        "--report-out",
+        type=str,
+        default="",
+        help="Optional proof-trail report path (.md Markdown, .json structured); works with --replay",
+    )
     parser.add_argument("--replay", type=str, default="", help="Re-render a saved --stream-out JSONL (no model calls)")
     args = parser.parse_args(argv)
 
@@ -130,19 +147,30 @@ def main(argv: list[str] | None = None) -> int:
     if not args.problem.strip():
         parser.error("--problem must be non-empty")
 
-    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
-
     state_dir = Path(args.state_dir) if args.state_dir else None
     registry_path = state_dir / "registry.json" if state_dir else None
     cases_path = state_dir / "case_bank.json" if state_dir else None
-    registry = (
-        VersionRegistry.load(registry_path)
-        if registry_path is not None and registry_path.exists()
-        else VersionRegistry()
-    )
+    # Load persisted state before any client exists: a corrupt or tampered failsafe must stop
+    # the command before a cent is spent, and must never be silently replaced by a fresh one
+    # (that would erase the rollback history the next save would then overwrite).
+    try:
+        registry = (
+            VersionRegistry.load(registry_path)
+            if registry_path is not None and registry_path.exists()
+            else VersionRegistry()
+        )
+    except (OSError, ValueError) as exc:
+        print(f"[pfp] refusing to run: cannot load registry {registry_path}: {exc}", file=sys.stderr)
+        return 1
+
+    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
     loop = SelfImprovementLoop(client=client, registry=registry)
     if cases_path is not None and cases_path.exists():
-        loop.load_case_bank(cases_path)
+        try:
+            loop.load_case_bank(cases_path)
+        except (OSError, ValueError) as exc:
+            print(f"[pfp] refusing to run: cannot load case bank {cases_path}: {exc}", file=sys.stderr)
+            return 1
 
     harness = MainHarness(
         client=client,
@@ -176,13 +204,13 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.html_out),
             problem=args.problem,
         )
+    if args.report_out:
+        write_proof_report(harness.arena_feed.events, Path(args.report_out), problem=args.problem, summary=summary)
     if registry_path is not None and cases_path is not None:
         registry.save(registry_path)
         loop.save_case_bank(cases_path)
     if args.summary_out:
-        out = Path(args.summary_out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+        atomic_write_text(Path(args.summary_out), json.dumps(summary, indent=2, default=str))
 
     b = summary["budget"]
     print(

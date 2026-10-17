@@ -75,6 +75,8 @@ from .self_improvement import (
     VersionRegistry,
     VersionSnapshot,
 )
+from .fsutil import atomic_write_text
+from .proof_report import build_proof_report, render_proof_markdown, write_proof_report
 
 __all__ = [
     "DEFAULT_BASE_URL",
@@ -132,5 +134,9 @@ __all__ = [
     "SelfImprovementLoop",
     "VersionRegistry",
     "VersionSnapshot",
+    "atomic_write_text",
+    "build_proof_report",
+    "render_proof_markdown",
+    "write_proof_report",
 ]
 

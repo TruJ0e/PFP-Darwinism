@@ -305,7 +305,12 @@ class BudgetLedger:
         if max_n <= 0:
             return []
 
-        active_scores = list(certainty_scores[:max_n])
+        # Non-finite scores (a poisoned recall case, a NaN critic signal) get no extra share
+        # instead of turning the whole split into NaN.
+        active_scores = [
+            float(s) if isinstance(s, (int, float)) and math.isfinite(s) else 0.0
+            for s in certainty_scores[:max_n]
+        ]
         k = len(active_scores)
         floor_total = round(k * self.min_branch_floor_usd, 6)
         surplus = max(0.0, pool - floor_total)
@@ -348,6 +353,15 @@ class BudgetLedger:
             granted = round(min(self.finish_reserve_usd, max(0.0, requested_usd)), 6)
             self.finish_reserve_usd = round(self.finish_reserve_usd - granted, 6)
             return granted
+
+
+def _seed_certainty(case: Dict[str, Any]) -> float:
+    """Recalled cases come from disk: a missing, non-numeric or non-finite score seeds nothing."""
+    try:
+        val = float(case.get("certainty_score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return val if math.isfinite(val) and val > 0.0 else 0.0
 
 
 def _conclusion_text(raw: str) -> str:
@@ -1153,9 +1167,7 @@ class MainHarness:
     # ------------------------------------------------------------------
     def _spawn_starters(self, problem: str) -> None:
         starter_scores = [
-            float(self.seed_cases[idx].get("certainty_score", 0.0)) * 0.25
-            if idx < len(self.seed_cases)
-            else 0.0
+            _seed_certainty(self.seed_cases[idx]) * 0.25 if idx < len(self.seed_cases) else 0.0
             for idx in range(self.starter_agents)
         ]
         starter_budgets = self.budget_ledger.split_among_siblings(

@@ -54,16 +54,33 @@ or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
 | `--max-retries` | 3 | live retries on 429/5xx/network errors |
 | `--max-concurrent` | 32 | max in-flight model calls across all branches |
 | `--summary-out` | — | write the run summary JSON (spend, winners, self-improvement) |
+| `--report-out` | — | write the proof trail: `.md` Markdown or `.json` structured (also works with `--replay`) |
 | `--replay` | — | re-render a saved `--stream-out` JSONL to ASCII / `--html-out`; no model calls, no spend |
 
 Exit code is `0` for a completed run, `2` if the run halted (`hard_cap`,
 `emergency_stop`, `backend_error`, or `interrupted` by Ctrl-C) and `1` for an
-unreadable replay. A halted run still writes its stream, HTML and summary, so
+unreadable replay or a corrupt `--state-dir` (checked before any client exists, so
+nothing is spent and the bad file is left in place for inspection). A halted run still writes its stream, HTML and summary, so
 the money already spent is never lost to a crash.
 
 ```bash
 # Re-render yesterday's live run for the demo video without spending a cent
 python run_arena.py --replay arena_out/run.jsonl --html-out arena_out/replay.html
+```
+
+## The proof trail
+
+`--report-out proof.md` writes what the winner's box means: for every winner, the
+claim it carried out, each falsification it survived (angle + judge), per-parent
+merge provenance, its full ancestry back to the starters, and every crash into
+the main line along that lineage. It is a pure reduction of the event stream
+(`pfp/proof_report.py`), so a live run and a `--replay` of its JSONL produce the
+same report; the live one adds the spend line. Model text is escaped, so a reply
+can't inject Markdown links, headings or HTML. Use a `.json` path for the
+structured form.
+
+```bash
+python run_arena.py --replay arena_out/run.jsonl --quiet --report-out arena_out/proof.md
 ```
 
 ## How it maps to the design
@@ -139,6 +156,13 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - `VersionRegistry.save/load` persists the failsafe; every snapshot's SHA-256 is
   re-verified on load, so a tampered version refuses to load.
 - Anti-model attacks that cite no event-log evidence are dropped.
+- The case bank is untrusted on load too: cases without a fork shape are dropped,
+  non-numeric / non-finite / negative certainty becomes 0 (it would otherwise
+  poison the certainty-weighted starter split), text is length-capped, and the
+  bank is bounded (`max_cases`, default 500, keeping the most-won cases).
+- A malformed registry refuses to load instead of half-loading; every persisted
+  artifact (stream, HTML, registry, case bank, summary, report) is written via
+  `pfp/fsutil.py`: temp file → fsync → atomic replace.
 
 ## The arena player
 
@@ -167,11 +191,12 @@ missing branch snapshots.
 ## Repository layout
 
 ```
-pfp/                 the package (pieces 1–8 + backend, json + dial helpers, HTML player)
+pfp/                 the package (pieces 1–8 + backend, json + dial helpers, HTML player, proof report)
 run_arena.py         full pipeline CLI (pieces 1–8)
 run_phase1.py        pieces 1–3 only, JSON summary
 spike.py             Token Factory parallel fan-out economics probe
 tests/               offline test suite
+.github/workflows/   CI: pyflakes + pytest on Linux/Windows, Python 3.10–3.13, live==replay smoke
 DESIGN.md            the design this implements
 ```
 

@@ -27,8 +27,6 @@ import copy
 import hashlib
 import json
 import math
-import os
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -36,33 +34,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .arena_html import build_arena_html
+from .fsutil import atomic_write_text as _atomic_write_text
 from .branch_spawner import HarnessEvent
-
-
-def _atomic_write_text(target: Path, text: str) -> Path:
-    """Durably replace ``target`` without exposing a partial replay."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, target)
-        # Persist the directory entry on platforms that support directory fsync.
-        try:
-            dir_fd = os.open(target.parent, os.O_RDONLY)
-        except OSError:
-            dir_fd = None
-        if dir_fd is not None:
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return target
 
 
 def _event_digest(
