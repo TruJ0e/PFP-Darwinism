@@ -24,7 +24,11 @@ From DESIGN.md:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import math
+import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -36,12 +40,55 @@ from .branch_spawner import HarnessEvent
 
 
 def _atomic_write_text(target: Path, text: str) -> Path:
-    """Write via a sibling temp file + rename so a crash never leaves a half-written replay."""
+    """Durably replace ``target`` without exposing a partial replay."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(target)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+        # Persist the directory entry on platforms that support directory fsync.
+        try:
+            dir_fd = os.open(target.parent, os.O_RDONLY)
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        tmp.unlink(missing_ok=True)
     return target
+
+
+def _event_digest(
+    *,
+    seq: int,
+    event_type: str,
+    branch_id: str,
+    timestamp: float,
+    details: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    previous_digest: str,
+    journal_version: int = 2,
+) -> str:
+    """Hash the complete event and its predecessor using deterministic JSON."""
+    payload = {
+        "seq": seq,
+        "event_type": event_type,
+        "branch_id": branch_id,
+        "timestamp": timestamp,
+        "details": details,
+        "snapshot": snapshot,
+        "previous_digest": previous_digest,
+        "journal_version": journal_version,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 CANONICAL_EVENT_TYPES: Tuple[str, ...] = (
@@ -80,6 +127,9 @@ class ArenaEvent:
     timestamp: float
     details: Dict[str, Any]
     snapshot: Dict[str, Any]
+    previous_digest: str = ""
+    digest: str = ""
+    journal_version: int = 2
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -89,6 +139,9 @@ class ArenaEvent:
             "timestamp": round(self.timestamp, 4),
             "details": copy.deepcopy(self.details),
             "snapshot": copy.deepcopy(self.snapshot),
+            "previous_digest": self.previous_digest,
+            "digest": self.digest,
+            "journal_version": self.journal_version,
         }
 
     @classmethod
@@ -100,7 +153,14 @@ class ArenaEvent:
             timestamp=float(raw["timestamp"]),
             details=dict(raw.get("details", {})),
             snapshot=dict(raw.get("snapshot", {})),
+            previous_digest=str(raw.get("previous_digest", "")),
+            digest=str(raw.get("digest", "")),
+            journal_version=int(raw.get("journal_version", 1)),
         )
+
+    def detached_copy(self) -> "ArenaEvent":
+        """Return a deep copy so nested payloads cannot mutate journal history."""
+        return ArenaEvent.from_dict(self.to_dict())
 
 
 class AppendOnlyViolationError(RuntimeError):
@@ -157,21 +217,45 @@ class ArenaFeed:
     ) -> ArenaEvent:
         if not snapshot or "id" not in snapshot or "state" not in snapshot:
             raise ValueError("Every ArenaEvent must carry a valid branch state snapshot ('id', 'state').")
+        if str(snapshot["id"]) != branch_id:
+            raise ValueError("ArenaEvent branch_id must match its snapshot id.")
+        if not event_type:
+            raise ValueError("ArenaEvent event_type must be non-empty.")
         with self._lock:
             self._seq += 1
+            # Persist the exact value that is hashed; JSONL intentionally uses four decimal
+            # places for stable, compact replay files.
+            event_timestamp = round(timestamp if timestamp is not None else time.time(), 4)
+            if not math.isfinite(event_timestamp):
+                self._seq -= 1
+                raise ValueError("ArenaEvent timestamp must be finite.")
+            event_details = copy.deepcopy(details or {})
+            event_snapshot = copy.deepcopy(snapshot)
+            previous_digest = self._events[-1].digest if self._events else ""
+            digest = _event_digest(
+                seq=self._seq,
+                event_type=event_type,
+                branch_id=branch_id,
+                timestamp=event_timestamp,
+                details=event_details,
+                snapshot=event_snapshot,
+                previous_digest=previous_digest,
+            )
             evt = ArenaEvent(
                 seq=self._seq,
                 event_type=event_type,
                 branch_id=branch_id,
-                timestamp=timestamp if timestamp is not None else time.time(),
-                details=copy.deepcopy(details or {}),
-                snapshot=copy.deepcopy(snapshot),
+                timestamp=event_timestamp,
+                details=event_details,
+                snapshot=event_snapshot,
+                previous_digest=previous_digest,
+                digest=digest,
             )
             list.append(self._events, evt)
             subs = list(self._subscribers)
         for sub in subs:
-            sub(evt)
-        return evt
+            sub(evt.detached_copy())
+        return evt.detached_copy()
 
     def ingest_harness_event(self, event: HarnessEvent) -> ArenaEvent:
         return self.append(
@@ -185,7 +269,7 @@ class ArenaFeed:
     @property
     def events(self) -> Sequence[ArenaEvent]:
         with self._lock:
-            return _AppendOnlyEventList(self._events)
+            return _AppendOnlyEventList(event.detached_copy() for event in self._events)
 
     def __len__(self) -> int:
         with self._lock:
@@ -202,6 +286,8 @@ class ArenaFeed:
     def from_jsonl(cls, jsonl_text: str) -> "ArenaFeed":
         feed = cls()
         expected_seq = 1
+        previous_digest = ""
+        chain_mode: Optional[bool] = None
         for line_no, line in enumerate(jsonl_text.splitlines(), start=1):
             stripped = line.strip()
             if not stripped:
@@ -219,10 +305,64 @@ class ArenaFeed:
                     raise AppendOnlyViolationError(
                         f"Arena replay sequence must be contiguous: expected {expected_seq}, got {evt.seq}."
                     )
+                if not math.isfinite(evt.timestamp):
+                    raise ValueError(f"Arena event {evt.seq} has a non-finite timestamp.")
                 if not evt.snapshot or "id" not in evt.snapshot or "state" not in evt.snapshot:
                     raise ValueError(
                         f"Arena event {evt.seq} lacks the required full branch snapshot ('id', 'state')."
                     )
+                if str(evt.snapshot["id"]) != evt.branch_id:
+                    raise ValueError(
+                        f"Arena event {evt.seq} branch_id does not match its snapshot id."
+                    )
+                has_chain = evt.journal_version >= 2
+                if has_chain and (len(evt.digest) != 64 or (evt.seq > 1 and len(evt.previous_digest) != 64)):
+                    raise AppendOnlyViolationError(
+                        f"Arena replay event {evt.seq} is missing its required hash chain."
+                    )
+                if chain_mode is None:
+                    chain_mode = has_chain
+                elif has_chain != chain_mode:
+                    raise AppendOnlyViolationError("Arena replay mixes chained and legacy events.")
+                if has_chain:
+                    expected_digest = _event_digest(
+                        seq=evt.seq,
+                        event_type=evt.event_type,
+                        branch_id=evt.branch_id,
+                        timestamp=evt.timestamp,
+                        details=evt.details,
+                        snapshot=evt.snapshot,
+                        previous_digest=previous_digest,
+                        journal_version=evt.journal_version,
+                    )
+                    if evt.previous_digest != previous_digest or evt.digest != expected_digest:
+                        raise AppendOnlyViolationError(
+                            f"Arena replay hash chain is invalid at event {evt.seq}."
+                        )
+                    previous_digest = evt.digest
+                else:
+                    # Read v1 logs for compatibility, but upgrade them in memory so a
+                    # subsequent save/append cannot create a mixed-trust journal.
+                    digest = _event_digest(
+                        seq=evt.seq,
+                        event_type=evt.event_type,
+                        branch_id=evt.branch_id,
+                        timestamp=evt.timestamp,
+                        details=evt.details,
+                        snapshot=evt.snapshot,
+                        previous_digest=previous_digest,
+                    )
+                    evt = ArenaEvent(
+                        seq=evt.seq,
+                        event_type=evt.event_type,
+                        branch_id=evt.branch_id,
+                        timestamp=evt.timestamp,
+                        details=evt.details,
+                        snapshot=evt.snapshot,
+                        previous_digest=previous_digest,
+                        digest=digest,
+                    )
+                    previous_digest = digest
                 feed._seq = evt.seq
                 list.append(feed._events, evt)
                 expected_seq += 1

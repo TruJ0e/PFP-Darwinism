@@ -11,6 +11,8 @@ import email.utils
 import http.client
 import io
 import json
+import math
+import pytest
 import tempfile
 import time
 import unittest
@@ -19,6 +21,7 @@ from typing import Any, List
 
 import run_arena
 from pfp import (
+    AppendOnlyViolationError,
     ArenaFeed,
     BackendError,
     BudgetLedger,
@@ -28,6 +31,69 @@ from pfp import (
     OpenAICompatibleClient,
     SelfImprovementLoop,
 )
+
+
+def test_arena_feed_payloads_are_deeply_detached_and_hash_chained(tmp_path):
+    feed = ArenaFeed()
+    source_snapshot = {"id": "b1", "state": "Possible", "nested": {"score": 1}}
+    source_details = {"claims": ["original"]}
+    subscriber_events = []
+    feed.subscribe(subscriber_events.append)
+
+    returned = feed.append("spawn", "b1", source_snapshot, source_details, timestamp=10.0)
+    source_snapshot["nested"]["score"] = 99
+    source_details["claims"].append("mutated")
+    returned.snapshot["nested"]["score"] = 88
+    subscriber_events[0].details["claims"].append("subscriber mutation")
+    exposed = feed.events
+    exposed[0].snapshot["nested"]["score"] = 77
+
+    second = feed.append(
+        "conclude", "b1", {"id": "b1", "state": "Possible"}, timestamp=11.0
+    )
+    persisted = feed.events
+    assert persisted[0].snapshot["nested"]["score"] == 1
+    assert persisted[0].details["claims"] == ["original"]
+    assert len(persisted[0].digest) == 64
+    assert second.previous_digest == persisted[0].digest
+
+    path = feed.save_jsonl(tmp_path / "arena.jsonl")
+    loaded = ArenaFeed.load_jsonl(path)
+    assert [event.to_dict() for event in loaded.events] == [event.to_dict() for event in persisted]
+
+
+def test_arena_feed_rejects_tampering_mixed_chain_and_invalid_identity():
+    feed = ArenaFeed()
+    feed.append("spawn", "b1", {"id": "b1", "state": "Possible"}, timestamp=10.0)
+    feed.append("conclude", "b1", {"id": "b1", "state": "Possible"}, timestamp=11.0)
+    records = [json.loads(line) for line in feed.to_jsonl().splitlines()]
+
+    tampered = [dict(record) for record in records]
+    tampered[0]["details"] = {"rewritten": True}
+    with pytest.raises(AppendOnlyViolationError, match="hash chain"):
+        ArenaFeed.from_jsonl("\n".join(json.dumps(record) for record in tampered))
+
+    mixed = [dict(record) for record in records]
+    mixed[1].pop("digest")
+    mixed[1].pop("previous_digest")
+    mixed[1].pop("journal_version")
+    with pytest.raises(AppendOnlyViolationError, match="mixes chained and legacy"):
+        ArenaFeed.from_jsonl("\n".join(json.dumps(record) for record in mixed))
+
+    invalid = [dict(records[0])]
+    invalid[0]["snapshot"] = {"id": "other", "state": "Possible"}
+    with pytest.raises(ValueError, match="snapshot id"):
+        ArenaFeed.from_jsonl(json.dumps(invalid[0]))
+
+    invalid[0]["snapshot"] = {"id": "b1", "state": "Possible"}
+    invalid[0]["timestamp"] = math.nan
+    with pytest.raises(ValueError, match="non-finite timestamp"):
+        ArenaFeed.from_jsonl(json.dumps(invalid[0]))
+
+    with pytest.raises(ValueError, match="snapshot id"):
+        feed.append("spawn", "b2", {"id": "other", "state": "Possible"})
+    with pytest.raises(ValueError, match="finite"):
+        feed.append("spawn", "b2", {"id": "b2", "state": "Possible"}, timestamp=math.inf)
 from pfp.backend import ChatCompletionResponse, ChatMessage, Choice, CompletionUsage
 from test_hardening import PROBLEM, InterceptingClient, _FakeServer, _OK_BODY
 
