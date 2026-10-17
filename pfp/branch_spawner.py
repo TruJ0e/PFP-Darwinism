@@ -117,6 +117,8 @@ class BudgetLedger:
         # Fraction of every branch's budget that exploration and child spawning can't touch:
         # it pays for the branch's own falsification / alignment / merge (selection is not free)
         self.verification_share = verification_share
+        if not isinstance(hard_cap_usd, (int, float)) or not math.isfinite(hard_cap_usd) or hard_cap_usd < 0:
+            raise ValueError("hard_cap_usd must be a finite number >= 0.")
         self._cost_ema: Dict[str, float] = {}
         self.hard_cap_usd = hard_cap_usd
         self.depth_decay = depth_decay
@@ -470,14 +472,17 @@ class MiniHarness:
                 reasoning_step=f"[Directive] {self.directive.parent_reasoning_compressed}",
             )
 
-        self._emit(
-            "spawn",
-            {
-                "depth": self.depth,
-                "directive": self.directive.to_dict(),
-                "ns_cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
-            },
-        )
+        spawn_details: Dict[str, Any] = {
+            "depth": self.depth,
+            "directive": self.directive.to_dict(),
+            "ns_cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
+        }
+        if self.parent_id is None and origin == "starter":
+            from .arena import MAX_STREAM_PROBLEM_CHARS
+
+            # The journal names its own problem: replays and proof reports need no --problem.
+            spawn_details["problem"] = str(problem)[:MAX_STREAM_PROBLEM_CHARS]
+        self._emit("spawn", spawn_details)
 
     def _emit(self, event_type: str, details: Dict[str, Any]) -> None:
         rec = self.tracker.get(self.branch_id)
@@ -879,8 +884,10 @@ class MainHarness:
 
         if starter_agents < 1:
             raise ValueError("starter_agents must be >= 1")
-        if hard_cap_usd <= 0:
-            raise ValueError("hard_cap_usd must be > 0")
+        if not isinstance(hard_cap_usd, (int, float)) or not math.isfinite(hard_cap_usd) or hard_cap_usd <= 0:
+            # NaN compares False against every spend, inf never binds: either would silently
+            # turn the hard cap off, so both are refused before a client is wrapped.
+            raise ValueError("hard_cap_usd must be a finite number > 0")
 
         self.raw_client = client
         self.client = MeteredClient(

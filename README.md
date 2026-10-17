@@ -49,7 +49,7 @@ or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
 | `--k-probes` | 3 | blind continuations per divergence check |
 | `--gauntlet-rounds` | 3 | rotated falsification rounds to earn Pass |
 | `--selection-rounds` | 3 | align → clash → merge rounds (merged children can merge again) |
-| `--state-dir` | — | persist registry + case bank across runs |
+| `--state-dir` | — | persist registry + case bank across runs (one run at a time: `.pfp.lock`) |
 | `--no-improve` | off | skip the Piece 8 post-run loop |
 | `--max-retries` | 3 | live retries on 429/5xx/network errors |
 | `--max-concurrent` | 32 | max in-flight model calls across all branches |
@@ -59,8 +59,9 @@ or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
 
 Exit code is `0` for a completed run, `2` if the run halted (`hard_cap`,
 `emergency_stop`, `backend_error`, or `interrupted` by Ctrl-C) and `1` for an
-unreadable replay or a corrupt `--state-dir` (checked before any client exists, so
-nothing is spent and the bad file is left in place for inspection). A halted run still writes its stream, HTML and summary, so
+unreadable replay, a corrupt `--state-dir`, or a `--state-dir` another run is using
+(all checked before any client exists, so nothing is spent and the bad file is left
+in place for inspection). A halted run still writes its stream, HTML and summary, so
 the money already spent is never lost to a crash.
 
 ```bash
@@ -75,7 +76,9 @@ claim it carried out, each falsification it survived (angle + judge), per-parent
 merge provenance, its full ancestry back to the starters, and every crash into
 the main line along that lineage. It is a pure reduction of the event stream
 (`pfp/proof_report.py`), so a live run and a `--replay` of its JSONL produce the
-same report; the live one adds the spend line. Model text is escaped, so a reply
+same report; the live one adds the spend line. The problem statement rides on the
+starter spawn events (inside the hash chain), so a replay recovers its title without
+`--problem` and a forged title breaks the journal. Model text is escaped, so a reply
 can't inject Markdown links, headings or HTML. Use a `.json` path for the
 structured form.
 
@@ -105,6 +108,9 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   `MeteredClient`; the ledger records each call's real cost. Cost a branch can't
   cover is drawn from the finish reserve (verification work only) or reported as
   `overdraft_usd` — never dropped. `total_spent_usd == api_spend_usd` is tested.
+- **The cap must be able to bind.** `--hard-cap nan` or `inf` is rejected by the CLI,
+  `MainHarness`, `BudgetLedger`, `MeteredClient` and the sandbox: a NaN cap compares
+  False against every spend and would silently admit unlimited calls.
 - **Hard cap is enforced**, not advisory: every call atomically reserves a
   conservative upper-bound cost before it enters the parallel request pool.
   A call that would exceed `--hard-cap` (including spend already in flight) is
@@ -163,6 +169,11 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   non-numeric / non-finite / negative certainty becomes 0 (it would otherwise
   poison the certainty-weighted starter split), text is length-capped, and the
   bank is bounded (`max_cases`, default 500, keeping the most-won cases).
+- **One run per state dir.** `--state-dir` is held with an atomic `O_EXCL` lock file
+  (`.pfp.lock`, naming pid/host/time) for the whole command; a second run refuses
+  before spending instead of loading the same registry and overwriting the first
+  run's versions and wins on save. A lock left by a killed process is cleared by
+  deleting the file.
 - A malformed registry refuses to load instead of half-loading; every persisted
   artifact (stream, HTML, registry, case bank, summary, report) is written via
   `pfp/fsutil.py`: temp file → fsync → atomic replace.

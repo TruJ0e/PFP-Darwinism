@@ -32,4 +32,4 @@ jobs:
         run: |
           python run_arena.py --mock --quiet --no-improve --stream-out out/run.jsonl --html-out out/arena.html --report-out out/proof.json
           python run_arena.py --replay out/run.jsonl --quiet --report-out out/replay.json
-          python -c "import json; a=json.load(open('out/proof.json')); b=json.load(open('out/replay.json')); [d.pop(k, None) for d in (a, b) for k in ('spend', 'problem')]; assert a == b, 'replay report diverged'; assert a['winners'], 'no winners'"
+          python -c "import json; a=json.load(open('out/proof.json')); b=json.load(open('out/replay.json')); [d.pop(k, None) for d in (a, b) for k in ('spend',)]; assert a['problem'], 'stream lost its problem'; assert a == b, 'replay report diverged'; assert a['winners'], 'no winners'"

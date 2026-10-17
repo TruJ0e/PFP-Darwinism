@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -32,7 +33,8 @@ from pfp import (
     VersionRegistry,
     create_client,
 )
-from pfp.fsutil import atomic_write_text
+from pfp.arena import stream_problem
+from pfp.fsutil import StateLockError, atomic_write_text, exclusive_lock
 from pfp.proof_report import write_proof_report
 
 DEFAULT_PROBLEM = (
@@ -57,8 +59,9 @@ def _non_negative_int(text: str) -> int:
 
 def _positive_float(text: str) -> float:
     val = float(text)
-    if val <= 0:
-        raise argparse.ArgumentTypeError("must be > 0")
+    # float() accepts "nan" and "inf": a NaN cap admits every call, an infinite one never binds.
+    if not math.isfinite(val) or val <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number > 0")
     return val
 
 
@@ -69,7 +72,8 @@ def _replay(args: argparse.Namespace) -> int:
     except (OSError, ValueError, AppendOnlyViolationError) as exc:
         print(f"[pfp] cannot replay {args.replay}: {exc}", file=sys.stderr)
         return 1
-    problem = args.problem or ""
+    # The journal records its own problem; --problem only overrides the title.
+    problem = args.problem or stream_problem(feed.events)
     renderer = TronArenaRenderer()
     if not args.quiet:
         print(renderer.render_ascii(feed.events, problem=problem))
@@ -148,6 +152,19 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--problem must be non-empty")
 
     state_dir = Path(args.state_dir) if args.state_dir else None
+    if state_dir is None:
+        return _run_live(args, None)
+    # One run per state dir: two concurrent runs would each load the failsafe and the
+    # case bank, and the later save would silently drop the other run's versions and wins.
+    try:
+        with exclusive_lock(state_dir / ".pfp.lock"):
+            return _run_live(args, state_dir)
+    except StateLockError as exc:
+        print(f"[pfp] refusing to run: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
     registry_path = state_dir / "registry.json" if state_dir else None
     cases_path = state_dir / "case_bank.json" if state_dir else None
     # Load persisted state before any client exists: a corrupt or tampered failsafe must stop

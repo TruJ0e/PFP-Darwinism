@@ -443,6 +443,14 @@ class MeteredClient:
         hard_cap_usd: Optional[float] = None,
         max_concurrent_calls: int = 32,
     ) -> None:
+        if hard_cap_usd is not None:
+            try:
+                hard_cap_usd = float(hard_cap_usd)
+            except (TypeError, ValueError):
+                raise ValueError("hard_cap_usd must be a finite number >= 0 or None") from None
+            if not math.isfinite(hard_cap_usd) or hard_cap_usd < 0:
+                # A NaN cap admits every call (all comparisons are False); refuse it loudly.
+                raise ValueError("hard_cap_usd must be a finite number >= 0 or None")
         self.inner = inner
         self.hard_cap_usd = hard_cap_usd
         self.model = getattr(inner, "model", "")

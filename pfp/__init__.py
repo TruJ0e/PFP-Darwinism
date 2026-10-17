@@ -64,6 +64,7 @@ from .arena import (
     ArenaEvent,
     ArenaFeed,
     TronArenaRenderer,
+    stream_problem,
 )
 from .self_improvement import (
     EventLogMiner,
@@ -75,7 +76,7 @@ from .self_improvement import (
     VersionRegistry,
     VersionSnapshot,
 )
-from .fsutil import atomic_write_text
+from .fsutil import StateLockError, atomic_write_text, exclusive_lock
 from .proof_report import build_proof_report, render_proof_markdown, write_proof_report
 
 __all__ = [
@@ -138,5 +139,8 @@ __all__ = [
     "build_proof_report",
     "render_proof_markdown",
     "write_proof_report",
+    "stream_problem",
+    "StateLockError",
+    "exclusive_lock",
 ]
 

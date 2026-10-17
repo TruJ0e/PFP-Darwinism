@@ -64,8 +64,9 @@ def build_proof_report(
     summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Structured proof trail reduced from the stream (JSON-serialisable)."""
-    from .arena import TronArenaRenderer
+    from .arena import TronArenaRenderer, stream_problem
 
+    events = list(events)
     state = TronArenaRenderer.reconstruct_state_from_stream(events)
     branches: Dict[str, Dict[str, Any]] = state["branches"]
     crashes_by_branch: Dict[str, List[Dict[str, Any]]] = {}
@@ -111,7 +112,7 @@ def build_proof_report(
 
     report: Dict[str, Any] = {
         "format": "pfp-proof-report/1",
-        "problem": problem or (summary or {}).get("problem", ""),
+        "problem": problem or (summary or {}).get("problem", "") or stream_problem(events),
         "events_processed": state["events_processed"],
         "branches_total": len(branches),
         "branches_by_state": dict(sorted(counts.items())),

@@ -695,8 +695,8 @@ class SelfImprovementLoop:
     ) -> None:
         if max_cases < 1:
             raise ValueError("max_cases must be >= 1")
-        if sandbox_hard_cap_usd <= 0:
-            raise ValueError("sandbox_hard_cap_usd must be > 0")
+        if not math.isfinite(float(sandbox_hard_cap_usd)) or sandbox_hard_cap_usd <= 0:
+            raise ValueError("sandbox_hard_cap_usd must be a finite number > 0")
         self.client = client
         self.sandbox_hard_cap_usd = float(sandbox_hard_cap_usd)
         self.registry = registry or VersionRegistry()

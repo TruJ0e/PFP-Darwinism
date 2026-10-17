@@ -85,6 +85,26 @@ CANONICAL_EVENT_TYPES: Tuple[str, ...] = (
 # Events about the arena as a whole (no branch): renderers and miners must not treat them as agents
 ARENA_LEVEL_EVENT_TYPES: Tuple[str, ...] = ("halt",)
 
+# Longest problem statement a starter spawn event carries (the replay title, not a dump).
+MAX_STREAM_PROBLEM_CHARS = 4000
+
+
+def stream_problem(events: Iterable[Any]) -> str:
+    """
+    The problem statement recorded on the stream by the first starter spawn, or "".
+    A replay recovers the run's title from the hashed journal itself, so a re-render
+    and its proof report match the live run without the operator retyping --problem.
+    """
+    for e in events:
+        raw = e.to_dict() if isinstance(e, ArenaEvent) else e
+        if not isinstance(raw, dict) or raw.get("event_type") != "spawn":
+            continue
+        details = raw.get("details") or {}
+        problem = details.get("problem") if isinstance(details, dict) else None
+        if isinstance(problem, str) and problem.strip():
+            return problem[:MAX_STREAM_PROBLEM_CHARS]
+    return ""
+
 
 @dataclass(frozen=True)
 class ArenaEvent:
@@ -791,6 +811,7 @@ class TronArenaRenderer:
             (e.to_dict() if isinstance(e, ArenaEvent) else dict(e))
             for e in events
         ]
+        problem = problem or stream_problem(ev_dicts)
         ascii_snapshot = self.render_ascii(ev_dicts, problem=problem)
         html = build_arena_html(ev_dicts, problem=problem, ascii_snapshot=ascii_snapshot)
         return _atomic_write_text(Path(output_path), html)
