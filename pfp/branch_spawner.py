@@ -164,10 +164,14 @@ class BudgetLedger:
         )
         probe_cost = float(resp.usage.cost_usd)
         raw = resp.choices[0].message.content if resp.choices else "{}"
+        # Live models wrap JSON in fences / <think> blocks; a NaN, inf or negative
+        # estimate must never become the root budget.
+        parsed = parse_json_object(raw) or {}
         try:
-            parsed = json.loads(raw)
             est = float(parsed.get("difficulty_estimate_usd", 0.05))
-        except Exception:
+        except (TypeError, ValueError):
+            est = 0.05
+        if not math.isfinite(est) or est <= 0:
             est = 0.05
 
         with self._lock:
@@ -1207,7 +1211,7 @@ class MainHarness:
         6. Unlock run boundary on `version_registry` and return full summary.
         A hard-cap hit or emergency stop halts the run cleanly (`halted_reason`), never mid-write.
         """
-        from .backend import HardCapExceededError
+        from .backend import BackendError, HardCapExceededError
 
         if not problem or not problem.strip():
             raise ValueError("problem must be a non-empty string")
@@ -1222,14 +1226,31 @@ class MainHarness:
                 # All starter branches live at once in parallel
                 with ThreadPoolExecutor(max_workers=max(1, len(self.starters))) as pool:
                     futs = [pool.submit(mini.step, force_ns_on_starters) for mini in self.starters]
-                    for f in as_completed(futs):
-                        f.result()
+                    try:
+                        for f in as_completed(futs):
+                            f.result()
+                    except BaseException:
+                        # One starter failing (or Ctrl-C) stops every other branch from
+                        # starting new paid calls before the pool drains.
+                        self._stop_event.set()
+                        raise
 
                 if self.enable_selection and not self._should_stop():
                     selection_summary = self._run_selection_phase()
             except HardCapExceededError as exc:
+                self._stop_event.set()
                 self.halted_reason = "hard_cap"
                 self._emit_halt("hard_cap", str(exc))
+            except BackendError as exc:
+                # The endpoint failed after retries (or rejected the request outright):
+                # keep everything spent so far reportable instead of crashing the run.
+                self._stop_event.set()
+                self.halted_reason = "backend_error"
+                self._emit_halt("backend_error", str(exc)[:500])
+            except KeyboardInterrupt:
+                self._stop_event.set()
+                self.halted_reason = "interrupted"
+                self._emit_halt("interrupted", "Operator interrupted the run (Ctrl-C); partial results kept.")
             if self.halted_reason is None and self._should_stop():
                 self.halted_reason = "emergency_stop"
                 self._emit_halt("emergency_stop", "Emergency stop killed the run; rollback applies next run.")
@@ -1260,6 +1281,8 @@ class MainHarness:
                     "api_calls": meter["calls"],
                     "api_spend_usd": meter["total_cost_usd"],
                     "api_spend_by_model": meter["cost_by_model"],
+                    "api_failed_calls": meter.get("failed_calls", 0),
+                    "api_estimated_usage_calls": meter.get("estimated_usage_calls", 0),
                 },
                 "total_branches_spawned": len(self.tracker.all_records()),
                 "selection": selection_summary,

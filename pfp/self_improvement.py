@@ -638,8 +638,12 @@ class SelfImprovementLoop:
         registry: Optional[VersionRegistry] = None,
         *,
         super_model: str = SUPER_MODEL,
+        sandbox_hard_cap_usd: float = 1.00,
     ) -> None:
+        if sandbox_hard_cap_usd <= 0:
+            raise ValueError("sandbox_hard_cap_usd must be > 0")
         self.client = client
+        self.sandbox_hard_cap_usd = float(sandbox_hard_cap_usd)
         self.registry = registry or VersionRegistry()
         self.miner = EventLogMiner()
         self.super_model = super_model
@@ -852,7 +856,7 @@ class SelfImprovementLoop:
         harness = MainHarness(
             client=self.client,
             starter_agents=2,
-            hard_cap_usd=1.00,
+            hard_cap_usd=self.sandbox_hard_cap_usd,
             depth_dial=2,
             k_probes=2,
             gauntlet_rounds=int(dials["gauntlet_rounds"]),
@@ -866,7 +870,9 @@ class SelfImprovementLoop:
         winners = summary.get("winners_box", [])
         passed_count = len(winners)
         top_cert = max((float(w.get("certainty_score", 0.0)) for w in winners), default=0.0)
-        coherent = passed_count > 0 and top_cert > 0.0
+        halted = summary.get("halted_reason")
+        # A sandbox that was cut short (cap, backend failure) proves nothing about the candidate
+        coherent = halted is None and passed_count > 0 and top_cert > 0.0
 
         return SandboxResult(
             coherent=coherent,
@@ -874,8 +880,12 @@ class SelfImprovementLoop:
             score=top_cert,
             baseline_score=baseline_score,
             passed_branches=passed_count,
-            total_spent_usd=float(summary["budget"]["total_spent_usd"]),
-            details=f"Sandbox produced {passed_count} winner(s) with max certainty {top_cert:.2f}",
+            total_spent_usd=float(summary["budget"]["api_spend_usd"]),
+            details=(
+                f"Sandbox halted ({halted}) before it could validate the candidate"
+                if halted
+                else f"Sandbox produced {passed_count} winner(s) with max certainty {top_cert:.2f}"
+            ),
         )
 
     def run_post_run_improvement(

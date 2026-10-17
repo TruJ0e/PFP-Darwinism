@@ -52,8 +52,19 @@ or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
 | `--state-dir` | — | persist registry + case bank across runs |
 | `--no-improve` | off | skip the Piece 8 post-run loop |
 | `--max-retries` | 3 | live retries on 429/5xx/network errors |
+| `--max-concurrent` | 32 | max in-flight model calls across all branches |
+| `--summary-out` | — | write the run summary JSON (spend, winners, self-improvement) |
+| `--replay` | — | re-render a saved `--stream-out` JSONL to ASCII / `--html-out`; no model calls, no spend |
 
-Exit code is `0` for a completed run and `2` if the run halted (hard cap or emergency stop).
+Exit code is `0` for a completed run, `2` if the run halted (`hard_cap`,
+`emergency_stop`, `backend_error`, or `interrupted` by Ctrl-C) and `1` for an
+unreadable replay. A halted run still writes its stream, HTML and summary, so
+the money already spent is never lost to a crash.
+
+```bash
+# Re-render yesterday's live run for the demo video without spending a cent
+python run_arena.py --replay arena_out/run.jsonl --html-out arena_out/replay.html
+```
 
 ## How it maps to the design
 
@@ -83,6 +94,14 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   refused; the run halts cleanly with `halted_reason: "hard_cap"` and a `halt`
   event in the arena feed. Unknown model IDs use the highest known catalog rate
   instead of an optimistic cheap-model fallback.
+- **One cap for the whole command.** The post-run self-improvement loop
+  (assessment, anti-model, proposition, sandbox run) is metered against what the
+  arena left under `--hard-cap`; the summary reports `total_api_spend_usd` =
+  arena + improvement. A sandbox cut short by the cap is never adopted.
+- **No free calls.** If the provider omits or garbles `usage`, the call is charged
+  the same upper bound that was reserved for it (`usage.estimated`,
+  `api_estimated_usage_calls`) instead of $0. Calls billed above their
+  reservation are counted in `reservation_overruns`.
 - **Selection is paid for.** Each branch keeps a protected verification share
   (30% by default) that exploration and child spawning can't touch; split
   parents' idle budgets return to the finish reserve when selection begins.
@@ -98,9 +117,15 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   `bool("false")` would be true).
 - **Falsification fails closed.** A judge reply with no readable verdict is
   *inconclusive*: no survival credit, no kill, no appeal consumed, and no Pass.
-- HTTP: exponential backoff with jitter on 408/409/425/429/5xx and network
-  errors, `Retry-After` honored, non-retryable errors raised immediately with
+- HTTP: exponential backoff with jitter on 408/409/425/429/5xx, network errors
+  and connections dropped mid-body, `Retry-After` honored (seconds or HTTP-date), non-retryable errors raised immediately with
   status and body; reasoning-model `reasoning_content` fallback.
+- A backend failure after retries (or a rejected key) halts the run as
+  `backend_error`; Ctrl-C halts it as `interrupted`. Either way every branch
+  stops starting paid calls at once and the partial arena is kept.
+- The sizing probe reply goes through the same tolerant parser; a NaN, infinite
+  or negative difficulty estimate falls back to the default instead of becoming
+  the root budget.
 - Bounded concurrency (`max_concurrent_calls`, default 32) across all branches.
 
 ## Self-improvement guardrails

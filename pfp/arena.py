@@ -35,6 +35,15 @@ from .arena_html import build_arena_html
 from .branch_spawner import HarnessEvent
 
 
+def _atomic_write_text(target: Path, text: str) -> Path:
+    """Write via a sibling temp file + rename so a crash never leaves a half-written replay."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(target)
+    return target
+
+
 CANONICAL_EVENT_TYPES: Tuple[str, ...] = (
     "spawn",
     "branch",
@@ -187,22 +196,25 @@ class ArenaFeed:
             return "\n".join(json.dumps(e.to_dict()) for e in self._events)
 
     def save_jsonl(self, path: str | Path) -> Path:
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(self.to_jsonl() + "\n", encoding="utf-8")
-        return target
+        return _atomic_write_text(Path(path), self.to_jsonl() + "\n")
 
     @classmethod
     def from_jsonl(cls, jsonl_text: str) -> "ArenaFeed":
         feed = cls()
         expected_seq = 1
-        for line in jsonl_text.splitlines():
+        for line_no, line in enumerate(jsonl_text.splitlines(), start=1):
             stripped = line.strip()
             if not stripped:
                 continue
-            raw = json.loads(stripped)
-            with feed._lock:
+            try:
+                raw = json.loads(stripped)
+                if not isinstance(raw, dict):
+                    raise TypeError("record is not a JSON object")
                 evt = ArenaEvent.from_dict(raw)
+            except (ValueError, KeyError, TypeError) as exc:
+                # A truncated or hand-edited log must fail with a pointer, not a bare KeyError
+                raise ValueError(f"Malformed arena event on line {line_no}: {exc!r}") from exc
+            with feed._lock:
                 if evt.seq != expected_seq:
                     raise AppendOnlyViolationError(
                         f"Arena replay sequence must be contiguous: expected {expected_seq}, got {evt.seq}."
@@ -656,7 +668,4 @@ class TronArenaRenderer:
         ]
         ascii_snapshot = self.render_ascii(ev_dicts, problem=problem)
         html = build_arena_html(ev_dicts, problem=problem, ascii_snapshot=ascii_snapshot)
-        target = Path(output_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(html, encoding="utf-8")
-        return target
+        return _atomic_write_text(Path(output_path), html)

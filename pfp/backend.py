@@ -13,7 +13,9 @@ Provides:
 
 from __future__ import annotations
 
+import email.utils
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -59,6 +61,34 @@ def estimate_call_cost_usd(
     model_id = model or get_model_name()
     in_rate, out_rate = MODEL_PRICING_PER_1M.get(model_id, DEFAULT_PRICING_PER_1M)
     return (prompt_tokens / 1_000_000.0) * in_rate + (completion_tokens / 1_000_000.0) * out_rate
+
+
+def prompt_token_upper_bound(messages: Any) -> int:
+    """Conservative token bound for a prompt: a token cannot be smaller than one UTF-8 byte."""
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+        return 1024
+    total = 1024  # protocol/template overhead across providers
+    for message in messages:
+        if isinstance(message, dict):
+            total += len(str(message.get("role", "")).encode("utf-8"))
+            total += len(str(message.get("content", "")).encode("utf-8"))
+            total += 64
+        else:
+            total += len(str(message).encode("utf-8")) + 64
+    return total
+
+
+def _non_negative_int(value: Any) -> Optional[int]:
+    """Parse a provider token count; None when absent or unreadable (never negative)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return max(0, int(number))
 
 
 @dataclass
@@ -123,6 +153,9 @@ class CompletionUsage:
     completion_tokens: int
     total_tokens: int
     cost_usd: float = 0.0
+    # True when the provider omitted (or garbled) token usage and cost_usd is a
+    # conservative upper-bound estimate rather than the billed figure.
+    estimated: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -130,6 +163,7 @@ class CompletionUsage:
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
             "cost_usd": self.cost_usd,
+            "estimated": self.estimated,
         }
 
 
@@ -199,6 +233,13 @@ class _LiveChatCompletions:
                 return min(60.0, max(0.0, float(retry_after)))
             except ValueError:
                 pass
+            # RFC 9110 also allows an HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT")
+            try:
+                when = email.utils.parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError, IndexError):
+                when = None
+            if when is not None and when.tzinfo is not None:
+                return min(60.0, max(0.0, when.timestamp() - time.time()))
         # Exponential backoff with full jitter so hundreds of parallel branches don't stampede
         return random.uniform(0.0, self.backoff_base_s * (2 ** attempt))
 
@@ -231,7 +272,8 @@ class _LiveChatCompletions:
                 if exc.code not in RETRYABLE_STATUSES:
                     raise last_error from exc
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+                # HTTPException covers IncompleteRead / BadStatusLine from a dropped connection
                 last_error = BackendError(f"Network error calling {self.base_url}: {exc}")
             except json.JSONDecodeError as exc:
                 last_error = BackendError(f"Non-JSON response from {self.base_url}: {exc}")
@@ -302,10 +344,20 @@ class _LiveChatCompletions:
                 )
             )
 
-        usage_raw = raw.get("usage") or {}
-        p_tok = int(usage_raw.get("prompt_tokens", 0))
-        c_tok = int(usage_raw.get("completion_tokens", 0))
-        t_tok = int(usage_raw.get("total_tokens", p_tok + c_tok))
+        usage_raw = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+        p_tok = _non_negative_int(usage_raw.get("prompt_tokens"))
+        c_tok = _non_negative_int(usage_raw.get("completion_tokens"))
+        estimated = p_tok is None or c_tok is None
+        if estimated:
+            # No billable usage reported: never book the call as free (spend would slip
+            # past the hard cap). Charge the same upper bound the meter reserved.
+            if p_tok is None:
+                p_tok = prompt_token_upper_bound(messages)
+            if c_tok is None:
+                c_tok = max(0, int(max_tokens)) * max(1, len(choices), int(n))
+        t_tok = _non_negative_int(usage_raw.get("total_tokens"))
+        if t_tok is None or estimated:
+            t_tok = p_tok + c_tok
         cost = estimate_call_cost_usd(p_tok, c_tok, target_model)
 
         return ChatCompletionResponse(
@@ -317,6 +369,7 @@ class _LiveChatCompletions:
                 completion_tokens=c_tok,
                 total_tokens=t_tok,
                 cost_usd=cost,
+                estimated=estimated,
             ),
         )
 
@@ -395,9 +448,14 @@ class MeteredClient:
         self.model = getattr(inner, "model", "")
         self.base_url = getattr(inner, "base_url", "")
         self.is_mock = getattr(inner, "is_mock", False)
+        # Clients that bill above catalog rates (the mock's demo scale, a nested meter's
+        # inner client) advertise it so the preflight reservation stays an upper bound.
+        self.cost_scale = max(1.0, float(getattr(inner, "cost_scale", 1.0) or 1.0))
+        self.reservation_overruns: int = 0
         self.total_cost_usd: float = 0.0
         self.calls: int = 0
         self.failed_calls: int = 0
+        self.estimated_usage_calls: int = 0
         self.cost_by_model: Dict[str, float] = {}
         self._reserved_cost_usd: float = 0.0
         self._lock = threading.Lock()
@@ -414,24 +472,14 @@ class MeteredClient:
     @staticmethod
     def _prompt_token_upper_bound(messages: Any) -> int:
         """Conservative preflight bound: a token cannot exceed its UTF-8 byte input."""
-        if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
-            return 1024
-        total = 1024  # protocol/template overhead across providers
-        for message in messages:
-            if isinstance(message, dict):
-                total += len(str(message.get("role", "")).encode("utf-8"))
-                total += len(str(message.get("content", "")).encode("utf-8"))
-                total += 64
-            else:
-                total += len(str(message).encode("utf-8")) + 64
-        return total
+        return prompt_token_upper_bound(messages)
 
     def _reserve_call(self, kwargs: Dict[str, Any]) -> float:
         model = str(kwargs.get("model") or self.model)
         prompt_bound = self._prompt_token_upper_bound(kwargs.get("messages", []))
         completion_bound = max(0, int(kwargs.get("max_tokens", 256)))
         n = max(1, int(kwargs.get("n", 1)))
-        reservation = estimate_call_cost_usd(prompt_bound, completion_bound * n, model)
+        reservation = estimate_call_cost_usd(prompt_bound, completion_bound * n, model) * self.cost_scale
         with self._lock:
             projected = self.total_cost_usd + self._reserved_cost_usd + reservation
             if self.hard_cap_usd is not None and projected > self.hard_cap_usd:
@@ -448,16 +496,30 @@ class MeteredClient:
         try:
             with self._slots:
                 resp = self.inner.chat.completions.create(*args, **kwargs)
-        except Exception:
+        except BaseException:  # incl. KeyboardInterrupt: never strand an in-flight reservation
             with self._lock:
                 self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - reservation)
                 self.failed_calls += 1
             raise
-        cost = float(getattr(getattr(resp, "usage", None), "cost_usd", 0.0) or 0.0)
+        usage = getattr(resp, "usage", None)
+        try:
+            cost = float(getattr(usage, "cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = float("nan")
+        estimated = bool(getattr(usage, "estimated", False))
+        if usage is None or not math.isfinite(cost) or cost < 0:
+            # An inner client that reports no usable cost is charged its full reservation
+            cost, estimated = reservation, True
         model = str(kwargs.get("model") or self.model)
         with self._lock:
             self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - reservation)
             self.calls += 1
+            if estimated:
+                self.estimated_usage_calls += 1
+            if cost > reservation + 1e-12:
+                # Billed above the preflight bound (provider ignored max_tokens or an
+                # off-catalog price): surfaced so cap enforcement gaps are never silent.
+                self.reservation_overruns += 1
             self.total_cost_usd = round(self.total_cost_usd + cost, 8)
             self.cost_by_model[model] = round(self.cost_by_model.get(model, 0.0) + cost, 8)
         return resp
@@ -467,6 +529,8 @@ class MeteredClient:
             return {
                 "calls": self.calls,
                 "failed_calls": self.failed_calls,
+                "estimated_usage_calls": self.estimated_usage_calls,
+                "reservation_overruns": self.reservation_overruns,
                 "total_cost_usd": round(self.total_cost_usd, 6),
                 "in_flight_reserved_usd": round(self._reserved_cost_usd, 6),
                 "cost_by_model": {k: round(v, 6) for k, v in self.cost_by_model.items()},
@@ -1019,6 +1083,8 @@ class MockOpenAIClient:
         self.base_url = (base_url or get_base_url()).rstrip("/")
         self.model = model or get_model_name()
         self.is_mock = True
+        # Mock costs are catalog prices x this factor; the meter scales its reservations to match
+        self.cost_scale = float(force_cost_scale)
         self.chat = _MockChatNamespace(
             _MockChatCompletions(
                 default_model=self.model,
