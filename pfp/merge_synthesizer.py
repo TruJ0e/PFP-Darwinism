@@ -270,7 +270,7 @@ class MergeSynthesizer:
             transferred_budget_usd=child_budget,
             parent_a_budget_transferred_usd=budget_a,
             parent_b_budget_transferred_usd=budget_b,
-            synthesis_cost_usd=actual_synth_deducted,
+            synthesis_cost_usd=round(max(0.0, synth_cost), 6),
             unified_fork=unified_fork,
             unified_reasoning=unified_reasoning,
             kept_claims=kept_claims,

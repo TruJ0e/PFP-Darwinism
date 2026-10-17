@@ -49,24 +49,32 @@ or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
 | `--k-probes` | 3 | blind continuations per divergence check |
 | `--gauntlet-rounds` | 3 | rotated falsification rounds to earn Pass |
 | `--selection-rounds` | 3 | align → clash → merge rounds (merged children can merge again) |
-| `--state-dir` | — | persist registry + case bank across runs (one run at a time: `.pfp.lock`) |
+| `--state-dir` | — | persist registry + case bank across runs (one run at a time: `.pfp.lock`, auto-reclaiming dead local PIDs) |
+| `--pin-version` | — | pin a registry version in `--state-dir` before running |
+| `--unpin` | off | clear any manual version pin in `--state-dir` before running |
+| `--restore-version` | — | restore a registry version in `--state-dir` before running |
+| `--list-versions` | off | print active, pinned, and historical versions in `--state-dir` as JSON and exit |
 | `--no-improve` | off | skip the Piece 8 post-run loop |
 | `--max-retries` | 3 | live retries on 429/5xx/network errors |
 | `--max-concurrent` | 32 | max in-flight model calls across all branches |
-| `--summary-out` | — | write the run summary JSON (spend, winners, self-improvement) |
+| `--summary-out` | — | write the run summary JSON (spend, winners, self-improvement; also works with `--replay`) |
 | `--report-out` | — | write the proof trail: `.md` Markdown or `.json` structured (also works with `--replay`) |
-| `--replay` | — | re-render a saved `--stream-out` JSONL to ASCII / `--html-out`; no model calls, no spend |
+| `--replay` | — | re-render a saved `--stream-out` JSONL to ASCII / `--html-out` / `--summary-out`; runs post-replay improvement if `--state-dir` is given without `--no-improve` |
 
 Exit code is `0` for a completed run, `2` if the run halted (`hard_cap`,
 `emergency_stop`, `backend_error`, or `interrupted` by Ctrl-C) and `1` for an
-unreadable replay, a corrupt `--state-dir`, or a `--state-dir` another run is using
-(all checked before any client exists, so nothing is spent and the bad file is left
-in place for inspection). A halted run still writes its stream, HTML and summary, so
-the money already spent is never lost to a crash.
+unreadable replay, an unknown version ID, a corrupt `--state-dir`, or a `--state-dir`
+another live run is using (all checked before any client exists, so nothing is spent
+and the bad file is left in place for inspection). A halted run still writes its
+stream, HTML and summary, so the money already spent is never lost to a crash.
 
 ```bash
 # Re-render yesterday's live run for the demo video without spending a cent
 python run_arena.py --replay arena_out/run.jsonl --html-out arena_out/replay.html
+
+# Inspect or pin versions in a persisted state directory
+python run_arena.py --state-dir .pfp_state --list-versions
+python run_arena.py --state-dir .pfp_state --pin-version v000_initial --list-versions
 ```
 
 ## The proof trail
@@ -107,7 +115,9 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - **True spend, not affordable spend.** Every model call goes through
   `MeteredClient`; the ledger records each call's real cost. Cost a branch can't
   cover is drawn from the finish reserve (verification work only) or reported as
-  `overdraft_usd` — never dropped. `total_spent_usd == api_spend_usd` is tested.
+  `overdraft_usd` — never dropped. Every spend event (including `problem_sizing_probe`
+  and `merge_synthesis`) is recorded in the arena stream so stream-mined spend,
+  `total_spent_usd`, and `api_spend_usd` match exactly.
 - **The cap must be able to bind.** `--hard-cap nan` or `inf` is rejected by the CLI,
   `MainHarness`, `BudgetLedger`, `MeteredClient` and the sandbox: a NaN cap compares
   False against every spend and would silently admit unlimited calls.
@@ -137,7 +147,8 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 
 - Model replies are parsed with `pfp/jsonutil.py`: code fences, leading prose and
   `<think>` blocks are handled; `"survived": "false"` is false (plain
-  `bool("false")` would be true).
+  `bool("false")` would be true), and non-finite floats (`nan`, `inf`) return
+  `default` instead of `True`.
 - **Falsification fails closed.** A judge reply with no readable verdict is
   *inconclusive*: no survival credit, no kill, no appeal consumed, and no Pass.
 - HTTP: exponential backoff with jitter on 408/409/425/429/5xx, network errors
@@ -156,7 +167,9 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - Proposed dial changes are untrusted input: `pfp/dials.py` rejects unknown
   keys, non-numeric values, NaN/inf, and anything outside the safe envelope
   (e.g. `gauntlet_rounds: 0`, rewarding open objections). Rejections are
-  recorded on the proposition for the anti-model.
+  recorded on the proposition for the anti-model, and both `VersionRegistry.register_rewrite`
+  and `VersionRegistry.load` enforce `sanitize_dials` and prompt length bounds (`<= 4000` chars)
+  so a hand-edited or re-hashed snapshot with out-of-range dials refuses to load.
 - Versioned prompts are live: `plaus_probe_hint` from the active version is
   injected into every probe, and into the sandbox run.
 - `VersionRegistry.save/load` persists the failsafe; every snapshot's SHA-256 is
@@ -172,14 +185,15 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - **One run per state dir.** `--state-dir` is held with an atomic `O_EXCL` lock file
   (`.pfp.lock`, naming pid/host/time) for the whole command; a second run refuses
   before spending instead of loading the same registry and overwriting the first
-  run's versions and wins on save. A lock left by a killed process is cleared by
-  deleting the file.
+  run's versions and wins on save. A lock left on the same host by a dead process
+  PID is reclaimed automatically; foreign-host or live-PID locks are strictly respected.
 - A malformed registry refuses to load instead of half-loading; every persisted
   artifact (stream, HTML, registry, case bank, summary, report) is written via
   `pfp/fsutil.py`: temp file → fsync → atomic replace.
-- Winner certification is state-derived: `winner_exit` only counts with a Pass
-  snapshot, and any later non-Pass state evicts the claim from replay and proof
-  reports. A UI event cannot manufacture a certified result.
+- Winner certification is state-derived across ASCII, HTML, and proof reports:
+  `winner_exit` only counts with a Pass snapshot, and any later `fail`, `kill`,
+  `revocation`, or non-Pass state evicts the claim from the winner's box. A UI
+  event cannot manufacture a certified result.
 
 ## The arena player
 

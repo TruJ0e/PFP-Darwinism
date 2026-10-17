@@ -275,15 +275,27 @@ const PROBLEM = __PROBLEM_JSON__;
     for (let i = 0; i < upto; i++) {
       const e = ARENA_EVENTS[i];
       if (e.event_type === "halt") { halt = e.details; continue; }
-      snaps[e.branch_id] = e.snapshot;
+      const s = e.snapshot || {};
+      snaps[e.branch_id] = s;
       const d = e.details || {};
       if (e.event_type === "budget_change" && d.spent_usd) spend += Number(d.spent_usd) || 0;
       if (e.event_type === "merge" && d.synthesis_cost_usd) spend += Number(d.synthesis_cost_usd) || 0;
-      if (e.event_type === "winner_exit" && !winners.some((w) => w.id === e.branch_id)) winners.push({ id: e.branch_id, snap: e.snapshot, seq: e.seq });
-      if (e.event_type === "revocation") {
+      if (e.event_type === "winner_exit" && s.state === "Pass" && !winners.some((w) => w.id === e.branch_id)) {
+        winners.push({ id: e.branch_id, snap: s, seq: e.seq });
+      }
+      if (e.event_type === "revocation" || e.event_type === "fail" || e.event_type === "kill" || s.state !== "Pass") {
         const k = winners.findIndex((w) => w.id === e.branch_id);
         if (k >= 0) winners.splice(k, 1);
+      } else {
+        const k = winners.findIndex((w) => w.id === e.branch_id);
+        if (k >= 0) winners[k].snap = s;
       }
+    }
+    if (winners.length === 0 && upto === N) {
+      Object.values(snaps)
+        .filter((r) => r && r.id && r.state === "Pass")
+        .sort((a, b) => (b.certainty_score || 0) - (a.certainty_score || 0))
+        .forEach((r) => winners.push({ id: r.id, snap: r, seq: N }));
     }
     return { snaps, winners, halt, spend };
   }

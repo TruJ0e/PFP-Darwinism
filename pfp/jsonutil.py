@@ -11,6 +11,7 @@ verdict (e.g. `bool("false") is True`).
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any, Dict, Optional
 
@@ -65,12 +66,15 @@ def parse_json_object(raw: Optional[str]) -> Optional[Dict[str, Any]]:
 def coerce_bool(value: Any, default: Optional[bool] = None) -> Optional[bool]:
     """
     Strict boolean coercion for model verdicts. Strings like "false" / "no"
-    map to False (plain `bool("false")` would be True). Unknown values return
+    map to False (plain `bool("false")` would be True), and non-finite floats
+    (`nan`, `inf`) return `default` instead of `True`. Unknown values return
     `default` so callers can treat them as inconclusive.
     """
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return default
         return bool(value)
     if isinstance(value, str):
         word = value.strip().lower()

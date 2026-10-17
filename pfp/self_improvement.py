@@ -105,6 +105,12 @@ class EventLogMiner:
                         "transferred_budget_usd": float(det.get("transferred_budget_usd", 0.0)),
                     }
                 )
+                synth_spent = float(det.get("synthesis_cost_usd", 0.0) or 0.0)
+                if math.isfinite(synth_spent) and synth_spent > 0.0:
+                    spend_by_reason["merge_synthesis"] = round(
+                        spend_by_reason.get("merge_synthesis", 0.0) + synth_spent, 6
+                    )
+                    total_spent_usd = round(total_spent_usd + synth_spent, 6)
             elif et in ("fail", "falsification_survived"):
                 angle = str(det.get("angle") or "unknown")
                 entry = angle_stats.setdefault(
@@ -117,8 +123,8 @@ class EventLogMiner:
                 else:
                     entry["survivals"] += 1
             elif et == "budget_change":
-                spent = float(det.get("spent_usd", 0.0))
-                if spent > 0.0:
+                spent = float(det.get("spent_usd", 0.0) or 0.0)
+                if math.isfinite(spent) and spent > 0.0:
                     reason = str(det.get("reason", "other"))
                     spend_by_reason[reason] = round(spend_by_reason.get(reason, 0.0) + spent, 6)
                     total_spent_usd = round(total_spent_usd + spent, 6)
@@ -370,8 +376,20 @@ class VersionRegistry:
                 "Cannot adopt a new version while a live run is in progress; versions switch only between runs."
             )
 
+        clean_dials, rejected_dials = sanitize_dials(config_dials or {})
+        if rejected_dials:
+            raise ValueError(f"Cannot register version with invalid config_dials: {rejected_dials}")
+        if not isinstance(prompts, dict):
+            raise ValueError("prompts must be a dict of string keys and values")
+        clean_prompts: Dict[str, str] = {}
+        for k, v in prompts.items():
+            ks, vs = str(k), str(v)
+            if len(vs) > 4000:
+                raise ValueError(f"Prompt {ks!r} exceeds maximum length of 4000 characters")
+            clean_prompts[ks] = vs
+
         code_hashes = self._compute_code_hashes()
-        full_hash = self._hash_payload(config_dials, prompts, code_hashes, proposition, sandbox_result)
+        full_hash = self._hash_payload(clean_dials, clean_prompts, code_hashes, proposition, sandbox_result)
         vid = f"v{len(self._version_order) + 1:03d}_{full_hash[:8]}"
         parent_id = self.active_version_id or None
 
@@ -385,8 +403,8 @@ class VersionRegistry:
             sha256_hash=full_hash,
             created_at=time.time(),
             parent_version_id=parent_id,
-            config_dials=copy.deepcopy(config_dials),
-            prompts=copy.deepcopy(prompts),
+            config_dials=copy.deepcopy(clean_dials),
+            prompts=copy.deepcopy(clean_prompts),
             code_snapshot_hashes=code_hashes,
             proposition=copy.deepcopy(proposition),
             sandbox_result=copy.deepcopy(sandbox_result),
@@ -507,6 +525,15 @@ class VersionRegistry:
             )
             if expected != snap.sha256_hash:
                 raise ValueError(f"Version {snap.version_id} failed SHA-256 integrity check; refusing to load.")
+            _, rejected_dials = sanitize_dials(snap.config_dials)
+            if rejected_dials:
+                raise ValueError(
+                    f"Version {snap.version_id} contains invalid config_dials {rejected_dials}; refusing to load."
+                )
+            if any(len(val) > 4000 for val in snap.prompts.values()):
+                raise ValueError(
+                    f"Version {snap.version_id} contains an oversized prompt (>4000 chars); refusing to load."
+                )
             if not snap.version_id or snap.version_id in reg._versions:
                 raise ValueError(f"Duplicate or empty registry version id: {snap.version_id!r}")
             if not math.isfinite(snap.created_at):

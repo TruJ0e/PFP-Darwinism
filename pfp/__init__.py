@@ -78,6 +78,7 @@ from .self_improvement import (
 )
 from .fsutil import StateLockError, atomic_write_text, exclusive_lock
 from .proof_report import build_proof_report, render_proof_markdown, write_proof_report
+from .arena_html import build_arena_html
 
 __all__ = [
     "DEFAULT_BASE_URL",
@@ -139,8 +140,11 @@ __all__ = [
     "build_proof_report",
     "render_proof_markdown",
     "write_proof_report",
+    "build_arena_html",
     "stream_problem",
     "StateLockError",
     "exclusive_lock",
 ]
+
+
 

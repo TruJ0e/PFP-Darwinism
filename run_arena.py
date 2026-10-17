@@ -66,7 +66,7 @@ def _positive_float(text: str) -> float:
 
 
 def _replay(args: argparse.Namespace) -> int:
-    """Re-render a saved arena stream: no model calls, no spend (the renderers are pure)."""
+    """Re-render a saved arena stream: no model calls unless --state-dir triggers post-replay improvement."""
     try:
         feed = ArenaFeed.load_jsonl(Path(args.replay))
     except (OSError, ValueError, AppendOnlyViolationError) as exc:
@@ -81,8 +81,79 @@ def _replay(args: argparse.Namespace) -> int:
         renderer.export_html_arena(feed.events, Path(args.html_out), problem=problem)
     if args.report_out:
         write_proof_report(feed.events, Path(args.report_out), problem=problem)
+
+    state_dir = Path(args.state_dir) if args.state_dir else None
+    improvement_result = None
+    improvement_spend_usd = 0.0
+    if state_dir is not None and not args.no_improve:
+        try:
+            with exclusive_lock(state_dir / ".pfp.lock"):
+                rc, improvement_result, improvement_spend_usd = _replay_improve(args, state_dir, feed, problem)
+                if rc != 0:
+                    return rc
+        except StateLockError as exc:
+            print(f"[pfp] refusing to run: {exc}", file=sys.stderr)
+            return 1
+
+    if args.summary_out:
+        state = renderer.reconstruct_state_from_stream(feed.events)
+        mined = SelfImprovementLoop(client=None).miner.mine(feed.events).to_dict()
+        replay_summary = {
+            "replay_source": str(args.replay),
+            "problem": problem,
+            "events_count": state["events_processed"],
+            "total_branches_spawned": len(state["branches"]),
+            "halted_reason": state["halted"].get("reason") if state["halted"] else None,
+            "winners_box": state["winners_box"],
+            "scoreboard": state["scoreboard"],
+            "mined_metrics": mined,
+        }
+        if improvement_result is not None:
+            replay_summary["self_improvement"] = improvement_result
+            replay_summary["self_improvement_spend_usd"] = improvement_spend_usd
+        atomic_write_text(Path(args.summary_out), json.dumps(replay_summary, indent=2, default=str))
     print(f"[pfp] REPLAY | {len(feed)} events from {args.replay}", file=sys.stderr)
     return 0
+
+
+def _replay_improve(
+    args: argparse.Namespace,
+    state_dir: Path,
+    feed: ArenaFeed,
+    problem: str,
+) -> tuple[int, dict, float]:
+    """Run Piece 8 self-improvement on a replayed stream under the exclusive state-dir lock and hard cap."""
+    registry_path = state_dir / "registry.json"
+    cases_path = state_dir / "case_bank.json"
+    try:
+        registry = VersionRegistry.load(registry_path) if registry_path.exists() else VersionRegistry()
+    except (OSError, ValueError) as exc:
+        print(f"[pfp] refusing to run: cannot load registry {registry_path}: {exc}", file=sys.stderr)
+        return 1, {}, 0.0
+    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
+    loop = SelfImprovementLoop(client=client, registry=registry)
+    if cases_path.exists():
+        try:
+            loop.load_case_bank(cases_path)
+        except (OSError, ValueError) as exc:
+            print(f"[pfp] refusing to run: cannot load case bank {cases_path}: {exc}", file=sys.stderr)
+            return 1, {}, 0.0
+    meter = MeteredClient(client, hard_cap_usd=args.hard_cap, max_concurrent_calls=args.max_concurrent)
+    loop.client = meter
+    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, args.hard_cap)
+    try:
+        res = loop.run_post_run_improvement(
+            feed.events,
+            problem=problem or DEFAULT_PROBLEM,
+            run_sandbox=True,
+        )
+    except (HardCapExceededError, BackendError) as exc:
+        res = {"skipped": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    finally:
+        loop.client = client
+    registry.save(registry_path)
+    loop.save_case_bank(cases_path)
+    return 0, res, meter.stats()["total_cost_usd"]
 
 
 def _run_improvement(
@@ -128,6 +199,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stream-out", type=str, default="", help="Optional JSONL path to save append-only ArenaFeed")
     parser.add_argument("--html-out", type=str, default="", help="Optional HTML path to export Tron Arena player")
     parser.add_argument("--state-dir", type=str, default="", help="Persist registry + case bank here between runs")
+    parser.add_argument("--pin-version", type=str, default="", help="Pin a registry version in --state-dir before running")
+    parser.add_argument("--unpin", action="store_true", help="Clear any manual version pin in --state-dir before running")
+    parser.add_argument("--restore-version", type=str, default="", help="Restore a registry version in --state-dir before running")
+    parser.add_argument("--list-versions", action="store_true", help="List versions in --state-dir and exit (no model calls)")
     parser.add_argument("--no-improve", action="store_true", help="Skip the Piece 8 post-run improvement loop")
     parser.add_argument("--json", action="store_true", help="Print JSON summary in addition to Tron Arena view")
     parser.add_argument("--quiet", action="store_true", help="Do not print the ASCII arena")
@@ -146,6 +221,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.replay:
         return _replay(args)
+    if (args.pin_version or args.unpin or args.restore_version or args.list_versions) and not args.state_dir:
+        parser.error("--pin-version, --unpin, --restore-version, and --list-versions require --state-dir")
+    if sum(bool(x) for x in (args.pin_version, args.unpin, args.restore_version)) > 1:
+        parser.error("--pin-version, --unpin, and --restore-version are mutually exclusive")
     if args.problem is None:
         args.problem = DEFAULT_PROBLEM
     if not args.problem.strip():
@@ -164,6 +243,40 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def _apply_registry_cli_actions(args: argparse.Namespace, registry: VersionRegistry, registry_path: Path | None) -> int | None:
+    """Apply operator failsafe commands (--unpin, --pin-version, --restore-version, --list-versions) at the run boundary."""
+    mutated = False
+    if args.unpin:
+        registry.unpin()
+        mutated = True
+    if args.restore_version:
+        try:
+            registry.restore_version(args.restore_version)
+            mutated = True
+        except KeyError as exc:
+            print(f"[pfp] refusing to run: unknown version {args.restore_version!r} ({exc})", file=sys.stderr)
+            return 1
+    if args.pin_version:
+        try:
+            registry.pin_version(args.pin_version)
+            mutated = True
+        except KeyError as exc:
+            print(f"[pfp] refusing to run: unknown version {args.pin_version!r} ({exc})", file=sys.stderr)
+            return 1
+    if mutated and registry_path is not None:
+        registry.save(registry_path)
+    if args.list_versions:
+        listing = {
+            "active_version_id": registry.active_version_id,
+            "pinned_version_id": registry.pinned_version_id,
+            "versions": [v.to_dict() for v in registry.all_versions()],
+            "failed_experiments": registry.failed_experiments,
+        }
+        print(json.dumps(listing, indent=2))
+        return 0
+    return None
+
+
 def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
     registry_path = state_dir / "registry.json" if state_dir else None
     cases_path = state_dir / "case_bank.json" if state_dir else None
@@ -179,6 +292,10 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
     except (OSError, ValueError) as exc:
         print(f"[pfp] refusing to run: cannot load registry {registry_path}: {exc}", file=sys.stderr)
         return 1
+
+    action_rc = _apply_registry_cli_actions(args, registry, registry_path)
+    if action_rc is not None:
+        return action_rc
 
     client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
     loop = SelfImprovementLoop(client=client, registry=registry)

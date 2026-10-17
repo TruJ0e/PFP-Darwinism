@@ -1239,7 +1239,23 @@ class MainHarness:
         try:
             try:
                 self.budget_ledger.size_problem_once(self.client, problem)
+                probe_spent = self.budget_ledger.total_spent_usd
                 self._spawn_starters(problem)
+                if self.starters and probe_spent > 0.0:
+                    first_id = self.starters[0].branch_id
+                    self._on_event(
+                        HarnessEvent(
+                            event_type="budget_change",
+                            branch_id=first_id,
+                            timestamp=time.time(),
+                            details={
+                                "reason": "problem_sizing_probe",
+                                "spent_usd": round(probe_spent, 6),
+                                "budget_remaining": self.tracker.get(first_id).budget_remaining,
+                            },
+                            snapshot=self.tracker.get(first_id).to_dict(),
+                        )
+                    )
 
                 # All starter branches live at once in parallel
                 with ThreadPoolExecutor(max_workers=max(1, len(self.starters))) as pool:
