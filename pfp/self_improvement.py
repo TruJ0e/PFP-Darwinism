@@ -31,12 +31,15 @@ import copy
 import hashlib
 import json
 import math
+import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .arena import ARENA_LEVEL_EVENT_TYPES, ArenaEvent
+from .alignment_detector import _UNTRUSTED_NOTICE, fence_untrusted
+from .arena import ARENA_LEVEL_EVENT_TYPES, CANONICAL_EVENT_TYPES, ArenaEvent
 from .backend import SUPER_MODEL
 from .fsutil import atomic_write_text
 from .dials import DEFAULT_DIALS, resolve_dials, sanitize_dials, weights_from_dials
@@ -88,11 +91,16 @@ class MinedArenaMetrics:
     merge_patterns: Dict[str, Any]
     falsifier_angles: Dict[str, Dict[str, Any]]
     spend_efficiency: Dict[str, Any]
+    # What the log actually contains, so the anti-model's citations can be checked against it
+    event_type_counts: Dict[str, int] = field(default_factory=dict)
+    event_seqs: frozenset = field(default_factory=frozenset, repr=False)
+    branch_ids: frozenset = field(default_factory=frozenset, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "total_events": self.total_events,
             "total_branches": self.total_branches,
+            "event_type_counts": dict(self.event_type_counts),
             "winning_branch_shapes": copy.deepcopy(self.winning_branch_shapes),
             "merge_patterns": copy.deepcopy(self.merge_patterns),
             "falsifier_angles": copy.deepcopy(self.falsifier_angles),
@@ -116,8 +124,12 @@ class EventLogMiner:
         angle_stats: Dict[str, Dict[str, Any]] = {}
         spend_by_reason: Dict[str, float] = {}
         total_spent_usd = 0.0
+        type_counts: Dict[str, int] = {}
+        seqs: set = set()
 
         for evt in ev_list:
+            type_counts[evt.event_type] = type_counts.get(evt.event_type, 0) + 1
+            seqs.add(int(evt.seq))
             if evt.event_type in ARENA_LEVEL_EVENT_TYPES:
                 continue
             branches[evt.branch_id] = copy.deepcopy(evt.snapshot)
@@ -227,6 +239,9 @@ class EventLogMiner:
             merge_patterns=merge_patterns,
             falsifier_angles=angle_stats,
             spend_efficiency=spend_efficiency,
+            event_type_counts=type_counts,
+            event_seqs=frozenset(seqs),
+            branch_ids=frozenset(str(b) for b in branches),
         )
 
 
@@ -243,6 +258,8 @@ class RewriteProposition:
     anti_model_critique: List[Dict[str, Any]] = field(default_factory=list)
     # Proposed dial changes that failed validation (unknown key, non-numeric, out of safe range)
     rejected_dial_changes: Dict[str, str] = field(default_factory=dict)
+    # Proposed prompt changes that failed validation (unknown prompt key, not text, empty, too long)
+    rejected_prompt_changes: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -250,6 +267,7 @@ class RewriteProposition:
             "dial_changes": copy.deepcopy(self.dial_changes),
             "rejected_dial_changes": copy.deepcopy(self.rejected_dial_changes),
             "prompt_changes": copy.deepcopy(self.prompt_changes),
+            "rejected_prompt_changes": copy.deepcopy(self.rejected_prompt_changes),
             "self_assessment": copy.deepcopy(self.self_assessment),
             "anti_model_critique": copy.deepcopy(self.anti_model_critique),
         }
@@ -765,6 +783,89 @@ CASE_TEXT_LIMIT = 1200
 CASE_PROBLEM_LIMIT = 4000
 CASE_CERTAINTY_CEILING = 1000.0
 
+# Prompts a proposition may rewrite, and the longest text each may carry. Only these are read
+# by the harness; any other key would ride along in every later snapshot, unread and unvetted.
+PROMPT_LIMITS: Dict[str, int] = {"plaus_probe_hint": 1000}
+
+
+def _clean_prompt_text(value: str) -> str:
+    """One line of plain text: no control / format characters (newlines, zero-width, bidi
+    overrides) that could forge prompt structure, no fence tags, whitespace collapsed."""
+    kept = "".join(" " if unicodedata.category(ch) in ("Cc", "Cf") else ch for ch in value)
+    return fence_untrusted(" ".join(kept.split()))
+
+
+def sanitize_prompt_changes(changes: Any) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Validate proposed prompt changes like dials: a proposition is untrusted model output, and
+    `plaus_probe_hint` is injected into every probe of every later run. Returns
+    (accepted, rejected), rejected mapping key -> reason. Over-long text is rejected, not
+    truncated: a clipped instruction can mean something its author never proposed.
+    """
+    accepted: Dict[str, str] = {}
+    rejected: Dict[str, str] = {}
+    if not isinstance(changes, dict):
+        return accepted, rejected
+    for key, value in changes.items():
+        k = str(key)
+        if k not in PROMPT_LIMITS:
+            rejected[k] = "unknown_prompt"
+            continue
+        if not isinstance(value, str):
+            rejected[k] = "not_text"
+            continue
+        text = _clean_prompt_text(value)
+        if not text:
+            rejected[k] = "empty"
+            continue
+        if len(text) > PROMPT_LIMITS[k]:
+            rejected[k] = f"too_long[{PROMPT_LIMITS[k]}]"
+            continue
+        accepted[k] = text
+    return accepted, rejected
+
+
+_EVIDENCE_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
+_BRANCH_ID = re.compile(r"branch_\d+")
+_CANONICAL_TYPES = frozenset(CANONICAL_EVENT_TYPES)
+
+
+def ground_evidence(cited: Any, metrics: MinedArenaMetrics) -> Optional[List[str]]:
+    """
+    Resolve an anti-model attack's `evidence_seq` against the mined log. Every sequence number,
+    event type and branch ID it cites must exist in this run's journal. Returns the resolved
+    references, or None when the citation names nothing real ("log", "see above") or anything
+    invented: one fabricated seq taints the whole citation.
+    """
+    if cited is None or isinstance(cited, (bool, dict)):
+        return None
+    parts = cited if isinstance(cited, (list, tuple)) else [cited]
+    text = " ".join(str(x) for x in parts if not isinstance(x, (bool, dict, list, tuple)))
+    resolved: List[str] = []
+    for tok in _EVIDENCE_TOKEN.findall(text):
+        if tok.isdigit():
+            if int(tok) not in metrics.event_seqs:
+                return None
+            ref = f"seq:{int(tok)}"
+        elif tok in _CANONICAL_TYPES:
+            if not metrics.event_type_counts.get(tok):
+                return None
+            ref = f"type:{tok}"
+        elif tok in metrics.branch_ids:
+            ref = f"branch:{tok}"
+        elif _BRANCH_ID.fullmatch(tok):
+            return None
+        else:
+            continue
+        if ref not in resolved:
+            resolved.append(ref)
+    return resolved or None
+
+
+def _evidence_block(label: str, payload: Any) -> str:
+    """Quote run-derived JSON (winner text, model critiques) as fenced evidence, never orders."""
+    return f"{label}:\n<branch_text>{fence_untrusted(json.dumps(payload))}</branch_text>"
+
 
 class SelfImprovementLoop:
     """
@@ -805,6 +906,8 @@ class SelfImprovementLoop:
         # A/B the candidate against the current version on the SAME sandbox problem, so
         # auto-revert compares like with like (not sandbox certainty vs. live-run certainty)
         self.paired_sandbox = bool(paired_sandbox)
+        # Anti-model attacks the last critique dropped for citing nothing real in the log
+        self.last_ungrounded_attacks = 0
 
     def record_wins_for_recall(self, metrics: MinedArenaMetrics, problem: str) -> List[Dict[str, Any]]:
         """
@@ -968,11 +1071,15 @@ class SelfImprovementLoop:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are the PFP post-run self-assessment module. Return JSON with what_worked and what_to_improve.",
+                    "content": (
+                        "You are the PFP post-run self-assessment module. Return JSON with "
+                        f"what_worked and what_to_improve. {_UNTRUSTED_NOTICE}"
+                    ),
                 },
                 {
                     "role": "user",
-                    "content": f"self_assessment — post-run summary of mined arena metrics:\n{json.dumps(metrics.to_dict())}",
+                    "content": "self_assessment — post-run summary of mined arena metrics.\n"
+                    + _evidence_block("Mined metrics", metrics.to_dict()),
                 },
             ],
             temperature=0.2,
@@ -998,14 +1105,19 @@ class SelfImprovementLoop:
                 {
                     "role": "system",
                     "content": (
-                        "You are the PFP anti-model: a purely negative critic grounded strictly in event-log evidence."
+                        "You are the PFP anti-model: a purely negative critic grounded strictly in event-log evidence. "
+                        'Return JSON {"evidence_grounded_attacks": [{"target", "evidence_seq", "critique"}]}; '
+                        "evidence_seq must cite event seq numbers, event types or branch IDs that occur in the log. "
+                        f"{_UNTRUSTED_NOTICE}"
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"anti_model — purely negative critic on mined log:\n{json.dumps(metrics.to_dict())}\n"
-                        f"Past failed experiments: {json.dumps(self.registry.failed_experiments)}"
+                        f"anti_model — purely negative critic on mined log (seq 1..{metrics.total_events}).\n"
+                        + _evidence_block("Mined metrics", metrics.to_dict())
+                        + "\n"
+                        + _evidence_block("Past failed experiments", self.registry.failed_experiments)
                     ),
                 },
             ],
@@ -1014,16 +1126,28 @@ class SelfImprovementLoop:
         )
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
         data = parse_json_object(raw)
-        if data is None:
-            return [{"target": "general", "evidence_seq": "log", "critique": raw.strip()[:400]}] if raw.strip() else []
-        attacks = data.get("evidence_grounded_attacks")
+        self.last_ungrounded_attacks = 0
+        # An unparseable reply cites nothing: before v0.30 it was kept as evidence_seq "log"
+        attacks = data.get("evidence_grounded_attacks") if data is not None else None
         if not isinstance(attacks, list):
+            self.last_ungrounded_attacks = 1 if raw.strip() else 0
             return []
-        # "Grounded in the event log (evidence), not vibes": drop attacks that cite no evidence
-        return [
-            a for a in attacks
-            if isinstance(a, dict) and str(a.get("evidence_seq") or "").strip() and str(a.get("critique") or "").strip()
-        ]
+        # "Grounded in the event log (evidence), not vibes": every cited seq / event type /
+        # branch must exist in this run's journal, or the attack is noise and is dropped
+        kept: List[Dict[str, Any]] = []
+        for a in attacks:
+            critique = str(a.get("critique") or "").strip() if isinstance(a, dict) else ""
+            refs = ground_evidence(a.get("evidence_seq"), metrics) if critique else None
+            if refs is None:
+                self.last_ungrounded_attacks += 1
+                continue
+            kept.append({
+                "target": str(a.get("target") or "general")[:200],
+                "evidence_seq": str(a.get("evidence_seq"))[:200],
+                "critique": critique[:1000],
+                "grounded_in": refs,
+            })
+        return kept
 
     def synthesize_proposition(
         self,
@@ -1040,14 +1164,19 @@ class SelfImprovementLoop:
             messages=[
                 {
                     "role": "system",
-                    "content": "Synthesize self-assessment and anti-model critique into concrete dial_changes and prompt_changes JSON.",
+                    "content": (
+                        "Synthesize self-assessment and anti-model critique into concrete dial_changes and "
+                        f"prompt_changes JSON. Tunable dials: {sorted(DEFAULT_DIALS)}. "
+                        f"Rewritable prompts: {sorted(PROMPT_LIMITS)}. {_UNTRUSTED_NOTICE}"
+                    ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        "synthesize_proposition — concrete changes (dials, prompts, thresholds):\n"
-                        f"Self-assessment: {json.dumps(self_assessment)}\n"
-                        f"Anti-model: {json.dumps(anti_model_critique)}"
+                        "synthesize_proposition — concrete changes (dials, prompts, thresholds).\n"
+                        + _evidence_block("Self-assessment", self_assessment)
+                        + "\n"
+                        + _evidence_block("Anti-model", anti_model_critique)
                     ),
                 },
             ],
@@ -1057,16 +1186,15 @@ class SelfImprovementLoop:
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
         data = parse_json_object(raw)
         rejected: Dict[str, str] = {}
+        rejected_prompts: Dict[str, str] = {}
         if data is not None:
-            summary = str(data.get("summary") or "Proposed dial and prompt refinement")
+            summary = (
+                _clean_prompt_text(str(data.get("summary") or ""))[:400]
+                or "Proposed dial and prompt refinement"
+            )
             proposed = data.get("dial_changes")
             dial_changes, rejected = sanitize_dials(proposed if isinstance(proposed, dict) else {})
-            raw_prompts = data.get("prompt_changes")
-            prompt_changes = (
-                {str(k): str(v)[:1000] for k, v in raw_prompts.items() if str(v).strip()}
-                if isinstance(raw_prompts, dict)
-                else {}
-            )
+            prompt_changes, rejected_prompts = sanitize_prompt_changes(data.get("prompt_changes"))
         else:
             summary = "Fallback proposition (unparseable synthesis reply)"
             dial_changes = {}
@@ -1079,6 +1207,7 @@ class SelfImprovementLoop:
             self_assessment=self_assessment,
             anti_model_critique=anti_model_critique,
             rejected_dial_changes=rejected,
+            rejected_prompt_changes=rejected_prompts,
         )
 
     def run_sandbox_test(
@@ -1226,6 +1355,7 @@ class SelfImprovementLoop:
         return {
             "mined_metrics": metrics.to_dict(),
             "recall_cases_added": len(recalled),
+            "anti_model_ungrounded_dropped": self.last_ungrounded_attacks,
             "proposition": proposition.to_dict(),
             "sandbox_result": sandbox_record,
             "registered_version": snap.to_dict(),

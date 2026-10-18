@@ -405,7 +405,8 @@ class IssueDetector:
             f"probe_continuation depth={depth}\n"
             f"Fire K diverse continuations for problem: {problem}\n"
             f"Parent reasoning so far: {parent_reasoning}\n"
-            + (f"Guidance: {self.probe_hint}\n" if self.probe_hint else "")
+            # One line only: a hint carrying newlines could forge the prompt's own structure
+            + (f"Guidance: {' '.join(str(self.probe_hint).split())}\n" if self.probe_hint else "")
             + "Return JSON with fork_id, fork, and reasoning."
         )
         choices, total_cost = self._sample_choices(

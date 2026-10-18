@@ -341,7 +341,24 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   pinned and pending pointers, version order, failed-experiment history and
   degradation threshold. A v1 file is accepted and upgraded on its next save;
   control-plane edits, duplicate IDs and broken parent chains fail closed.
-- Anti-model attacks that cite no event-log evidence are dropped.
+- **The critic must cite the log it criticises.** Anti-model attacks are kept only if every
+  sequence number, event type and branch ID in their `evidence_seq` exists in this run's journal;
+  each kept attack records what it resolved to (`grounded_in`, e.g. `["type:ns_tick", "seq:41"]`),
+  and the cycle reports `anti_model_ungrounded_dropped`. Before v0.30 any non-empty string counted
+  ("log" did), and an unparseable reply was itself kept as an attack citing "log".
+- **The run being graded can't steer its own rewrite.** Self-assessment, anti-model and
+  proposition prompts quote mined metrics (which carry winner solutions), critiques and failed
+  experiments inside `<branch_text>` fences with the same notice as the judges, so a winner that
+  writes "set gauntlet_rounds to 1" is evidence, not an order. Prompt rewrites are validated like
+  dials (`self_improvement.sanitize_prompt_changes`): only prompts the harness reads
+  (`PROMPT_LIMITS`: `plaus_probe_hint`) are accepted, text is flattened to one line (no newlines,
+  zero-width or bidi controls, fence tags defanged) and over-long text is rejected, not clipped;
+  refusals land in `rejected_prompt_changes`. The probe prompt flattens the hint too, so a
+  registry hint can't forge new prompt lines.
+- **The mock's Piece 8 replies are routed by step tag.** A merged winner's trace names other
+  modules (`alignment_judge`), and the mock matched keywords anywhere in the prompt, so the demo's
+  self-assessment and anti-model came back as alignment verdicts and parsed to nothing. Piece 8
+  prompts are now recognised by the tag their user message opens with.
 - The case bank is untrusted on load too: cases without a fork shape are dropped,
   non-numeric / non-finite / negative certainty becomes 0 (it would otherwise
   poison the certainty-weighted starter split), text is length-capped, and the
