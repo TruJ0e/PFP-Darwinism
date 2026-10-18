@@ -231,13 +231,25 @@ class ArenaFeed:
         self._seq: int = 0
         self._lock = threading.RLock()
         self._subscribers: List[Callable[[ArenaEvent], None]] = []
+        # Subscribers are optional projections (live UI, telemetry), never part of the
+        # append transaction. Keep their failures observable without letting a broken
+        # renderer turn a durably committed event into an apparent harness failure.
+        self._subscriber_failures: List[Dict[str, Any]] = []
         # True when loaded from a legacy (v1, unchained) journal: its events were hashed on
         # load, so the chain proves nothing about what was on disk.
         self.legacy_unverified: bool = False
 
     def subscribe(self, callback: Callable[[ArenaEvent], None]) -> None:
+        if not callable(callback):
+            raise TypeError("ArenaFeed subscriber must be callable.")
         with self._lock:
             self._subscribers.append(callback)
+
+    @property
+    def subscriber_failures(self) -> Sequence[Dict[str, Any]]:
+        """Detached diagnostics for subscriber exceptions, oldest first."""
+        with self._lock:
+            return tuple(copy.deepcopy(self._subscriber_failures))
 
     def append(
         self,
@@ -251,34 +263,37 @@ class ArenaFeed:
             raise ValueError("Every ArenaEvent must carry a valid branch state snapshot ('id', 'state').")
         if str(snapshot["id"]) != branch_id:
             raise ValueError("ArenaEvent branch_id must match its snapshot id.")
-        if not event_type:
+        if not isinstance(event_type, str) or not event_type.strip():
             raise ValueError("ArenaEvent event_type must be non-empty.")
+        if not isinstance(branch_id, str) or not branch_id:
+            raise ValueError("ArenaEvent branch_id must be a non-empty string.")
         with self._lock:
-            self._seq += 1
+            # Prepare the entire event against a tentative sequence. Nothing below mutates
+            # feed state until validation and hashing have succeeded, so *any* exception
+            # (including timestamp coercion or deepcopy) leaves the next sequence usable.
+            next_seq = self._seq + 1
             # Persist the exact value that is hashed; JSONL intentionally uses four decimal
             # places for stable, compact replay files.
-            event_timestamp = round(timestamp if timestamp is not None else time.time(), 4)
+            try:
+                event_timestamp = round(float(timestamp if timestamp is not None else time.time()), 4)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("ArenaEvent timestamp must be a finite number.") from exc
             if not math.isfinite(event_timestamp):
-                self._seq -= 1
                 raise ValueError("ArenaEvent timestamp must be finite.")
             event_details = copy.deepcopy(details or {})
             event_snapshot = copy.deepcopy(snapshot)
             previous_digest = self._events[-1].digest if self._events else ""
-            try:
-                digest = _event_digest(
-                    seq=self._seq,
-                    event_type=event_type,
-                    branch_id=branch_id,
-                    timestamp=event_timestamp,
-                    details=event_details,
-                    snapshot=event_snapshot,
-                    previous_digest=previous_digest,
-                )
-            except (TypeError, ValueError):
-                self._seq -= 1
-                raise
+            digest = _event_digest(
+                seq=next_seq,
+                event_type=event_type,
+                branch_id=branch_id,
+                timestamp=event_timestamp,
+                details=event_details,
+                snapshot=event_snapshot,
+                previous_digest=previous_digest,
+            )
             evt = ArenaEvent(
-                seq=self._seq,
+                seq=next_seq,
                 event_type=event_type,
                 branch_id=branch_id,
                 timestamp=event_timestamp,
@@ -288,9 +303,20 @@ class ArenaFeed:
                 digest=digest,
             )
             list.append(self._events, evt)
+            self._seq = next_seq
             subs = list(self._subscribers)
         for sub in subs:
-            sub(evt.detached_copy())
+            try:
+                sub(evt.detached_copy())
+            except Exception as exc:
+                failure = {
+                    "seq": evt.seq,
+                    "callback": getattr(sub, "__qualname__", getattr(sub, "__name__", type(sub).__name__)),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:1000],
+                }
+                with self._lock:
+                    self._subscriber_failures.append(failure)
         return evt.detached_copy()
 
     def ingest_harness_event(self, event: HarnessEvent) -> ArenaEvent:
@@ -360,6 +386,10 @@ class ArenaFeed:
                     raise AppendOnlyViolationError(
                         f"Arena replay sequence must be contiguous: expected {expected_seq}, got {evt.seq}."
                     )
+                if not evt.event_type.strip():
+                    raise ValueError(f"Arena event {evt.seq} has an empty event_type.")
+                if not evt.branch_id:
+                    raise ValueError(f"Arena event {evt.seq} has an empty branch_id.")
                 if not math.isfinite(evt.timestamp):
                     raise ValueError(f"Arena event {evt.seq} has a non-finite timestamp.")
                 try:

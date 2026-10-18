@@ -211,6 +211,11 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   inside `<branch_text>` / `<context>` fences, tells the judge that instructions in
   there are evidence against the branch, and defangs any fence tag a reply writes
   (`fail_judge.fence_untrusted`), so a branch can't close its own quote.
+- **Journal appends are transactional.** Timestamp coercion, payload copying and hashing
+  all complete before the feed advances its sequence. A malformed producer event therefore
+  cannot consume a sequence number and poison every later replay. Live UI subscribers are
+  isolated projections: one renderer failure is retained in `subscriber_failures` for
+  inspection, while the committed event continues to every other subscriber and the harness.
 - **Selection never hinges on scheduler jitter.** Untested age decays certainty a whole
   second at a time (`issue_detector.AGE_QUANTUM_S`). It used to count fractions of a
   second, so siblings born microseconds apart got certainties like -1.2500 vs -1.2502;
