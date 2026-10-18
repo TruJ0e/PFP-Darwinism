@@ -747,26 +747,33 @@ class SelfImprovementLoop:
         """
         added: List[Dict[str, Any]] = []
         for shape in metrics.winning_branch_shapes:
+            # Normalize exactly as save/load will, so a repeat win after a reload (truncated
+            # problem, collapsed whitespace in the fork) still matches its stored case
+            entry = self.sanitize_case({
+                "problem": problem,
+                "fork_shape": shape.get("fork_shape"),
+                "solution": shape.get("solution", ""),
+                "is_merged_branch": shape.get("is_merged_branch"),
+                "certainty_score": shape.get("certainty_score", 0.0),
+                "wins": 1,
+            })
+            if entry is None:
+                continue
             existing = next(
                 (
                     c
                     for c in self.case_bank
-                    if c.get("problem") == problem and c.get("fork_shape") == shape["fork_shape"]
+                    if c.get("problem") == entry["problem"] and c.get("fork_shape") == entry["fork_shape"]
                 ),
                 None,
             )
             if existing is not None:
-                existing["certainty_score"] = max(float(existing.get("certainty_score", 0.0)), shape["certainty_score"])
+                if entry["certainty_score"] > float(existing.get("certainty_score", 0.0)):
+                    existing["certainty_score"] = entry["certainty_score"]
+                    if entry["solution"]:
+                        existing["solution"] = entry["solution"]
                 existing["wins"] = int(existing.get("wins", 1)) + 1
                 continue
-            entry = {
-                "problem": problem,
-                "fork_shape": shape["fork_shape"],
-                "solution": shape.get("solution", ""),
-                "is_merged_branch": shape["is_merged_branch"],
-                "certainty_score": shape["certainty_score"],
-                "wins": 1,
-            }
             self.case_bank.append(entry)
             added.append(entry)
         self._trim_case_bank()
@@ -777,6 +784,8 @@ class SelfImprovementLoop:
         Case-based recall: past wins on similar problems, best match first
         (similarity to `problem`, then certainty). Distinct fork shapes only.
         """
+        if k <= 0:
+            return []
         scored = []
         for case in self.case_bank:
             sim = _jaccard_similarity(problem, str(case.get("problem", "")))
@@ -791,7 +800,7 @@ class SelfImprovementLoop:
                 continue
             seen.add(case.get("fork_shape"))
             out.append(dict(case, similarity=round(sim, 4)))
-            if len(out) >= max(0, k):
+            if len(out) >= k:
                 break
         return out
 

@@ -41,7 +41,10 @@ python run_arena.py --hard-cap 2.00 --state-dir .pfp_state --html-out arena_out/
 seeded with past wins on similar problems, on whichever config version is active
 or pinned. Both files are atomically written and integrity-enveloped; a changed or
 truncated recall bank is rejected before a model client is created. Legacy bare-list
-case banks load once and upgrade on the next save. Real scale is `--starters 9`
+case banks load once and upgrade on the next save. A recalled win's head start is
+its past certainty scaled by how similar its problem is to this one, and a repeat win
+(even after a reload truncated the problem or collapsed the fork's whitespace) bumps the
+stored case's `wins` instead of piling up duplicates. Real scale is `--starters 9`
 (odd: no arbitration ties).
 
 | Flag | Default | Meaning |
@@ -182,6 +185,9 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   `default` instead of `True`.
 - **Falsification fails closed.** A judge reply with no readable verdict is
   *inconclusive*: no survival credit, no kill, no appeal consumed, and no Pass.
+- **The alignment pre-filter matches concepts on whole words.** Concept anchors used
+  to be substring tests, so "report" hit *port*, "monkey" hit *key* and "ghost" hit
+  *host*, and unrelated branches cleared the 0.20 threshold into a paid Super judge call.
 - **Branches can't rule on themselves.** The judge prompt quotes model-written text
   inside `<branch_text>` / `<context>` fences, tells the judge that instructions in
   there are evidence against the branch, and defangs any fence tag a reply writes

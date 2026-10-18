@@ -90,6 +90,21 @@ _STOP_WORDS = {
 }
 
 
+_CONCEPT_ANCHORS: Tuple[Tuple[str, frozenset, float], ...] = (
+    ("__concept_ssh_host_ingress__", frozenset({
+        "sshd", "port", "ports", "22", "tcp", "firewall", "ufw", "inbound", "daemon",
+        "fail2ban", "listening",
+    }), 2.0),
+    ("__concept_endpoints__", frozenset({"laptop", "desktop", "host", "hosts", "server", "servers"}), 1.0),
+    ("__concept_ssh_auth__", frozenset({
+        "key", "keys", "authorized_keys", "chmod", "auth", "authentication", "strictmodes",
+    }), 2.0),
+    ("__concept_network_routing__", frozenset({
+        "vlan", "wifi", "wlan", "ipv6", "routing", "arp", "dns", "link_local",
+    }), 2.0),
+)
+
+
 def compute_branch_embedding(text: str, dim: int = 128) -> List[float]:
     """
     Cheap deterministic vector embedding of a branch's position (fork + reasoning)
@@ -110,16 +125,14 @@ def compute_branch_embedding(text: str, dim: int = 128) -> List[float]:
     for i in range(len(tokens) - 1):
         features.append((f"{tokens[i]}_{tokens[i + 1]}", 0.5))
 
-    # Domain concept buckets so surface-related positions recall well in the pre-filter
-    lower = text.lower()
-    if any(k in lower for k in ("sshd", "port", "22", "tcp", "firewall", "ufw", "inbound", "daemon", "fail2ban", "listening")):
-        features.append(("__concept_ssh_host_ingress__", 2.0))
-    if any(k in lower for k in ("laptop", "desktop", "host", "server")):
-        features.append(("__concept_endpoints__", 1.0))
-    if any(k in lower for k in ("key", "authorized_keys", "chmod", "auth", "strictmodes")):
-        features.append(("__concept_ssh_auth__", 2.0))
-    if any(k in lower for k in ("vlan", "wifi", "wlan", "ipv6", "routing", "arp", "dns", "link_local")):
-        features.append(("__concept_network_routing__", 2.0))
+    # Domain concept buckets so surface-related positions recall well in the pre-filter.
+    # Matched on whole tokens: substring tests let "report" hit "port", "monkey" hit
+    # "key" and "ghost" hit "host", pushing unrelated branches past the threshold and
+    # into a paid Super judge call.
+    words = set(re.findall(r"[a-z0-9_]+", text.lower()))
+    for concept, anchors, weight in _CONCEPT_ANCHORS:
+        if words & anchors:
+            features.append((concept, weight))
 
     for feat, weight in features:
         h = hashlib.md5(feat.encode("utf-8")).digest()

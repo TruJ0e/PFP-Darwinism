@@ -366,6 +366,23 @@ def _seed_certainty(case: Dict[str, Any]) -> float:
     return val if math.isfinite(val) and val > 0.0 else 0.0
 
 
+def _seed_weight(case: Dict[str, Any]) -> float:
+    """
+    Budget weight of a recalled starter: its past certainty scaled by how similar its
+    problem was to this one. A barely-related recall (similarity 0.15) must not draw the
+    same head start as a near-exact match. Cases without a `similarity` (seeded directly,
+    not via `recall`) count as exact matches; a bad value seeds nothing.
+    """
+    raw = case.get("similarity", 1.0)
+    try:
+        sim = float(raw) if not isinstance(raw, bool) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(sim):
+        return 0.0
+    return _seed_certainty(case) * min(1.0, max(0.0, sim))
+
+
 def _conclusion_text(raw: str) -> str:
     """Models often answer the conclusion prompt in JSON; surface the conclusion itself."""
     data = parse_json_object(raw)
@@ -1200,7 +1217,7 @@ class MainHarness:
     # ------------------------------------------------------------------
     def _spawn_starters(self, problem: str) -> None:
         starter_scores = [
-            _seed_certainty(self.seed_cases[idx]) * 0.25 if idx < len(self.seed_cases) else 0.0
+            _seed_weight(self.seed_cases[idx]) * 0.25 if idx < len(self.seed_cases) else 0.0
             for idx in range(self.starter_agents)
         ]
         starter_budgets = self.budget_ledger.split_among_siblings(
