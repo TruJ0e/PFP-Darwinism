@@ -211,6 +211,13 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   inside `<branch_text>` / `<context>` fences, tells the judge that instructions in
   there are evidence against the branch, and defangs any fence tag a reply writes
   (`fail_judge.fence_untrusted`), so a branch can't close its own quote.
+- **Selection never hinges on scheduler jitter.** Untested age decays certainty a whole
+  second at a time (`issue_detector.AGE_QUANTUM_S`). It used to count fractions of a
+  second, so siblings born microseconds apart got certainties like -1.2500 vs -1.2502;
+  that difference decided which branch the background falsifier tested first, and so which
+  branch went on to win. The same mock sandbox finished at 22.5 or 31.5 depending on thread
+  timing, and the paired A/B sometimes flagged an unchanged-quality candidate as degraded.
+  Now equal evidence means equal certainty, and the existing content tie-break decides.
 - **The winner's box is re-checked after the whole pre-exit sweep.** A later
   candidate's kill re-verifies its dependents; a winner demoted that way no longer
   exits. A contradiction tie on certainty spares the branch with more survived

@@ -26,6 +26,24 @@ from typing import Any, List, Optional, Sequence, Set
 from .jsonutil import as_str_list, parse_json_object
 
 
+# Untested age is counted in whole seconds. Sub-second age is pure thread-scheduling
+# jitter (siblings born microseconds apart): left in, it decided which of two
+# otherwise-equal branches the background falsifier tested first, so identical mock
+# runs could reach different winners and the paired sandbox A/B could flip.
+AGE_QUANTUM_S = 1.0
+
+
+def untested_age_units(seconds_since_last_test: float) -> float:
+    """Whole `AGE_QUANTUM_S` units of untested age; negative / non-finite clocks count 0."""
+    try:
+        age = float(seconds_since_last_test)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(age) or age <= 0.0:
+        return 0.0
+    return float(math.floor(age / AGE_QUANTUM_S))
+
+
 @dataclass
 class CertaintyWeights:
     """
@@ -33,7 +51,7 @@ class CertaintyWeights:
     - survived_falsifications: big plus
     - merges_attracted: plus
     - open_critic_objections: minus
-    - age_without_testing: decays (per second of untested age)
+    - age_without_testing: decays (per whole second of untested age)
     """
 
     survived_falsifications: float = 3.0
@@ -243,13 +261,14 @@ class IssueDetector:
         """
         Certainty ranking (Piece 1):
         survived falsifications (big plus), merges attracted (plus),
-        open critic objections (minus), age-without-testing (decays).
+        open critic objections (minus), age-without-testing (decays per whole second,
+        so wall-clock jitter between siblings can't reorder them).
         """
         score = (
             survived_falsifications * self.weights.survived_falsifications
             + merges_attracted * self.weights.merges_attracted
             + open_critic_objections * self.weights.open_critic_objections
-            + max(0.0, seconds_since_last_test) * self.weights.age_without_testing
+            + untested_age_units(seconds_since_last_test) * self.weights.age_without_testing
         )
         return round(score, 4)
 
