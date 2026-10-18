@@ -150,6 +150,10 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - **The cap must be able to bind.** `--hard-cap nan` or `inf` is rejected by the CLI,
   `MainHarness`, `BudgetLedger`, `MeteredClient` and the sandbox: a NaN cap compares
   False against every spend and would silently admit unlimited calls.
+- **Budget inputs fail closed.** Ledger configuration, provider-reported spend,
+  reserve transfers, and branch-budget arithmetic reject booleans, negatives,
+  `NaN`, and infinities before mutating state; invalid accounting data cannot
+  poison totals or silently disable affordability checks.
 - **Hard cap is enforced**, not advisory: every call atomically reserves a
   conservative upper-bound cost before it enters the parallel request pool.
   A call that would exceed `--hard-cap` (including spend already in flight) is

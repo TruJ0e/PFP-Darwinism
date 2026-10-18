@@ -39,6 +39,26 @@ from .jsonutil import parse_json_object
 from .tracker import BranchRecord, BranchState, PFPTracker
 
 
+def _finite_number(value: Any, name: str) -> float:
+    """Coerce a public budget input without admitting bool, NaN, or infinity."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number, not bool.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number.") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite.")
+    return number
+
+
+def _non_negative_amount(value: Any, name: str) -> float:
+    number = _finite_number(value, name)
+    if number < 0.0:
+        raise ValueError(f"{name} must be >= 0.")
+    return number
+
+
 @dataclass
 class Directive:
     """
@@ -110,15 +130,32 @@ class BudgetLedger:
         high_certainty_threshold: float = 0.0,
         verification_share: float = 0.3,
     ) -> None:
+        hard_cap_usd = _non_negative_amount(hard_cap_usd, "hard_cap_usd")
+        depth_decay = _finite_number(depth_decay, "depth_decay")
+        finish_reserve_ratio = _finite_number(finish_reserve_ratio, "finish_reserve_ratio")
+        min_branch_floor_usd = _finite_number(min_branch_floor_usd, "min_branch_floor_usd")
+        conclusion_reserve_usd = _non_negative_amount(conclusion_reserve_usd, "conclusion_reserve_usd")
+        expected_agent_seconds = _finite_number(expected_agent_seconds, "expected_agent_seconds")
+        estimated_cost_per_call_usd = _finite_number(
+            estimated_cost_per_call_usd, "estimated_cost_per_call_usd"
+        )
+        high_certainty_threshold = _finite_number(high_certainty_threshold, "high_certainty_threshold")
+        verification_share = _finite_number(verification_share, "verification_share")
+        if not (0.0 < depth_decay <= 1.0):
+            raise ValueError("depth_decay must be in (0, 1].")
         if not (0.10 <= finish_reserve_ratio <= 0.15):
             raise ValueError("finish_reserve_ratio must be between 0.10 and 0.15 (10-15% of root).")
+        if min_branch_floor_usd <= 0.0:
+            raise ValueError("min_branch_floor_usd must be > 0.")
+        if expected_agent_seconds <= 0.0:
+            raise ValueError("expected_agent_seconds must be > 0.")
+        if estimated_cost_per_call_usd <= 0.0:
+            raise ValueError("estimated_cost_per_call_usd must be > 0.")
         if not (0.0 <= verification_share < 1.0):
             raise ValueError("verification_share must be in [0, 1).")
         # Fraction of every branch's budget that exploration and child spawning can't touch:
         # it pays for the branch's own falsification / alignment / merge (selection is not free)
         self.verification_share = verification_share
-        if not isinstance(hard_cap_usd, (int, float)) or not math.isfinite(hard_cap_usd) or hard_cap_usd < 0:
-            raise ValueError("hard_cap_usd must be a finite number >= 0.")
         self._cost_ema: Dict[str, float] = {}
         self.hard_cap_usd = hard_cap_usd
         self.depth_decay = depth_decay
@@ -126,7 +163,7 @@ class BudgetLedger:
         self.min_branch_floor_usd = min_branch_floor_usd
         self.conclusion_reserve_usd = conclusion_reserve_usd
         self.expected_agent_seconds = expected_agent_seconds
-        self.estimated_cost_per_call_usd = max(1e-6, estimated_cost_per_call_usd)
+        self.estimated_cost_per_call_usd = estimated_cost_per_call_usd
         self.high_certainty_threshold = high_certainty_threshold
 
         self.difficulty_estimate_usd: float = 0.0
@@ -163,7 +200,7 @@ class BudgetLedger:
             temperature=0.1,
             max_tokens=100,
         )
-        probe_cost = float(resp.usage.cost_usd)
+        probe_cost = _non_negative_amount(resp.usage.cost_usd, "probe cost_usd")
         raw = resp.choices[0].message.content if resp.choices else "{}"
         # Live models wrap JSON in fences / <think> blocks; a NaN, inf or negative
         # estimate must never become the root budget.
@@ -193,8 +230,10 @@ class BudgetLedger:
         never understates spend.
         """
         with self._lock:
-            amount = max(0.0, amount_usd)
-            covered = amount if covered_usd is None else min(amount, max(0.0, covered_usd))
+            amount = _non_negative_amount(amount_usd, "amount_usd")
+            covered = amount if covered_usd is None else min(
+                amount, _non_negative_amount(covered_usd, "covered_usd")
+            )
             self.total_spent_usd = round(self.total_spent_usd + amount, 6)
             self.overdraft_usd = round(self.overdraft_usd + (amount - covered), 6)
             return self.total_spent_usd
@@ -215,7 +254,7 @@ class BudgetLedger:
         3. Book whatever is still uncovered as overdraft.
         Always records the full cost as spent.
         """
-        cost = max(0.0, float(cost_usd))
+        cost = _non_negative_amount(cost_usd, "cost_usd")
         with self._lock:
             rec = tracker.get(branch_id)
             from_branch = min(rec.budget_remaining, cost)
@@ -237,24 +276,27 @@ class BudgetLedger:
 
     def cover_from_finish_reserve(self, amount_usd: float) -> float:
         """Pay up to `amount_usd` of selection work from the finish reserve; returns what was granted."""
+        amount = _non_negative_amount(amount_usd, "amount_usd")
         with self._lock:
-            granted = round(min(self.finish_reserve_usd, max(0.0, amount_usd)), 6)
+            granted = round(min(self.finish_reserve_usd, amount), 6)
             self.finish_reserve_usd = round(self.finish_reserve_usd - granted, 6)
             return granted
 
     def return_to_finish_reserve(self, amount_usd: float) -> float:
         """Idle branch budget flowing back to the finish reserve (never creates money)."""
+        amount = _non_negative_amount(amount_usd, "amount_usd")
         with self._lock:
-            self.finish_reserve_usd = round(self.finish_reserve_usd + max(0.0, amount_usd), 6)
+            self.finish_reserve_usd = round(self.finish_reserve_usd + amount, 6)
             return self.finish_reserve_usd
 
     def observe_call_cost(self, kind: str, cost_usd: float) -> None:
         """Learn what each kind of call really costs (EMA) so affordability checks track reality."""
-        if cost_usd <= 0.0:
+        cost = _non_negative_amount(cost_usd, "cost_usd")
+        if cost == 0.0:
             return
         with self._lock:
             prev = self._cost_ema.get(kind)
-            self._cost_ema[kind] = cost_usd if prev is None else round(0.7 * prev + 0.3 * cost_usd, 8)
+            self._cost_ema[kind] = cost if prev is None else round(0.7 * prev + 0.3 * cost, 8)
 
     def observed_cost(self, kind: str) -> Optional[float]:
         """The learned (EMA) cost of `kind`, or None if no such call has been paid for yet."""
@@ -267,7 +309,8 @@ class BudgetLedger:
 
     def protected_budget(self, initial_budget: float) -> float:
         """The verification share of a branch's initial budget (never spent on exploration)."""
-        return max(self.conclusion_reserve_usd, round(initial_budget * self.verification_share, 6))
+        budget = _non_negative_amount(initial_budget, "initial_budget")
+        return max(self.conclusion_reserve_usd, round(budget * self.verification_share, 6))
 
     def compute_ns_cadence(self, branch_budget: float) -> float:
         """
@@ -276,7 +319,8 @@ class BudgetLedger:
         Tight budget -> slower cadence.
         When spendable budget calls <= 0, returns inf (NS stopped).
         """
-        spendable = max(0.0, branch_budget - self.conclusion_reserve_usd)
+        budget = _non_negative_amount(branch_budget, "branch_budget")
+        spendable = max(0.0, budget - self.conclusion_reserve_usd)
         budget_calls = spendable / self.estimated_cost_per_call_usd
         if budget_calls <= 0.0:
             return float("inf")
@@ -287,7 +331,8 @@ class BudgetLedger:
         Determine how many children can be funded at or above `min_branch_floor_usd`
         from the decayed child pool (`parent_budget * depth_decay`).
         """
-        pool = parent_budget * (self.depth_decay if apply_depth_decay else 1.0)
+        budget = _non_negative_amount(parent_budget, "parent_budget")
+        pool = budget * (self.depth_decay if apply_depth_decay else 1.0)
         if pool < self.min_branch_floor_usd:
             return 0
         return int(pool // self.min_branch_floor_usd)
@@ -307,7 +352,8 @@ class BudgetLedger:
         if n == 0:
             return []
 
-        pool = round(parent_budget * (self.depth_decay if apply_depth_decay else 1.0), 6)
+        budget = _non_negative_amount(parent_budget, "parent_budget")
+        pool = round(budget * (self.depth_decay if apply_depth_decay else 1.0), 6)
         max_n = int(pool // self.min_branch_floor_usd)
         if max_n <= 0:
             return []
@@ -348,6 +394,7 @@ class BudgetLedger:
         Finish reserve: 10-15% of root held back; exploration can't touch it,
         only near-conclusion branches (high certainty, no open issues) can draw.
         """
+        requested = _non_negative_amount(requested_usd, "requested_usd")
         with self._lock:
             is_near_conclusion = (
                 record.state == BranchState.POSSIBLE
@@ -357,7 +404,7 @@ class BudgetLedger:
             if not is_near_conclusion or self.finish_reserve_usd <= 0.0:
                 return 0.0
 
-            granted = round(min(self.finish_reserve_usd, max(0.0, requested_usd)), 6)
+            granted = round(min(self.finish_reserve_usd, requested), 6)
             self.finish_reserve_usd = round(self.finish_reserve_usd - granted, 6)
             return granted
 
