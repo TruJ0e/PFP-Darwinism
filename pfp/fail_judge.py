@@ -24,26 +24,17 @@ exits survived — not that only one can.
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .alignment_detector import branch_position_text
+from .alignment_detector import branch_position_text, fence_untrusted
 from .backend import SUPER_MODEL
 from .branch_spawner import BudgetLedger, HarnessEvent
 from .issue_detector import IssueDetector
 from .jsonutil import coerce_bool, parse_json_object
 from .tracker import BranchRecord, BranchState, PFPTracker, PassProvenanceRecord
-
-
-_FENCE_TAG = re.compile(r"<\s*/?\s*(branch_text|context)\s*>", re.IGNORECASE)
-
-
-def fence_untrusted(text: Any) -> str:
-    """Defang fence tags inside model-written text so a branch can't close its own quote."""
-    return _FENCE_TAG.sub(lambda m: f"[{m.group(1)}]", str(text or ""))
 
 
 class FalsifierAngle(str, Enum):

@@ -178,6 +178,12 @@ def _replay(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _improvement_budget(args: argparse.Namespace, remaining: float) -> float:
+    """Piece 8's own ceiling: what --hard-cap left, further bounded by --improve-cap if given."""
+    cap = getattr(args, "improve_cap", None)
+    return round(remaining if cap is None else min(remaining, cap), 8)
+
+
 def _replay_improve(
     args: argparse.Namespace,
     state_dir: Path,
@@ -201,9 +207,10 @@ def _replay_improve(
             return 1, {}, 0.0
     client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
     loop.client = client
-    meter = MeteredClient(client, hard_cap_usd=args.hard_cap, max_concurrent_calls=args.max_concurrent)
+    budget = _improvement_budget(args, args.hard_cap)
+    meter = MeteredClient(client, hard_cap_usd=budget, max_concurrent_calls=args.max_concurrent)
     loop.client = meter
-    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, args.hard_cap / (2 if loop.paired_sandbox else 1))
+    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, budget / (2 if loop.paired_sandbox else 1))
     try:
         res = loop.run_post_run_improvement(
             feed.events,
@@ -237,10 +244,12 @@ def _run_improvement(
     if remaining <= 0:
         summary["self_improvement"] = {"skipped": "hard cap exhausted by the arena run"}
         return
-    meter = MeteredClient(client, hard_cap_usd=remaining, max_concurrent_calls=args.max_concurrent)
+    budget = _improvement_budget(args, remaining)
+    summary["self_improvement_budget_usd"] = budget
+    meter = MeteredClient(client, hard_cap_usd=budget, max_concurrent_calls=args.max_concurrent)
     loop.client = meter
     # A paired A/B runs two sandboxes (candidate + current version): split what's left
-    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, remaining / (2 if loop.paired_sandbox else 1))
+    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, budget / (2 if loop.paired_sandbox else 1))
     try:
         summary["self_improvement"] = loop.run_post_run_improvement(
             harness.arena_feed.events,
@@ -276,6 +285,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--restore-version", type=str, default="", help="Restore a registry version in --state-dir before running")
     parser.add_argument("--list-versions", action="store_true", help="List versions in --state-dir and exit (no model calls)")
     parser.add_argument("--no-improve", action="store_true", help="Skip the Piece 8 post-run improvement loop")
+    parser.add_argument(
+        "--improve-cap",
+        type=_positive_float,
+        default=None,
+        help="USD ceiling for the Piece 8 loop (default: whatever --hard-cap leaves after the arena)",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON summary in addition to Tron Arena view")
     parser.add_argument("--quiet", action="store_true", help="Do not print the ASCII arena")
     parser.add_argument("--mock", action="store_true", help="Force mock backend even if NEBIUS_API_KEY is set")

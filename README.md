@@ -61,6 +61,7 @@ stored case's `wins` instead of piling up duplicates. Real scale is `--starters 
 | `--restore-version` | — | restore a registry version in `--state-dir` before running |
 | `--list-versions` | off | print active, pinned, and historical versions in `--state-dir` as JSON and exit |
 | `--no-improve` | off | skip the Piece 8 post-run loop |
+| `--improve-cap` | — | USD ceiling for the Piece 8 loop (default: whatever `--hard-cap` leaves after the arena; the summary records `self_improvement_budget_usd`) |
 | `--max-retries` | 3 | live retries on 429/5xx/network errors |
 | `--max-concurrent` | 32 | max in-flight model calls across all branches |
 | `--summary-out` | — | write the run summary JSON (spend, winners, self-improvement; also works with `--replay`) |
@@ -169,6 +170,16 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   `api_estimated_usage_calls`) instead of $0. Calls billed above their
   reservation are counted in `reservation_overruns`; `hard_cap_overrun_usd`
   exposes any unavoidable provider-side overrun instead of hiding it.
+- **One paid verdict per branch per selection round.** Once a pair comes back `overlap`,
+  both branches belong to that merge; later candidate pairs touching either are skipped
+  instead of buying a Super verdict on a branch about to be absorbed (the merged child is
+  compared afresh next round). On the mock demo this took the ratio from 24 judgments → 9
+  merges to 20 → 14; at `--starters 9`, 24 → 3 became 16 → 8. Equal-similarity ties go to
+  pairs from different starter trees (`PFPTracker.starter_roots` walks parent + merge edges).
+- **Merges must leave the finish they create.** A merge buys a synthesis call and a post-merge
+  falsification, and the child it makes still needs the Pass gauntlet plus a pre-exit check.
+  After the first merge the harness learns that round-trip cost and stops merging once the
+  root budget can't cover one more merge *and* `gauntlet_rounds + 1` falsifications.
 - **Selection is paid for.** Each branch keeps a protected verification share
   (30% by default) that exploration and child spawning can't touch; split
   parents' idle budgets return to the finish reserve when selection begins.
@@ -188,6 +199,11 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - **The alignment pre-filter matches concepts on whole words.** Concept anchors used
   to be substring tests, so "report" hit *port*, "monkey" hit *key* and "ghost" hit
   *host*, and unrelated branches cleared the 0.20 threshold into a paid Super judge call.
+- **Every Super prompt quotes branch text as evidence, not orders.** Claim extraction, the
+  alignment judge and the merge synthesizer fence model-written positions in `<branch_text>`
+  exactly like the fail judge (v0.14), so a branch can't talk the alignment judge into an
+  `overlap` verdict or smuggle commands into the merged child. Extracted claims are
+  de-duplicated (case / whitespace-insensitive) before they reach the judge.
 - **Branches can't rule on themselves.** The judge prompt quotes model-written text
   inside `<branch_text>` / `<context>` fences, tells the judge that instructions in
   there are evidence against the branch, and defangs any fence tag a reply writes

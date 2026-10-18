@@ -256,6 +256,11 @@ class BudgetLedger:
             prev = self._cost_ema.get(kind)
             self._cost_ema[kind] = cost_usd if prev is None else round(0.7 * prev + 0.3 * cost_usd, 8)
 
+    def observed_cost(self, kind: str) -> Optional[float]:
+        """The learned (EMA) cost of `kind`, or None if no such call has been paid for yet."""
+        with self._lock:
+            return self._cost_ema.get(kind)
+
     def estimate_call_cost(self, kind: str) -> float:
         with self._lock:
             return self._cost_ema.get(kind, self.estimated_cost_per_call_usd)
@@ -1028,6 +1033,26 @@ class MainHarness:
     # ------------------------------------------------------------------
     # Selection (Pieces 4-6)
     # ------------------------------------------------------------------
+    def _can_afford_merge(self) -> bool:
+        """
+        True while the root budget covers one more merge round trip (synthesis + post-merge check)
+        *and* still leaves the finish for the child it creates: a merged child is only worth
+        anything if it can run the Pass gauntlet plus the pre-exit check. Costs are the ones
+        learned from merges already paid for this run; before the first merge nothing is known,
+        so the first merge is gated by headroom alone.
+        """
+        ledger = self.budget_ledger
+        headroom = ledger.root_budget_usd - ledger.total_spent_usd
+        if headroom <= 0.0:
+            return False
+        if ledger.observed_cost("merge_round_trip") is None:
+            return True
+        finish_calls = self.fail_judge.gauntlet_rounds + 1
+        need = ledger.estimate_call_cost("merge_round_trip") + finish_calls * ledger.estimate_call_cost(
+            "merge_falsification"
+        )
+        return headroom >= need
+
     def _charge_alignment(self, al: Any) -> None:
         """Split a judge call's real cost across the two branches it compared (verification work)."""
         half_cost = al.cost_usd / 2.0
@@ -1124,7 +1149,7 @@ class MainHarness:
                 break
             rounds_run += 1
             alignments = self.alignment_detector.detect_alignments(
-                self.tracker.active_branches(), max_pairs_to_judge=8
+                self.tracker.active_branches(), max_pairs_to_judge=8, roots_of=self.tracker.starter_roots
             )
             for al in alignments:
                 self._charge_alignment(al)
@@ -1161,6 +1186,11 @@ class MainHarness:
                 bb = self.tracker.get(al.branch_b_id)
                 if not (ba.is_alive and bb.is_alive):
                     continue
+                # A merge buys a synthesis call plus its post-merge falsification. Once the root
+                # budget can't cover another one (learned from the merges already paid for), stop
+                # cooperating and keep what's left for the pre-exit finish
+                if self._should_stop() or not self._can_afford_merge():
+                    break
                 child_id = self._next_branch_id()
                 merge_res = self.merge_synthesizer.merge_branches(ba.id, bb.id, child_id, alignment=al)
                 merges_performed.append(merge_res.to_dict())
@@ -1168,6 +1198,10 @@ class MainHarness:
                 # Schedule Trigger 1: after every merge (new claims -> verify before going anywhere)
                 post_merge_out = self.fail_judge.verify_after_merge(child_id)
                 falsifications_run.append(post_merge_out.to_dict())
+                self.budget_ledger.observe_call_cost(
+                    "merge_round_trip", merge_res.synthesis_cost_usd + post_merge_out.cost_usd
+                )
+                self.budget_ledger.observe_call_cost("merge_falsification", post_merge_out.cost_usd)
                 if self.tracker.get(child_id).is_alive:
                     self.tracker.update_branch(
                         child_id,

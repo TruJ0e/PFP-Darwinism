@@ -29,7 +29,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
 
 
 class BranchState(str, Enum):
@@ -390,6 +390,24 @@ class PFPTracker:
                 curr_id = rec.parent
             chain.reverse()
             return chain
+
+    def starter_roots(self, branch_id: str) -> FrozenSet[str]:
+        """Starter IDs reachable through `parent` and every `merge_parents` edge (the lineage DAG)."""
+        with self._lock:
+            roots: set = set()
+            queue: List[str] = [branch_id]
+            visited: set = set()
+            while queue:
+                curr_id = queue.pop()
+                if curr_id in visited or curr_id not in self._records:
+                    continue
+                visited.add(curr_id)
+                rec = self._records[curr_id]
+                parents = ([rec.parent] if rec.parent else []) + list(rec.merge_parents)
+                if not parents:
+                    roots.add(curr_id)
+                queue.extend(parents)
+            return frozenset(roots)
 
     def known_forks_in_lineage(self, branch_id: str) -> List[str]:
         """
