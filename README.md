@@ -215,6 +215,13 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   absorptions and the child's registration run under one tracker lock (`PFPTracker.atomic()`),
   so a worker can't kill a parent, or take the child id, halfway through and strand an absorbed,
   zeroed parent with no child to carry its budget.
+- **A merged child earns its own survivals.** Survival credit belongs to the text that survived.
+  A merge child is a new synthesis no judge has seen, but before v0.33 it inherited the larger of
+  its parents' `survived_falsifications`: +3 certainty per inherited survival, skipped by the
+  background falsifier's untested-first pass, compounding with every round of merging. On the mock
+  demo the winner read `Survived: 8` over a proof trail listing 5 tests (certainty 33 vs 24). The
+  child now starts at 0 and keeps `merges_attracted`; parents keep the survivals they earned, and
+  every branch's count equals its own `pass_provenance`.
 - **Selection is paid for.** Each branch keeps a protected verification share
   (30% by default) that exploration and child spawning can't touch; split
   parents' idle budgets return to the finish reserve when selection begins.

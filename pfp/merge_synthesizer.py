@@ -181,7 +181,9 @@ class MergeSynthesizer:
         # Child starts Possible (NEVER Passed), at max depth of parents + 1
         child_depth = max(parent_a.depth, parent_b.depth) + 1
         combined_merges = parent_a.merges_attracted + parent_b.merges_attracted + 1
-        combined_survived = max(parent_a.survived_falsifications, parent_b.survived_falsifications)
+        # The child's text is new claims no judge has seen: survival credit belongs to the text that
+        # survived, so the child starts at 0 and earns its own (post-merge check, gauntlet). The
+        # parents' survivals stay on their records and in the child's ancestry.
         initial_certainty = round(max(parent_a.certainty_score, parent_b.certainty_score) + 1.5, 4)
 
         # Zero out parents' remaining budgets (transferred to child) and mark both ABSORBED (terminal)
@@ -204,7 +206,7 @@ class MergeSynthesizer:
         child_rec.merge_provenance = provenance
         self.tracker.update_branch(
             child_branch_id,
-            survived_falsifications=combined_survived,
+            survived_falsifications=0,
             merges_attracted=combined_merges,
             open_critic_objections=0,
             reasoning_step=f"[Merged {branch_a_id} + {branch_b_id}] {unified_reasoning}",
