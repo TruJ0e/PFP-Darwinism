@@ -31,7 +31,7 @@ from pfp import (
     OpenAICompatibleClient,
     SelfImprovementLoop,
 )
-from pfp.backend import prompt_token_upper_bound, request_token_upper_bound
+from pfp.backend import request_token_upper_bound
 
 
 def test_arena_feed_payloads_are_deeply_detached_and_hash_chained(tmp_path):

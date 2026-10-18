@@ -170,6 +170,19 @@ def _configuration_float(value: Any, name: str, *, minimum: float, inclusive: bo
     return number
 
 
+def _refuse_streaming(kwargs: Dict[str, Any]) -> None:
+    """Refuse streamed requests before dispatch: this harness parses one JSON body.
+
+    A server-sent-event reply is billed by the provider but unreadable as JSON, so the live
+    client would count it as an unusable billed attempt, retry, and pay again on every
+    attempt before failing.  Fail closed instead of buying a response nothing can read.
+    """
+    stream = kwargs.get("stream")
+    if stream is None or stream is False:
+        return
+    raise ValueError("stream must be False or omitted: PFP parses non-streamed completions only")
+
+
 def _message_text(value: Any) -> str:
     """Normalize message content: providers may send null, a string, or a list of content parts."""
     if value is None:
@@ -439,6 +452,7 @@ class _LiveChatCompletions:
         # request body is built so a direct (unmetered) client cannot dispatch more
         # samples than its accounting bound understood.
         n = _configuration_int(n, "n", minimum=1)
+        _refuse_streaming(kwargs)
         target_model = model or self.default_model
         payload: Dict[str, Any] = {
             "model": target_model,
@@ -680,6 +694,9 @@ class MeteredClient:
         return reservation
 
     def _metered_create(self, *args: Any, **kwargs: Any) -> Any:
+        # Refused before any reservation or slot: an inner client that streamed would hand
+        # back an iterator with no usage, and the call could never be booked truthfully.
+        _refuse_streaming(kwargs)
         reservation = self._reserve_call(args, kwargs)
         try:
             with self._slots:
@@ -1235,6 +1252,10 @@ class _MockChatCompletions:
         n: int = 1,
         **kwargs: Any,
     ) -> ChatCompletionResponse:
+        # Same request contract as the live client, so code that runs on the mock cannot
+        # send a sample count or streaming flag the live backend would refuse.
+        n = _configuration_int(n, "n", minimum=1)
+        _refuse_streaming(kwargs)
         with self._count_lock:
             self._call_count += 1
             call_no = self._call_count
@@ -1243,7 +1264,7 @@ class _MockChatCompletions:
 
         choices: List[Choice] = []
         total_out_tokens = 0
-        for i in range(max(1, n)):
+        for i in range(n):
             content, high_entropy = self._generate_one_content(prompt_text, temperature, i)
             out_tokens = max(16, len(content.split()) * 2)
             total_out_tokens += out_tokens

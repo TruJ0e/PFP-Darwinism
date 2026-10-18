@@ -183,6 +183,11 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   future OpenAI-compatible request fields participate in the input-token reservation and in
   missing-usage fallback billing. A tiny chat message cannot hide a large billable schema
   outside the hard-cap preflight.
+- **The request contract fails closed.** `stream=True` (or any truthy `stream`) is refused
+  by the live client, the mock, and the meter before a reservation or request: an SSE reply
+  is billed but unreadable as JSON, so each retry would pay again for nothing. The mock now
+  validates `n` exactly like the live client, so code that passes on the mock cannot send a
+  sample count the live backend refuses.
 - **One cap for the whole command.** The post-run self-improvement loop
   (assessment, anti-model, proposition, sandbox run) is metered against what the
   arena left under `--hard-cap`; the summary reports `total_api_spend_usd` =
