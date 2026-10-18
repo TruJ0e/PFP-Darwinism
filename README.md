@@ -328,6 +328,17 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   through. The CLI splits the remaining sandbox budget across the pair;
   `SelfImprovementLoop(paired_sandbox=False)` restores the single-run behaviour.
 
+- **The A/B is scored on a yardstick no proposition can rewrite.** Certainty weights and
+  `gauntlet_rounds` are dials, and each sandbox side used to be scored by its winner's
+  certainty in its *own* weights. On the mock, raising `survived_falsifications_weight` 3.0 → 3.25
+  lifted an identical winner from 22.5 to 24.75 and was adopted as an improvement; lowering it to
+  1.0 read as a 53% degradation and was auto-reverted for doing nothing; `gauntlet_rounds: 9` scored
+  40.5 by testing more, not reasoning better. Both sides, and the live-run fallback baseline
+  (`spend_efficiency.max_winner_evidence`), are now scored by `dials.evidence_score`: survived
+  falsifications, merges attracted and open objections on the factory weights
+  (`dials.REFERENCE_WEIGHTS`), with survivals from gauntlet rounds past the reference three left
+  uncounted (a candidate that runs fewer rounds still loses what it skipped). Every sandbox record
+  names its `score_yardstick` and keeps the candidate-weight figure as `certainty_score`.
 - Proposed dial changes are untrusted input: `pfp/dials.py` rejects unknown
   keys, non-numeric values, NaN/inf, and anything outside the safe envelope
   (e.g. `gauntlet_rounds: 0`, rewarding open objections). Rejections are

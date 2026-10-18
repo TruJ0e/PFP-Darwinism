@@ -42,10 +42,13 @@ from .alignment_detector import _UNTRUSTED_NOTICE, fence_untrusted
 from .arena import ARENA_LEVEL_EVENT_TYPES, CANONICAL_EVENT_TYPES, ArenaEvent
 from .backend import SUPER_MODEL
 from .fsutil import atomic_write_text
-from .dials import DEFAULT_DIALS, resolve_dials, sanitize_dials, weights_from_dials
+from .dials import DEFAULT_DIALS, evidence_score, resolve_dials, sanitize_dials, weights_from_dials
 from .issue_detector import _jaccard_similarity
 from .jsonutil import as_str_list, parse_json_object
 
+
+# What `SandboxResult.score` measures (recorded on every sandbox record; see dials.evidence_score)
+SCORE_YARDSTICK = "reference_evidence_v1"
 
 _SNAPSHOT_STATUSES = frozenset({"baseline", "adopted", "reverted", "rejected_sandbox"})
 
@@ -186,7 +189,9 @@ class EventLogMiner:
                     "merge_parents": list(w.get("merge_parents", [])),
                     "merges_attracted": int(w.get("merges_attracted", 0)),
                     "survived_falsifications": int(w.get("survived_falsifications", 0)),
+                    "open_critic_objections": int(w.get("open_critic_objections", 0) or 0),
                     "certainty_score": float(w.get("certainty_score", 0.0)),
+                    "evidence_score": evidence_score(w),
                     "fork_shape": str(w.get("fork_under_exploration", "")),
                     "solution": str(w.get("solution", "")),
                     "origin": str(w.get("origin", "")),
@@ -218,6 +223,8 @@ class EventLogMiner:
         max_winner_certainty = (
             max((float(w.get("certainty_score", 0.0)) for w in winners), default=0.0)
         )
+        # The version-invariant yardstick (dials.evidence_score): the sandbox A/B baseline
+        max_winner_evidence = max((evidence_score(w) for w in winners), default=0.0)
         mean_certainty = (
             sum(float(b.get("certainty_score", 0.0)) for b in branches.values())
             / float(max(1, len(branches)))
@@ -226,6 +233,7 @@ class EventLogMiner:
         spend_efficiency = {
             "total_spent_usd": round(total_spent_usd, 6),
             "max_winner_certainty": round(max_winner_certainty, 4),
+            "max_winner_evidence": round(max_winner_evidence, 4),
             "mean_branch_certainty": round(mean_certainty, 4),
             "winner_certainty_per_usd": round(max_winner_certainty / denom, 4),
             "pass_rate": round(len(winners) / float(max(1, len(branches))), 4),
@@ -283,9 +291,12 @@ class SandboxResult:
     total_spent_usd: float
     details: str = ""
     halted_reason: Optional[str] = None
+    # Max winner certainty on the run's own (candidate) weights: informational only. `score` is
+    # `dials.evidence_score` on the reference weights, so a candidate can't win by reweighting.
+    certainty_score: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "coherent": self.coherent,
             "halted_reason": self.halted_reason,
             "test_problem": self.test_problem,
@@ -294,7 +305,11 @@ class SandboxResult:
             "passed_branches": self.passed_branches,
             "total_spent_usd": round(self.total_spent_usd, 6),
             "details": self.details,
+            "score_yardstick": SCORE_YARDSTICK,
         }
+        if self.certainty_score is not None:
+            out["certainty_score"] = round(self.certainty_score, 4)
+        return out
 
 
 @dataclass
@@ -1245,14 +1260,17 @@ class SelfImprovementLoop:
         winners = summary.get("winners_box", [])
         passed_count = len(winners)
         top_cert = max((float(w.get("certainty_score", 0.0)) for w in winners), default=0.0)
+        # Scored on the reference weights, not the candidate's own (see dials.REFERENCE_WEIGHTS)
+        top_evidence = max((evidence_score(w) for w in winners), default=0.0)
         halted = summary.get("halted_reason")
         # A sandbox that was cut short (cap, backend failure) proves nothing about the candidate
-        coherent = halted is None and passed_count > 0 and top_cert > 0.0
+        coherent = halted is None and passed_count > 0 and top_evidence > 0.0
 
         return SandboxResult(
             coherent=coherent,
             test_problem=test_problem,
-            score=top_cert,
+            score=top_evidence,
+            certainty_score=top_cert,
             baseline_score=baseline_score,
             passed_branches=passed_count,
             total_spent_usd=float(summary["budget"]["api_spend_usd"]),
@@ -1260,7 +1278,10 @@ class SelfImprovementLoop:
             details=(
                 f"Sandbox halted ({halted}) before it could validate the candidate"
                 if halted
-                else f"Sandbox produced {passed_count} winner(s) with max certainty {top_cert:.2f}"
+                else (
+                    f"Sandbox produced {passed_count} winner(s) with max evidence score "
+                    f"{top_evidence:.2f} (certainty {top_cert:.2f} on candidate weights)"
+                )
             ),
         )
 
@@ -1291,7 +1312,8 @@ class SelfImprovementLoop:
         new_prompts = copy.deepcopy(cur_ver.prompts)
         new_prompts.update(proposition.prompt_changes)
 
-        baseline_score = metrics.spend_efficiency.get("max_winner_certainty", 5.0)
+        # Same yardstick as the sandbox score: the live run's certainty is in its own weights
+        baseline_score = metrics.spend_efficiency.get("max_winner_evidence", 5.0)
         baseline_source = "run_metrics"
         baseline_sandbox: Optional[SandboxResult] = None
         if run_sandbox:

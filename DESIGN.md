@@ -205,6 +205,9 @@ post-run replay — same data.
 - Version registry: every rewrite snapshots code/config/prompts, hashed,
   with proposition + sandbox result attached.
 - Auto-revert on degradation past threshold (no human needed).
+  Degradation is measured on a fixed yardstick (factory certainty weights, reference
+  gauntlet length), never on the dials under test: a rewrite that only changes how
+  certainty is counted must not look like better or worse reasoning.
 - Manual pin: any version, anytime; all future runs use it.
 - Run-boundary switching: versions change between runs, never mid-arena.
   Emergency stop kills the run; rollback applies next.

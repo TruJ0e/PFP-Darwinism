@@ -170,5 +170,5 @@ def test_baseline_sandbox_cut_short_falls_back_to_the_live_run_baseline():
     sb = res["sandbox_result"]
     assert sb["baseline_source"] == "run_metrics_fallback"
     assert sb["baseline_sandbox"]["halted_reason"] == "hard_cap"
-    assert sb["baseline_score"] == res["mined_metrics"]["spend_efficiency"]["max_winner_certainty"] > 0.1
+    assert sb["baseline_score"] == res["mined_metrics"]["spend_efficiency"]["max_winner_evidence"] > 0.1
     assert res["auto_revert_check"]["reverted"] is True
