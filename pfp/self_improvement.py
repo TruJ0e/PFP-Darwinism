@@ -44,6 +44,34 @@ from .issue_detector import _jaccard_similarity
 from .jsonutil import as_str_list, parse_json_object
 
 
+_SNAPSHOT_STATUSES = frozenset({"baseline", "adopted", "reverted", "rejected_sandbox"})
+
+
+def _finite_number(value: Any, name: str) -> float:
+    """Coerce a control-plane number without admitting bool, NaN, or infinity."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number, not bool.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number.") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite.")
+    return number
+
+
+def _json_control_object(value: Any, name: str) -> Dict[str, Any]:
+    """Return a detached JSON object, rejecting values that cannot be persisted exactly."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object.")
+    try:
+        encoded = json.dumps(value, allow_nan=False, sort_keys=True, ensure_ascii=False)
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must contain finite JSON data: {exc}") from exc
+    return decoded
+
+
 @dataclass
 class MinedArenaMetrics:
     """
@@ -311,7 +339,10 @@ class VersionRegistry:
         initial_prompts: Optional[Dict[str, str]] = None,
         degradation_threshold: float = 0.15,
     ) -> None:
-        self.degradation_threshold = degradation_threshold
+        threshold = _finite_number(degradation_threshold, "degradation_threshold")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("degradation_threshold must be between 0 and 1.")
+        self.degradation_threshold = threshold
         self._versions: Dict[str, VersionSnapshot] = {}
         self._version_order: List[str] = []
         self.active_version_id: str = ""
@@ -379,6 +410,8 @@ class VersionRegistry:
                 "Cannot adopt a new version while a live run is in progress; versions switch only between runs."
             )
 
+        if status not in _SNAPSHOT_STATUSES:
+            raise ValueError(f"Unknown version status: {status!r}")
         clean_dials, rejected_dials = sanitize_dials(config_dials or {})
         if rejected_dials:
             raise ValueError(f"Cannot register version with invalid config_dials: {rejected_dials}")
@@ -386,17 +419,26 @@ class VersionRegistry:
             raise ValueError("prompts must be a dict of string keys and values")
         clean_prompts: Dict[str, str] = {}
         for k, v in prompts.items():
-            ks, vs = str(k), str(v)
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ValueError("prompts must contain only string keys and values")
+            ks, vs = k, v
             if len(vs) > 4000:
                 raise ValueError(f"Prompt {ks!r} exceeds maximum length of 4000 characters")
             clean_prompts[ks] = vs
 
+        clean_proposition = _json_control_object(proposition, "proposition")
+        clean_sandbox = _json_control_object(sandbox_result, "sandbox_result")
+        coherent = clean_sandbox.get("coherent", True)
+        if not isinstance(coherent, bool):
+            raise ValueError("sandbox_result.coherent must be a boolean when present")
+
         code_hashes = self._compute_code_hashes()
-        full_hash = self._hash_payload(clean_dials, clean_prompts, code_hashes, proposition, sandbox_result)
+        full_hash = self._hash_payload(
+            clean_dials, clean_prompts, code_hashes, clean_proposition, clean_sandbox
+        )
         vid = f"v{len(self._version_order) + 1:03d}_{full_hash[:8]}"
         parent_id = self.active_version_id or None
 
-        coherent = bool(sandbox_result.get("coherent", True))
         if not coherent:
             status = "rejected_sandbox"
             adopt = False
@@ -409,8 +451,8 @@ class VersionRegistry:
             config_dials=copy.deepcopy(clean_dials),
             prompts=copy.deepcopy(clean_prompts),
             code_snapshot_hashes=code_hashes,
-            proposition=copy.deepcopy(proposition),
-            sandbox_result=copy.deepcopy(sandbox_result),
+            proposition=clean_proposition,
+            sandbox_result=clean_sandbox,
             status=status,
         )
         self._versions[vid] = snap
@@ -422,8 +464,8 @@ class VersionRegistry:
                     "version_id": vid,
                     "sha256_hash": full_hash,
                     "reason": "rejected_by_sandbox",
-                    "proposition": copy.deepcopy(proposition),
-                    "sandbox_result": copy.deepcopy(sandbox_result),
+                    "proposition": copy.deepcopy(clean_proposition),
+                    "sandbox_result": copy.deepcopy(clean_sandbox),
                 }
             )
             return snap
@@ -493,9 +535,11 @@ class VersionRegistry:
     @classmethod
     def _from_raw(cls, raw: Dict[str, Any]) -> "VersionRegistry":
         reg = cls.__new__(cls)
-        reg.degradation_threshold = float(raw.get("degradation_threshold", 0.15))
-        if not math.isfinite(reg.degradation_threshold) or reg.degradation_threshold < 0.0:
-            raise ValueError("Registry degradation_threshold must be finite and non-negative.")
+        reg.degradation_threshold = _finite_number(
+            raw.get("degradation_threshold", 0.15), "Registry degradation_threshold"
+        )
+        if not 0.0 <= reg.degradation_threshold <= 1.0:
+            raise ValueError("Registry degradation_threshold must be between 0 and 1.")
         reg._versions = {}
         reg._version_order = []
         reg.run_in_progress = False
@@ -519,6 +563,24 @@ class VersionRegistry:
                 sandbox_result=dict(v.get("sandbox_result", {})),
                 status=str(v.get("status", "adopted")),
             )
+            if snap.status not in _SNAPSHOT_STATUSES:
+                raise ValueError(
+                    f"Version {snap.version_id} has unknown status {snap.status!r}."
+                )
+            if not isinstance(v.get("prompts", {}), dict) or any(
+                not isinstance(k, str) or not isinstance(val, str)
+                for k, val in v.get("prompts", {}).items()
+            ):
+                raise ValueError(f"Version {snap.version_id} prompts must be strings.")
+            _json_control_object(snap.proposition, f"Version {snap.version_id} proposition")
+            clean_sandbox = _json_control_object(
+                snap.sandbox_result, f"Version {snap.version_id} sandbox_result"
+            )
+            coherent = clean_sandbox.get("coherent", True)
+            if not isinstance(coherent, bool):
+                raise ValueError(
+                    f"Version {snap.version_id} sandbox_result.coherent must be a boolean."
+                )
             expected = cls._hash_payload(
                 snap.config_dials,
                 snap.prompts,
@@ -655,6 +717,11 @@ class VersionRegistry:
         """
         if self.run_in_progress:
             raise RunBoundarySwitchError("Auto-revert evaluation must run between runs, not mid-run.")
+
+        measured_score = _finite_number(measured_score, "measured_score")
+        baseline_score = _finite_number(baseline_score, "baseline_score")
+        if measured_score < 0.0 or baseline_score < 0.0:
+            raise ValueError("measured_score and baseline_score must be non-negative.")
 
         cur = self.get_version()
         if baseline_score <= 0:

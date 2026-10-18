@@ -47,6 +47,11 @@ its past certainty scaled by how similar its problem is to this one, and a repea
 stored case's `wins` instead of piling up duplicates. Real scale is `--starters 9`
 (odd: no arbitration ties).
 
+Registry control data is validated before admission: rollback thresholds and scores must
+be finite, sandbox coherence is a real boolean, prompts remain strings, and proposition /
+sandbox payloads must be persistable JSON. A rejected rewrite leaves registry state intact,
+so malformed self-improvement output cannot disable auto-revert or create an unsavable version.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--starters` | 3 | starter agents (3 demo, 9 real) |
