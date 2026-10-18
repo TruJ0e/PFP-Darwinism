@@ -234,6 +234,12 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   cut-off chain of thought cannot accidentally pass or kill a branch.
 - **Falsification fails closed.** A judge reply with no readable verdict is
   *inconclusive*: no survival credit, no kill, no appeal consumed, and no Pass.
+  That holds for the appeal too: a kill is irreversible, so it needs a readable
+  verdict from both judges; a verdict-less appeal hands the appeal back and the
+  branch lives. Verdicts commit against live state under the ledger lock: a branch
+  killed or absorbed while the judge was out earns no credit, is not appealed (no
+  paid call on the dead), and is never journaled as a second `fail`; a branch
+  promoted meanwhile has its Pass revoked instead of raising.
 - **The alignment pre-filter matches concepts on whole words.** Concept anchors used
   to be substring tests, so "report" hit *port*, "monkey" hit *key* and "ghost" hit
   *host*, and unrelated branches cleared the 0.20 threshold into a paid Super judge call.

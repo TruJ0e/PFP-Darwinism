@@ -326,31 +326,27 @@ class FailJudge:
         self._record_cost(branch_id, cost, f"falsify_{schedule_trigger}_{chosen_angle.value}")
 
         if survived is None:
-            outcome = FalsificationOutcome(
-                branch_id=branch_id,
-                schedule_trigger=schedule_trigger,
-                survived=False,
-                angle=chosen_angle.value,
-                judge_id=primary_judge,
-                rationale=rationale,
-                cost_usd=total_cost,
-                transitioned_to=self.tracker.get(branch_id).state.value,
-                inconclusive=True,
-            )
-            self._emit("falsification_inconclusive", branch_id, outcome.to_dict())
-            return outcome
+            return self._inconclusive(branch_id, schedule_trigger, chosen_angle, primary_judge, rationale, total_cost)
 
         appeal_attempted = False
         appeal_overturned = False
         appeal_judge = ""
 
-        # One appeal per kill: re-test with a different judge; survive and the verdict's overturned
-        if not survived and not rec.appeal_used:
+        # One appeal per kill: re-test with a different judge; survive and the verdict's overturned.
+        # The appeal is claimed under the ledger lock (two workers can't both spend the one appeal)
+        # and only for a branch still alive after the primary call (never pay to appeal the dead).
+        claimed_appeal = False
+        if not survived:
+            with self.tracker.atomic():
+                rec = self.tracker.get(branch_id)
+                if rec.is_alive and not rec.appeal_used:
+                    rec.appeal_used = True
+                    claimed_appeal = True
+        if claimed_appeal:
             appeal_attempted = True
-            rec.appeal_used = True
             appeal_judge = "super_judge_appeal_secondary"
             app_survived, app_obj, app_rat, app_cost = self._run_single_attack(
-                rec,
+                self.tracker.get(branch_id),
                 chosen_angle,
                 schedule_trigger=f"{schedule_trigger}_appeal",
                 judge_id=appeal_judge,
@@ -359,6 +355,21 @@ class FailJudge:
             )
             total_cost += app_cost
             self._record_cost(branch_id, app_cost, f"appeal_{schedule_trigger}")
+            if app_survived is None:
+                # Fail closed: an appeal with no verdict upholds nothing. A kill is irreversible, so
+                # it needs a readable verdict from both judges; the unheard appeal is handed back.
+                with self.tracker.atomic():
+                    self.tracker.get(branch_id).appeal_used = False
+                return self._inconclusive(
+                    branch_id,
+                    schedule_trigger,
+                    chosen_angle,
+                    primary_judge,
+                    f"Appeal by {appeal_judge} gave no verdict ({app_rat}); kill not upheld",
+                    total_cost,
+                    objection=objection,
+                    appeal_judge=appeal_judge,
+                )
             if app_survived is True:
                 survived = True
                 appeal_overturned = True
@@ -368,28 +379,35 @@ class FailJudge:
                 objection = app_obj or objection
                 rationale = f"Kill upheld on appeal by {appeal_judge}: {app_rat}"
 
-        rec = self.tracker.get(branch_id)
         if survived:
-            now = time.time()
-            rec.pass_provenance.append(
-                PassProvenanceRecord(
-                    survived_what=f"{schedule_trigger}:{chosen_angle.value}",
-                    timestamp=now,
-                    falsifier_angle=chosen_angle.value,
-                    judge_id=appeal_judge if appeal_overturned else primary_judge,
-                )
-            )
-            self.tracker.update_branch(
-                branch_id,
-                survived_falsifications=rec.survived_falsifications + 1,
-                open_critic_objections=0,
-                tested=True,
-            )
-            self._refresh_branch_certainty(branch_id)
+            # Credit lands only on a branch still alive when the verdict commits: a branch killed or
+            # absorbed while the judge was out earns no provenance, no survival, no certainty
+            with self.tracker.atomic():
+                rec = self.tracker.get(branch_id)
+                credited = rec.is_alive
+                if credited:
+                    rec.pass_provenance.append(
+                        PassProvenanceRecord(
+                            survived_what=f"{schedule_trigger}:{chosen_angle.value}",
+                            timestamp=time.time(),
+                            falsifier_angle=chosen_angle.value,
+                            judge_id=appeal_judge if appeal_overturned else primary_judge,
+                        )
+                    )
+                    self.tracker.update_branch(
+                        branch_id,
+                        survived_falsifications=rec.survived_falsifications + 1,
+                        open_critic_objections=0,
+                        tested=True,
+                    )
+            if credited:
+                self._refresh_branch_certainty(branch_id)
+            else:
+                rationale = f"{rationale} (branch became {rec.state.value} before the verdict landed; no credit)"
             outcome = FalsificationOutcome(
                 branch_id=branch_id,
                 schedule_trigger=schedule_trigger,
-                survived=True,
+                survived=credited,
                 angle=chosen_angle.value,
                 judge_id=primary_judge,
                 appeal_attempted=appeal_attempted,
@@ -400,29 +418,33 @@ class FailJudge:
                 cost_usd=total_cost,
                 transitioned_to=rec.state.value,
             )
-            self._emit("falsification_survived", branch_id, outcome.to_dict())
+            if credited:
+                self._emit("falsification_survived", branch_id, outcome.to_dict())
             return outcome
 
-        # Kill confirmed -> transition to FAIL (or revoke Pass -> FAIL if it was already Pass)
-        was_pass = rec.state == BranchState.PASS
-        if was_pass:
-            self.tracker.revoke_pass(
-                branch_id,
-                demote_to=BranchState.FAIL,
-                reason=f"falsified_on_{schedule_trigger}:{chosen_angle.value}",
-            )
-        elif rec.state == BranchState.POSSIBLE:
-            self.tracker.transition(
-                branch_id,
-                BranchState.FAIL,
-                reason=f"falsified_on_{schedule_trigger}:{chosen_angle.value}",
-            )
-        self.tracker.update_branch(
-            branch_id,
-            open_critic_objections=rec.open_critic_objections + 1,
-            tested=True,
-        )
-        self._refresh_branch_certainty(branch_id)
+        # Kill confirmed -> transition to FAIL (or revoke Pass -> FAIL if it was already Pass). The
+        # state is re-read and written under one lock: the branch may have been promoted, demoted,
+        # killed or absorbed while the judges were out, and a stale read either raised an illegal
+        # transition or journaled a "fail" for a branch that was already gone.
+        kill_reason = f"falsified_on_{schedule_trigger}:{chosen_angle.value}"
+        with self.tracker.atomic():
+            rec = self.tracker.get(branch_id)
+            prior_state = rec.state
+            killed = rec.is_alive
+            if prior_state == BranchState.PASS:
+                self.tracker.revoke_pass(branch_id, demote_to=BranchState.FAIL, reason=kill_reason)
+            elif prior_state == BranchState.POSSIBLE:
+                self.tracker.transition(branch_id, BranchState.FAIL, reason=kill_reason)
+            if killed:
+                self.tracker.update_branch(
+                    branch_id,
+                    open_critic_objections=rec.open_critic_objections + 1,
+                    tested=True,
+                )
+        if killed:
+            self._refresh_branch_certainty(branch_id)
+        else:
+            rationale = f"{rationale} (branch already {prior_state.value} before the verdict landed; no kill)"
 
         outcome = FalsificationOutcome(
             branch_id=branch_id,
@@ -436,16 +458,48 @@ class FailJudge:
             objection=objection,
             rationale=rationale,
             cost_usd=total_cost,
-            transitioned_to=BranchState.FAIL.value,
+            transitioned_to=BranchState.FAIL.value if killed else prior_state.value,
         )
+        if not killed:
+            return outcome
         self._emit("fail", branch_id, outcome.to_dict())
-        if was_pass:
+        if prior_state == BranchState.PASS:
             # A verified branch died: the main line rewrites and dependents re-verify or die
             self._rewrite_main_line_and_reverify(
                 branch_id,
                 demoted_to=BranchState.FAIL,
-                reason=f"falsified_on_{schedule_trigger}:{chosen_angle.value}",
+                reason=kill_reason,
             )
+        return outcome
+
+    def _inconclusive(
+        self,
+        branch_id: str,
+        schedule_trigger: str,
+        angle: FalsifierAngle,
+        judge_id: str,
+        rationale: str,
+        cost_usd: float,
+        *,
+        objection: str = "",
+        appeal_judge: str = "",
+    ) -> FalsificationOutcome:
+        """No usable verdict: no survival credit, no kill, no appeal consumed."""
+        outcome = FalsificationOutcome(
+            branch_id=branch_id,
+            schedule_trigger=schedule_trigger,
+            survived=False,
+            angle=angle.value,
+            judge_id=judge_id,
+            appeal_attempted=bool(appeal_judge),
+            appeal_judge_id=appeal_judge,
+            objection=objection,
+            rationale=rationale,
+            cost_usd=cost_usd,
+            transitioned_to=self.tracker.get(branch_id).state.value,
+            inconclusive=True,
+        )
+        self._emit("falsification_inconclusive", branch_id, outcome.to_dict())
         return outcome
 
     # ------------------------------------------------------------------
@@ -489,14 +543,20 @@ class FailJudge:
                 # Killed, or inconclusive (no verdict = no Pass; branch stays Possible)
                 return outcomes
 
-        rec = self.tracker.get(branch_id)
-        if rec.is_alive and len(outcomes) == num_rounds and all(o.survived for o in outcomes):
+        if len(outcomes) != num_rounds or not all(o.survived for o in outcomes):
+            return outcomes
+        # Promote under one lock: a branch killed or absorbed after its last round must not
+        # reach the verified main line (Possible -> Pass on a dead branch raised)
+        with self.tracker.atomic():
+            rec = self.tracker.get(branch_id)
+            promoted = rec.is_alive
             if rec.state == BranchState.POSSIBLE:
                 self.tracker.transition(
                     branch_id,
                     BranchState.PASS,
                     reason=f"survived_{num_rounds}_round_gauntlet",
                 )
+        if promoted:
             claim_summary = f"[{branch_id}] {rec.fork_under_exploration}"
             if claim_summary not in self.verified_main_line:
                 self.verified_main_line.append(claim_summary)
@@ -539,16 +599,21 @@ class FailJudge:
         )
 
         # "contradiction trigger (alignment detector finds clash -> falsify both, loser dies)"
-        rec_a = self.tracker.get(branch_a_id)
-        rec_b = self.tracker.get(branch_b_id)
-        if rec_a.is_alive and rec_b.is_alive:
-            loser = min((rec_a, rec_b), key=self._contradiction_strength)
+        # Pick and kill the loser under one lock, so neither side can die, be absorbed or change
+        # state between the check and the kill (a stale read raised an illegal transition)
+        loser = None
+        with self.tracker.atomic():
+            rec_a = self.tracker.get(branch_a_id)
+            rec_b = self.tracker.get(branch_b_id)
+            if rec_a.is_alive and rec_b.is_alive:
+                loser = min((rec_a, rec_b), key=self._contradiction_strength)
+                loser_was_pass = loser.state == BranchState.PASS
+                if loser_was_pass:
+                    self.tracker.revoke_pass(loser.id, demote_to=BranchState.FAIL, reason="contradiction_loser")
+                else:
+                    self.tracker.transition(loser.id, BranchState.FAIL, reason="contradiction_loser")
+        if loser is not None:
             loser_out = out_a if loser.id == branch_a_id else out_b
-            loser_was_pass = loser.state == BranchState.PASS
-            if loser_was_pass:
-                self.tracker.revoke_pass(loser.id, demote_to=BranchState.FAIL, reason="contradiction_loser")
-            else:
-                self.tracker.transition(loser.id, BranchState.FAIL, reason="contradiction_loser")
             loser_out.survived = False
             loser_out.inconclusive = False
             loser_out.transitioned_to = BranchState.FAIL.value

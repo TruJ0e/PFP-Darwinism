@@ -166,7 +166,8 @@ class TestFailJudgeVerdicts(unittest.TestCase):
     def test_killing_a_pass_branch_rewrites_main_line_and_reverifies_dependents(self) -> None:
         events: List[str] = []
         judge, tracker = self._judge(
-            ['{"survived": true}'] * 3 + ['{"survived": false}', '{"survived": false}', '{"survived": false}']
+            # b1: primary + appeal kill; dep: primary + appeal kill (a verdict-less appeal kills nothing)
+            ['{"survived": true}'] * 3 + ['{"survived": false}'] * 4
         )
         judge.event_sink = lambda e: events.append(e.event_type)
         tracker.register_branch("dep", "b1", 0.02, "Depends on firewall finding")
