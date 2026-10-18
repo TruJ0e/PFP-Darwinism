@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tup
 
 from .backend import SUPER_MODEL
 from .jsonutil import as_str_list, parse_json_object
-from .tracker import BranchRecord, branch_position_text, content_order_key
+from .tracker import BranchRecord, branch_position_text, content_order_key, id_free
 
 
 class AlignmentVerdict(str, Enum):
@@ -222,8 +222,11 @@ class AlignmentDetector:
         Stage 1: Compute cosine similarity across candidate branch pairs.
         Recall-only filter: pairs with similarity >= prefilter_threshold advance to Super judge.
         """
+        # Embed the ID-free position: merge traces name their parents ("[Merged branch_12 +
+        # branch_7] ..."), and those IDs follow thread scheduling. Hashed in, they nudged cosine
+        # similarity (0.9945 vs 0.9946) and so decided which pair merged first.
         embeddings: Dict[str, List[float]] = {
-            b.id: compute_branch_embedding(branch_position_text(b), dim=self.embedding_dim)
+            b.id: compute_branch_embedding(id_free(branch_position_text(b)), dim=self.embedding_dim)
             for b in branches
         }
         # Content order, not registration order: pair orientation (which branch is "A" in the
@@ -307,8 +310,8 @@ class AlignmentDetector:
         - unrelated (disjoint -> walk away)
         """
         if cosine_sim is None:
-            va = compute_branch_embedding(branch_position_text(branch_a), dim=self.embedding_dim)
-            vb = compute_branch_embedding(branch_position_text(branch_b), dim=self.embedding_dim)
+            va = compute_branch_embedding(id_free(branch_position_text(branch_a)), dim=self.embedding_dim)
+            vb = compute_branch_embedding(id_free(branch_position_text(branch_b)), dim=self.embedding_dim)
             cosine_sim = cosine_similarity(va, vb)
 
         claims_a, cost_a = self.extract_claims(branch_a)

@@ -82,7 +82,7 @@ remixes) and the depth dial.
 
 Certainty ranking (drives compute allocation, scoreboard order, exit order):
 survived falsifications (big plus), merges attracted (plus), open critic
-objections (minus), age-without-testing (decays per whole second). Certainty is *revealed by
+objections (minus), age-without-testing (decays per arena round a live branch goes untested). Certainty is *revealed by
 selection*, not computed upfront. Score weights are tunable dials.
 When evidence ties, selection uses ID-free branch content and a content-derived lineage
 digest. Parallel registration timing therefore cannot choose pair orientation, a

@@ -26,10 +26,11 @@ from typing import Any, List, Optional, Sequence, Set
 from .jsonutil import as_str_list, parse_json_object
 
 
-# Untested age is counted in whole seconds. Sub-second age is pure thread-scheduling
-# jitter (siblings born microseconds apart): left in, it decided which of two
-# otherwise-equal branches the background falsifier tested first, so identical mock
-# runs could reach different winners and the paired sandbox A/B could flip.
+# Legacy wall-clock path: untested age counted in whole seconds. Sub-second age is pure
+# thread-scheduling jitter, but whole seconds are not safe either: a run that straddles a
+# second boundary still decayed one sibling and not its twin (v0.29 found ~1 in 60 mock runs
+# reaching a different winner). The arena now counts untested age in arena rounds
+# (`untested_rounds=`, from `PFPTracker.untested_rounds`); seconds remain for direct callers.
 AGE_QUANTUM_S = 1.0
 
 
@@ -44,6 +45,19 @@ def untested_age_units(seconds_since_last_test: float) -> float:
     return float(math.floor(age / AGE_QUANTUM_S))
 
 
+def untested_round_units(untested_rounds: Any) -> float:
+    """Whole arena rounds of untested age; bools, negatives and non-finite values count 0."""
+    if isinstance(untested_rounds, bool):
+        return 0.0
+    try:
+        rounds = float(untested_rounds)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(rounds) or rounds <= 0.0:
+        return 0.0
+    return float(math.floor(rounds))
+
+
 @dataclass
 class CertaintyWeights:
     """
@@ -51,7 +65,7 @@ class CertaintyWeights:
     - survived_falsifications: big plus
     - merges_attracted: plus
     - open_critic_objections: minus
-    - age_without_testing: decays (per whole second of untested age)
+    - age_without_testing: decays (per arena round a live branch goes untested)
     """
 
     survived_falsifications: float = 3.0
@@ -256,19 +270,25 @@ class IssueDetector:
         survived_falsifications: int,
         merges_attracted: int,
         open_critic_objections: int,
-        seconds_since_last_test: float,
+        seconds_since_last_test: Optional[float] = None,
+        untested_rounds: Optional[int] = None,
     ) -> float:
         """
         Certainty ranking (Piece 1):
         survived falsifications (big plus), merges attracted (plus),
-        open critic objections (minus), age-without-testing (decays per whole second,
-        so wall-clock jitter between siblings can't reorder them).
+        open critic objections (minus), age-without-testing (decays per arena round untested
+        when `untested_rounds` is given — the arena's path, so certainty is a pure function of
+        the run's decisions; else per whole second of `seconds_since_last_test`).
         """
+        if untested_rounds is not None:
+            age_units = untested_round_units(untested_rounds)
+        else:
+            age_units = untested_age_units(seconds_since_last_test or 0.0)
         score = (
             survived_falsifications * self.weights.survived_falsifications
             + merges_attracted * self.weights.merges_attracted
             + open_critic_objections * self.weights.open_critic_objections
-            + untested_age_units(seconds_since_last_test) * self.weights.age_without_testing
+            + age_units * self.weights.age_without_testing
         )
         return round(score, 4)
 

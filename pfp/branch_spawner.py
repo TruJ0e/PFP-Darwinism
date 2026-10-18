@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .issue_detector import IssueDetectionResult, IssueDetector, ProbeContinuation
 from .jsonutil import parse_json_object
-from .tracker import BranchRecord, BranchState, PFPTracker
+from .tracker import BranchRecord, BranchState, PFPTracker, id_free
 
 
 def _finite_number(value: Any, name: str) -> float:
@@ -636,12 +636,11 @@ class MiniHarness:
         rec = self.tracker.get(self.branch_id)
         if open_objections is not None:
             rec.open_critic_objections = open_objections
-        age_untested = max(0.0, time.time() - rec.last_tested_at)
         base_score = self.detector.compute_certainty(
             survived_falsifications=rec.survived_falsifications,
             merges_attracted=rec.merges_attracted,
             open_critic_objections=rec.open_critic_objections,
-            seconds_since_last_test=age_untested,
+            untested_rounds=self.tracker.untested_rounds(rec),
         )
         score = round(base_score + support_bonus, 4)
         self.tracker.update_branch(self.branch_id, certainty_score=score)
@@ -1159,7 +1158,29 @@ class MainHarness:
 
     @staticmethod
     def _solution_key(rec: BranchRecord) -> str:
-        return " ".join(rec.fork_under_exploration.lower().split())
+        # ID-free: a merged fork that names its parents is the same solution whichever IDs it drew
+        return " ".join(id_free(rec.fork_under_exploration).lower().split())
+
+    def _age_untested_branches(self) -> int:
+        """
+        Close one arena round: every live branch the round left untested decays by one unit of
+        `age_without_testing`, then the logical clock ticks. Untested age used to be wall-clock
+        seconds, so call latency and thread scheduling decided which of two equal branches decayed
+        (and so the background target, sibling budgets and the pre-exit cut); counted in rounds it
+        is a pure function of the run's decisions. Returns how many branches decayed.
+        """
+        from .tracker import content_order_key
+
+        weight = float(self.detector.weights.age_without_testing)
+        decayed = 0
+        with self.tracker.atomic():
+            closing = self.tracker.arena_round
+            for rec in sorted(self.tracker.active_branches(), key=content_order_key):
+                if rec.last_tested_round < closing and weight:
+                    self.tracker.update_branch(rec.id, certainty_score=round(rec.certainty_score + weight, 4))
+                    decayed += 1
+            self.tracker.advance_round()
+        return decayed
 
     def _run_selection_phase(self) -> Dict[str, Any]:
         """
@@ -1183,6 +1204,9 @@ class MainHarness:
         alignments_evaluated: List[Dict[str, Any]] = []
         rounds_run = 0
         reclaimed_usd = self._reclaim_split_parent_budgets()
+        # The spawn phase is arena round 0; selection rounds count from 1, so a branch the first
+        # round leaves untested has aged one round (no one is tested while spawning)
+        self.tracker.advance_round()
 
         bg_out = self.fail_judge.sample_background(force=True)
         if bg_out is not None:
@@ -1255,6 +1279,7 @@ class MainHarness:
                         child_id,
                         reasoning_step=f"[Conclusion] {merge_res.unified_reasoning}",
                     )
+            self._age_untested_branches()
             if not changed:
                 break
 

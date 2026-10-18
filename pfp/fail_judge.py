@@ -213,12 +213,11 @@ class FailJudge:
     def _refresh_branch_certainty(self, branch_id: str) -> float:
         rec = self.tracker.get(branch_id)
         if self.detector is not None:
-            age_untested = max(0.0, time.time() - rec.last_tested_at)
             score = self.detector.compute_certainty(
                 survived_falsifications=rec.survived_falsifications,
                 merges_attracted=rec.merges_attracted,
                 open_critic_objections=rec.open_critic_objections,
-                seconds_since_last_test=age_untested,
+                untested_rounds=self.tracker.untested_rounds(rec),
             )
         else:
             score = round(
@@ -661,7 +660,8 @@ class FailJudge:
             # orders by thread scheduling; break certainty ties on content, not on the clock
             target = min(untested, key=lambda b: (-b.certainty_score, content_order_key(b)))
         else:
-            target = min(alive, key=lambda b: (-b.certainty_score, b.last_tested_at, content_order_key(b)))
+            # Least recently tested first, on the arena-round clock (wall time follows call latency)
+            target = min(alive, key=lambda b: (-b.certainty_score, b.last_tested_round, content_order_key(b)))
         self.last_background_sample_at = now
         return self.falsify_branch(target.id, schedule_trigger="background_sample")
 

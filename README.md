@@ -264,6 +264,16 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   branch went on to win. The same mock sandbox finished at 22.5 or 31.5 depending on thread
   timing, and the paired A/B sometimes flagged an unchanged-quality candidate as degraded.
   Now equal evidence means equal certainty, and the existing content tie-break decides.
+- **Untested age runs on the arena's clock, not the wall clock.** Whole seconds still leaked
+  scheduling: a run that straddled a second boundary aged one twin and not the other, and in
+  a live run a branch whose plaus call came back slowly lost 0.15 certainty per second of
+  network latency, which set sibling budgets. Untested age is now counted in arena rounds
+  (`PFPTracker.arena_round`): the spawn phase is round 0, and each completed selection round
+  decays every live branch it left untested by one `age_without_testing` unit, so that dial
+  means "rounds without facing the falsifier". Alignment embeddings also hash the ID-free
+  position: merge traces name their parents (`[Merged branch_12 + branch_7]`), and those IDs
+  shifted cosine similarity in the fourth decimal and so decided which pair merged first.
+  Together these made ~1 in 60 identical mock runs reach a different winner; 300 of 300 now agree.
 - **Selection is invariant to parallel registration order.** Every equal-score decision now
   uses an ID-free branch-position key plus a content-derived lineage digest: alignment pair
   orientation and similarity ties, background sampling, contradiction ties, dependent

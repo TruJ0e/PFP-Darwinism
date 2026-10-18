@@ -116,6 +116,9 @@ class BranchRecord:
     merges_attracted: int = 0
     open_critic_objections: int = 0
     last_tested_at: float = field(default_factory=time.time)
+    # Arena round (`PFPTracker.arena_round`) of the last test, or of birth if never tested.
+    # Untested age is counted on this logical clock, never on wall time (see `untested_rounds`).
+    last_tested_round: int = 0
     reasoning_trace: List[str] = field(default_factory=list)
     state_history: List[StateTransitionRecord] = field(default_factory=list)
     merge_parents: List[str] = field(default_factory=list)
@@ -205,6 +208,9 @@ class PFPTracker:
     def __init__(self) -> None:
         self._records: Dict[str, BranchRecord] = {}
         self._lock = threading.RLock()
+        # Logical arena clock: advanced by the harness once per completed selection round, so
+        # untested age is a function of the run's decisions, not of call latency or scheduling
+        self._arena_round = 0
 
     def register_branch(
         self,
@@ -239,6 +245,7 @@ class PFPTracker:
                 lineage_digest=self._lineage_digest(branch_id, parent, merge_parents, fork_under_exploration, origin),
                 created_at=now,
                 last_tested_at=now,
+                last_tested_round=self._arena_round,
                 state_history=[
                     StateTransitionRecord(
                         from_state=None,
@@ -442,10 +449,27 @@ class PFPTracker:
                 rec.open_critic_objections = open_critic_objections
             if tested:
                 rec.last_tested_at = now
+                rec.last_tested_round = self._arena_round
             if reasoning_step is not None:
                 rec.reasoning_trace.append(reasoning_step)
             rec.refresh_time_alive(now)
             return rec
+
+    @property
+    def arena_round(self) -> int:
+        with self._lock:
+            return self._arena_round
+
+    def advance_round(self) -> int:
+        """Tick the logical arena clock (one completed selection round); returns the new round."""
+        with self._lock:
+            self._arena_round += 1
+            return self._arena_round
+
+    def untested_rounds(self, record: BranchRecord) -> int:
+        """Arena rounds since `record` was last tested (or born): its untested age."""
+        with self._lock:
+            return max(0, self._arena_round - int(record.last_tested_round))
 
     def all_records(self) -> List[BranchRecord]:
         with self._lock:
