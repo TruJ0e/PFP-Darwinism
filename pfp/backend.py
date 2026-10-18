@@ -127,6 +127,28 @@ def _finite_float(value: Any, default: float) -> float:
     return number if math.isfinite(number) else default
 
 
+def _configuration_int(value: Any, name: str, *, minimum: int) -> int:
+    """Validate an integer control-plane value without lossy coercion."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _configuration_float(value: Any, name: str, *, minimum: float, inclusive: bool = True) -> float:
+    """Validate a finite numeric control-plane value; booleans are never numbers here."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a finite number") from None
+    valid = number >= minimum if inclusive else number > minimum
+    if not math.isfinite(number) or not valid:
+        operator = ">=" if inclusive else ">"
+        raise ValueError(f"{name} must be a finite number {operator} {minimum}")
+    return number
+
+
 def _message_text(value: Any) -> str:
     """Normalize message content: providers may send null, a string, or a list of content parts."""
     if value is None:
@@ -492,6 +514,9 @@ class OpenAICompatibleClient:
         max_retries: int = 3,
         backoff_base_s: float = 0.5,
     ):
+        timeout = _configuration_float(timeout, "timeout", minimum=0.0, inclusive=False)
+        max_retries = _configuration_int(max_retries, "max_retries", minimum=0)
+        backoff_base_s = _configuration_float(backoff_base_s, "backoff_base_s", minimum=0.0)
         self.base_url = (base_url or get_base_url()).rstrip("/")
         self.api_key = api_key if api_key is not None else os.environ.get("NEBIUS_API_KEY", "")
         self.model = model or get_model_name()
@@ -499,7 +524,7 @@ class OpenAICompatibleClient:
         # A retry after an HTTP 200 with an unreadable body may mean every
         # attempt was billed.  Meters use this to reserve the complete
         # worst-case request cost before admitting concurrent work.
-        self.max_billable_attempts = max(0, int(max_retries)) + 1
+        self.max_billable_attempts = max_retries + 1
         self.chat = _LiveChatNamespace(
             _LiveChatCompletions(
                 base_url=self.base_url,
@@ -546,13 +571,10 @@ class MeteredClient:
         max_concurrent_calls: int = 32,
     ) -> None:
         if hard_cap_usd is not None:
-            try:
-                hard_cap_usd = float(hard_cap_usd)
-            except (TypeError, ValueError):
-                raise ValueError("hard_cap_usd must be a finite number >= 0 or None") from None
-            if not math.isfinite(hard_cap_usd) or hard_cap_usd < 0:
-                # A NaN cap admits every call (all comparisons are False); refuse it loudly.
-                raise ValueError("hard_cap_usd must be a finite number >= 0 or None")
+            hard_cap_usd = _configuration_float(hard_cap_usd, "hard_cap_usd", minimum=0.0)
+        max_concurrent_calls = _configuration_int(
+            max_concurrent_calls, "max_concurrent_calls", minimum=1
+        )
         self.inner = inner
         self.hard_cap_usd = hard_cap_usd
         self.model = getattr(inner, "model", "")
@@ -560,8 +582,14 @@ class MeteredClient:
         self.is_mock = getattr(inner, "is_mock", False)
         # Clients that bill above catalog rates (the mock's demo scale, a nested meter's
         # inner client) advertise it so the preflight reservation stays an upper bound.
-        self.cost_scale = max(1.0, float(getattr(inner, "cost_scale", 1.0) or 1.0))
-        self.max_billable_attempts = max(1, int(getattr(inner, "max_billable_attempts", 1) or 1))
+        self.cost_scale = _configuration_float(
+            getattr(inner, "cost_scale", 1.0), "inner.cost_scale", minimum=1.0
+        )
+        self.max_billable_attempts = _configuration_int(
+            getattr(inner, "max_billable_attempts", 1),
+            "inner.max_billable_attempts",
+            minimum=1,
+        )
         self.reservation_overruns: int = 0
         self.total_cost_usd: float = 0.0
         self.calls: int = 0
@@ -570,7 +598,7 @@ class MeteredClient:
         self.cost_by_model: Dict[str, float] = {}
         self._reserved_cost_usd: float = 0.0
         self._lock = threading.Lock()
-        self._slots = threading.BoundedSemaphore(max(1, int(max_concurrent_calls)))
+        self._slots = threading.BoundedSemaphore(max_concurrent_calls)
         self.chat = _MeteredChatNamespace(_MeteredCompletions(self))
 
     @property

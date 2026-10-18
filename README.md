@@ -170,6 +170,10 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   keyword calls. The output bound honors both `max_tokens` and `max_completion_tokens`
   (the larger, if both are sent), and a call with no limit (`max_tokens=None`) reserves
   a full context window (131,072 tokens) rather than the 256-token default.
+- **Meter configuration fails closed.** Hard caps, timeouts and retry backoff must be
+  finite numbers (never booleans); retry counts and concurrency limits must be real
+  integers in range. Inner-client cost multipliers and billable-attempt counts are
+  validated before the meter starts, so malformed adapters cannot weaken reservations.
 - **One cap for the whole command.** The post-run self-improvement loop
   (assessment, anti-model, proposition, sandbox run) is metered against what the
   arena left under `--hard-cap`; the summary reports `total_api_spend_usd` =
