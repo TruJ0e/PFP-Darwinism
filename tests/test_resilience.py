@@ -31,7 +31,7 @@ from pfp import (
     OpenAICompatibleClient,
     SelfImprovementLoop,
 )
-from pfp.backend import prompt_token_upper_bound
+from pfp.backend import prompt_token_upper_bound, request_token_upper_bound
 
 
 def test_arena_feed_payloads_are_deeply_detached_and_hash_chained(tmp_path):
@@ -126,7 +126,17 @@ class TestHonestUsage(unittest.TestCase):
         self.assertTrue(resp.usage.estimated)
         # Negative counts are unreadable, not zero: treating them as zero would
         # erase billed input and weaken the hard-cap ledger.
-        self.assertEqual(resp.usage.prompt_tokens, prompt_token_upper_bound([{"role": "user", "content": "x"}]))
+        self.assertEqual(
+            resp.usage.prompt_tokens,
+            request_token_upper_bound(
+                [{"role": "user", "content": "x"}],
+                {
+                    "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+                    "temperature": 0.7,
+                    "max_tokens": 64,
+                },
+            ),
+        )
         self.assertEqual(resp.usage.completion_tokens, 64)  # unreadable -> max_tokens bound
         self.assertEqual(resp.usage.total_tokens, resp.usage.prompt_tokens + 64)
 

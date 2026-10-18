@@ -79,6 +79,27 @@ def prompt_token_upper_bound(messages: Any) -> int:
     return total
 
 
+def request_token_upper_bound(messages: Any, request_fields: Optional[Dict[str, Any]] = None) -> int:
+    """Conservative input-token bound including tools, schemas, and other request fields.
+
+    Providers tokenize more than the chat messages.  Tool definitions, response schemas,
+    metadata, and future OpenAI-compatible fields all ride in the request body and can be
+    billable input.  A UTF-8 token cannot be smaller than one byte, so the serialized body
+    plus protocol overhead is a safe catalog-pricing bound.  Keep the older message bound as
+    a floor for adapters whose wire representation differs from our JSON approximation.
+    """
+    payload: Dict[str, Any] = {"messages": messages}
+    if request_fields:
+        payload.update(request_fields)
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        # The inner client will reject an unserializable request before dispatch.  Until then,
+        # never let a failed sizing attempt weaken the established message-only reservation.
+        return prompt_token_upper_bound(messages)
+    return max(prompt_token_upper_bound(messages), 1024 + len(encoded))
+
+
 # A request with no completion limit (`max_tokens=None`) may run to the model's context
 # window; reserve that much rather than an optimistic default.
 UNBOUNDED_COMPLETION_TOKENS = 131_072
@@ -438,7 +459,8 @@ class _LiveChatCompletions:
 
         body = json.dumps(payload).encode("utf-8")
         completion_bound = completion_token_bound(max_tokens, n, kwargs.get("max_completion_tokens"))
-        attempt_bound_usd = estimate_call_cost_usd(prompt_token_upper_bound(messages), completion_bound, target_model)
+        attempt_prompt_bound = max(prompt_token_upper_bound(messages), 1024 + len(body))
+        attempt_bound_usd = estimate_call_cost_usd(attempt_prompt_bound, completion_bound, target_model)
         raw, unusable_billed = self._post_with_retries(body, attempt_bound_usd)
 
         # The call is billed from here on: a malformed reply must degrade, never raise,
@@ -471,7 +493,7 @@ class _LiveChatCompletions:
             # No billable usage reported: never book the call as free (spend would slip
             # past the hard cap). Charge the same upper bound the meter reserved.
             if p_tok is None:
-                p_tok = prompt_token_upper_bound(messages)
+                p_tok = attempt_prompt_bound
             if c_tok is None:
                 per_choice = completion_token_bound(max_tokens, 1, kwargs.get("max_completion_tokens"))
                 c_tok = per_choice * max(1, len(choices), _non_negative_int(n) or 1)
@@ -613,11 +635,6 @@ class MeteredClient:
             )
 
     @staticmethod
-    def _prompt_token_upper_bound(messages: Any) -> int:
-        """Conservative preflight bound: a token cannot exceed its UTF-8 byte input."""
-        return prompt_token_upper_bound(messages)
-
-    @staticmethod
     def _call_parameter(args: Sequence[Any], kwargs: Dict[str, Any], name: str, default: Any) -> Any:
         """Read a ``create`` argument without changing the call passed to the provider."""
         positions = {"messages": 0, "model": 1, "temperature": 2, "max_tokens": 3,
@@ -630,7 +647,20 @@ class MeteredClient:
     def _reserve_call(self, args: Sequence[Any], kwargs: Dict[str, Any]) -> float:
         model = str(self._call_parameter(args, kwargs, "model", None) or self.model)
         messages = self._call_parameter(args, kwargs, "messages", [])
-        prompt_bound = self._prompt_token_upper_bound(messages)
+        request_fields = dict(kwargs)
+        request_fields.pop("messages", None)
+        # Positional parameters are absent from kwargs but still become request fields.
+        for name, default in (
+            ("model", None),
+            ("temperature", 0.7),
+            ("max_tokens", 256),
+            ("logprobs", False),
+            ("top_logprobs", None),
+            ("n", 1),
+        ):
+            request_fields[name] = self._call_parameter(args, kwargs, name, default)
+        request_fields["model"] = model
+        prompt_bound = request_token_upper_bound(messages, request_fields)
         completion_bound = completion_token_bound(
             self._call_parameter(args, kwargs, "max_tokens", 256),
             self._call_parameter(args, kwargs, "n", 1),

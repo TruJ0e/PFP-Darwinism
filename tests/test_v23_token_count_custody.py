@@ -14,6 +14,7 @@ from pfp.backend import (
     completion_token_bound,
     estimate_call_cost_usd,
     prompt_token_upper_bound,
+    request_token_upper_bound,
 )
 from tests.test_hardening import _FakeServer, _OK_BODY
 
@@ -53,7 +54,14 @@ def test_malformed_provider_usage_is_conservatively_estimated(field: str, bad: o
         client = OpenAICompatibleClient(base_url=server.url, api_key="k", max_retries=0)
         response = client.chat.completions.create(messages=messages, max_tokens=17)
 
-    expected_prompt = 1000 if field == "completion_tokens" else prompt_token_upper_bound(messages)
+    expected_prompt = 1000 if field == "completion_tokens" else request_token_upper_bound(
+        messages,
+        {
+            "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+            "temperature": 0.7,
+            "max_tokens": 17,
+        },
+    )
     expected_completion = 500 if field == "prompt_tokens" else 17
     assert response.usage.estimated is True
     assert response.usage.prompt_tokens == expected_prompt

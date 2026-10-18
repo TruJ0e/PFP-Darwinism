@@ -16,6 +16,7 @@ from .backend import (
     MockOpenAIClient,
     OpenAICompatibleClient,
     create_client,
+    request_token_upper_bound,
 )
 from .jsonutil import coerce_bool, extract_json, parse_json_object
 from .tracker import (
@@ -92,6 +93,7 @@ __all__ = [
     "MockOpenAIClient",
     "OpenAICompatibleClient",
     "create_client",
+    "request_token_upper_bound",
     "coerce_bool",
     "extract_json",
     "parse_json_object",

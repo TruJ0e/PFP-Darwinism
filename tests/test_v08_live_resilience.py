@@ -35,7 +35,7 @@ from pfp import (
     SelfImprovementLoop,
     VersionRegistry,
 )
-from pfp.backend import estimate_call_cost_usd, prompt_token_upper_bound
+from pfp.backend import estimate_call_cost_usd, request_token_upper_bound
 from pfp.branch_spawner import MiniHarness
 from pfp.issue_detector import compute_token_entropy_from_choice
 
@@ -96,7 +96,10 @@ MESSAGES = [{"role": "user", "content": "probe"}]
 
 
 def _attempt_bound(max_tokens: int = 50, n: int = 1) -> float:
-    return estimate_call_cost_usd(prompt_token_upper_bound(MESSAGES), max_tokens * n, MODEL)
+    fields = {"model": MODEL, "temperature": 0.7, "max_tokens": max_tokens}
+    if n > 1:
+        fields["n"] = n
+    return estimate_call_cost_usd(request_token_upper_bound(MESSAGES, fields), max_tokens * n, MODEL)
 
 
 # ---------------------------------------------------------------------------

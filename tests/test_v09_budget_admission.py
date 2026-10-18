@@ -6,13 +6,25 @@ import pytest
 import types
 
 from pfp import HardCapExceededError, MeteredClient, MockOpenAIClient
-from pfp.backend import estimate_call_cost_usd, prompt_token_upper_bound
-from test_v08_live_resilience import MESSAGES, MODEL, _RawServer, _live, _ok
+from pfp.backend import estimate_call_cost_usd, request_token_upper_bound
+from test_v08_live_resilience import MESSAGES, MODEL, _RawServer, _attempt_bound, _live, _ok
 
 
 def _bound(max_tokens: int, attempts: int = 1, messages=MESSAGES, n: int = 1) -> float:
     return attempts * estimate_call_cost_usd(
-        prompt_token_upper_bound(messages), max_tokens * n, MODEL
+        request_token_upper_bound(
+            messages,
+            {
+                "model": MODEL,
+                "temperature": 0.7,
+                "max_tokens": max_tokens,
+                "logprobs": False,
+                "top_logprobs": None,
+                "n": n,
+            },
+        ),
+        max_tokens * n,
+        MODEL,
     )
 
 
@@ -37,7 +49,7 @@ def test_retry_reservation_is_released_and_only_actual_spend_is_booked():
         meter.chat.completions.create(messages=MESSAGES, max_tokens=50)
         assert srv.hits == 2
     stats = meter.stats()
-    expected = _bound(50) + estimate_call_cost_usd(10, 5, MODEL)
+    expected = _attempt_bound(50) + estimate_call_cost_usd(10, 5, MODEL)
     assert stats["total_cost_usd"] == pytest.approx(round(expected, 6))
     assert stats["in_flight_reserved_usd"] == 0.0
     assert stats["reservation_overruns"] == 0

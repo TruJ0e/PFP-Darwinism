@@ -179,6 +179,10 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   sample counts are rejected before dispatch. Negative or fractional provider usage is
   treated as missing and charged at the conservative bound, so malformed accounting cannot
   turn a billed response into a free one.
+- **The whole request is under custody.** Tool definitions, response schemas, metadata, and
+  future OpenAI-compatible request fields participate in the input-token reservation and in
+  missing-usage fallback billing. A tiny chat message cannot hide a large billable schema
+  outside the hard-cap preflight.
 - **One cap for the whole command.** The post-run self-improvement loop
   (assessment, anti-model, proposition, sandbox run) is metered against what the
   arena left under `--hard-cap`; the summary reports `total_api_spend_usd` =
