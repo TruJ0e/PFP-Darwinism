@@ -127,15 +127,19 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   A call that would exceed `--hard-cap` (including spend already in flight) is
   refused; the run halts cleanly with `halted_reason: "hard_cap"` and a `halt`
   event in the arena feed. Unknown model IDs use the highest known catalog rate
-  instead of an optimistic cheap-model fallback.
+  instead of an optimistic cheap-model fallback. Live reservations cover every
+  potentially billable retry, not just the final attempt, and positional
+  OpenAI-style arguments receive the same prompt / output / `n` preflight as
+  keyword calls.
 - **One cap for the whole command.** The post-run self-improvement loop
   (assessment, anti-model, proposition, sandbox run) is metered against what the
   arena left under `--hard-cap`; the summary reports `total_api_spend_usd` =
   arena + improvement. A sandbox cut short by the cap is never adopted.
 - **No free calls.** If the provider omits or garbles `usage`, the call is charged
-  the same upper bound that was reserved for it (`usage.estimated`,
+  a conservative upper bound (`usage.estimated`,
   `api_estimated_usage_calls`) instead of $0. Calls billed above their
-  reservation are counted in `reservation_overruns`.
+  reservation are counted in `reservation_overruns`; `hard_cap_overrun_usd`
+  exposes any unavoidable provider-side overrun instead of hiding it.
 - **Selection is paid for.** Each branch keeps a protected verification share
   (30% by default) that exploration and child spawning can't touch; split
   parents' idle budgets return to the finish reserve when selection begins.

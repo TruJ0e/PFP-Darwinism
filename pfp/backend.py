@@ -468,6 +468,10 @@ class OpenAICompatibleClient:
         self.api_key = api_key if api_key is not None else os.environ.get("NEBIUS_API_KEY", "")
         self.model = model or get_model_name()
         self.is_mock = False
+        # A retry after an HTTP 200 with an unreadable body may mean every
+        # attempt was billed.  Meters use this to reserve the complete
+        # worst-case request cost before admitting concurrent work.
+        self.max_billable_attempts = max(0, int(max_retries)) + 1
         self.chat = _LiveChatNamespace(
             _LiveChatCompletions(
                 base_url=self.base_url,
@@ -529,6 +533,7 @@ class MeteredClient:
         # Clients that bill above catalog rates (the mock's demo scale, a nested meter's
         # inner client) advertise it so the preflight reservation stays an upper bound.
         self.cost_scale = max(1.0, float(getattr(inner, "cost_scale", 1.0) or 1.0))
+        self.max_billable_attempts = max(1, int(getattr(inner, "max_billable_attempts", 1) or 1))
         self.reservation_overruns: int = 0
         self.total_cost_usd: float = 0.0
         self.calls: int = 0
@@ -552,12 +557,24 @@ class MeteredClient:
         """Conservative preflight bound: a token cannot exceed its UTF-8 byte input."""
         return prompt_token_upper_bound(messages)
 
-    def _reserve_call(self, kwargs: Dict[str, Any]) -> float:
-        model = str(kwargs.get("model") or self.model)
-        prompt_bound = self._prompt_token_upper_bound(kwargs.get("messages", []))
-        completion_bound = max(0, int(kwargs.get("max_tokens", 256)))
-        n = max(1, int(kwargs.get("n", 1)))
-        reservation = estimate_call_cost_usd(prompt_bound, completion_bound * n, model) * self.cost_scale
+    @staticmethod
+    def _call_parameter(args: Sequence[Any], kwargs: Dict[str, Any], name: str, default: Any) -> Any:
+        """Read a ``create`` argument without changing the call passed to the provider."""
+        positions = {"messages": 0, "model": 1, "temperature": 2, "max_tokens": 3,
+                     "logprobs": 4, "top_logprobs": 5, "n": 6}
+        if name in kwargs:
+            return kwargs[name]
+        position = positions[name]
+        return args[position] if position < len(args) else default
+
+    def _reserve_call(self, args: Sequence[Any], kwargs: Dict[str, Any]) -> float:
+        model = str(self._call_parameter(args, kwargs, "model", None) or self.model)
+        messages = self._call_parameter(args, kwargs, "messages", [])
+        prompt_bound = self._prompt_token_upper_bound(messages)
+        completion_bound = max(0, int(self._call_parameter(args, kwargs, "max_tokens", 256)))
+        n = max(1, int(self._call_parameter(args, kwargs, "n", 1)))
+        per_attempt = estimate_call_cost_usd(prompt_bound, completion_bound * n, model) * self.cost_scale
+        reservation = per_attempt * self.max_billable_attempts
         with self._lock:
             projected = self.total_cost_usd + self._reserved_cost_usd + reservation
             if self.hard_cap_usd is not None and projected > self.hard_cap_usd:
@@ -570,13 +587,13 @@ class MeteredClient:
         return reservation
 
     def _metered_create(self, *args: Any, **kwargs: Any) -> Any:
-        reservation = self._reserve_call(kwargs)
+        reservation = self._reserve_call(args, kwargs)
         try:
             with self._slots:
                 resp = self.inner.chat.completions.create(*args, **kwargs)
         except BaseException as exc:  # incl. KeyboardInterrupt: never strand an in-flight reservation
             billed = _finite_float(getattr(exc, "billed_usd", 0.0), 0.0)
-            model = str(kwargs.get("model") or self.model)
+            model = str(self._call_parameter(args, kwargs, "model", None) or self.model)
             with self._lock:
                 self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - reservation)
                 self.failed_calls += 1
@@ -585,6 +602,8 @@ class MeteredClient:
                     self.estimated_usage_calls += 1
                     self.total_cost_usd = round(self.total_cost_usd + billed, 8)
                     self.cost_by_model[model] = round(self.cost_by_model.get(model, 0.0) + billed, 8)
+                    if billed > reservation + 1e-12:
+                        self.reservation_overruns += 1
             raise
         usage = getattr(resp, "usage", None)
         try:
@@ -595,7 +614,7 @@ class MeteredClient:
         if usage is None or not math.isfinite(cost) or cost < 0:
             # An inner client that reports no usable cost is charged its full reservation
             cost, estimated = reservation, True
-        model = str(kwargs.get("model") or self.model)
+        model = str(self._call_parameter(args, kwargs, "model", None) or self.model)
         with self._lock:
             self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - reservation)
             self.calls += 1
@@ -621,6 +640,11 @@ class MeteredClient:
                 "cost_by_model": {k: round(v, 6) for k, v in self.cost_by_model.items()},
                 "hard_cap_usd": self.hard_cap_usd,
                 "cap_reached": self.hard_cap_usd is not None and self.total_cost_usd >= self.hard_cap_usd,
+                "hard_cap_overrun_usd": round(
+                    max(0.0, self.total_cost_usd - self.hard_cap_usd)
+                    if self.hard_cap_usd is not None else 0.0,
+                    6,
+                ),
             }
 
 
@@ -1175,6 +1199,7 @@ class MockOpenAIClient:
         self.base_url = (base_url or get_base_url()).rstrip("/")
         self.model = model or get_model_name()
         self.is_mock = True
+        self.max_billable_attempts = 1
         # Mock costs are catalog prices x this factor; the meter scales its reservations to match
         self.cost_scale = float(force_cost_scale)
         self.chat = _MockChatNamespace(
