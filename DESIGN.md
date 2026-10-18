@@ -84,6 +84,9 @@ Certainty ranking (drives compute allocation, scoreboard order, exit order):
 survived falsifications (big plus), merges attracted (plus), open critic
 objections (minus), age-without-testing (decays per whole second). Certainty is *revealed by
 selection*, not computed upfront. Score weights are tunable dials.
+When evidence ties, selection uses ID-free branch content and a content-derived lineage
+digest. Parallel registration timing therefore cannot choose pair orientation, a
+contradiction loser, falsification order, or which candidates make the winner cut.
 
 ### 2. Branch spawner — directives, mini-harnesses, budget
 

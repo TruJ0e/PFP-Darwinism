@@ -78,9 +78,10 @@ class TestPiece4AlignmentDetector(unittest.TestCase):
 
         # Stage 1: Embedding pre-filter recalls SSH port 22 host pairs (A-B, A-C, B-C) above unrelated D
         candidates = detector.embedding_prefilter([ba, bb, bc, bd])
-        passed_pairs = {(c.branch_a_id, c.branch_b_id) for c in candidates if c.passed_prefilter}
-        self.assertIn(("b_firewall", "b_sshd"), passed_pairs)
-        self.assertIn(("b_firewall", "b_fail2ban"), passed_pairs)
+        # Pair orientation is content-ordered (v0.17), so compare unordered pairs
+        passed_pairs = {frozenset((c.branch_a_id, c.branch_b_id)) for c in candidates if c.passed_prefilter}
+        self.assertIn(frozenset(("b_firewall", "b_sshd")), passed_pairs)
+        self.assertIn(frozenset(("b_firewall", "b_fail2ban")), passed_pairs)
 
         # Stage 2: Super judge distinguishes overlap vs contradictory vs unrelated
         res_ab = detector.judge_pair(ba, bb)

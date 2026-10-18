@@ -25,12 +25,22 @@ Refinements in Pass 2 (by what was meant):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import re
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+
+_BRANCH_ID = re.compile(r"branch_\d+")
+
+
+def id_free(text: str) -> str:
+    """Text with branch IDs blanked: IDs follow thread scheduling, so they can't order content."""
+    return _BRANCH_ID.sub("branch_#", text)
 
 
 def _finite_number(value: Any, field_name: str) -> float:
@@ -113,6 +123,11 @@ class BranchRecord:
     appeal_used: bool = False
     # How the branch was born: "starter", "plaus", "ns", "merge" (drives arena colors + NS selection)
     origin: str = "starter"
+    # Scheduling-free identity of where the branch came from: a digest of its ID-free fork and
+    # origin plus its parents' digests (set by `PFPTracker.register_branch`). Two branches with
+    # byte-identical text but different ancestry (common for merged children) order apart on
+    # it, where their IDs would order them by which thread registered first.
+    lineage_digest: str = ""
 
     @property
     def is_alive(self) -> bool:
@@ -160,6 +175,25 @@ class BranchRecord:
         }
 
 
+def branch_position_text(record: BranchRecord) -> str:
+    trace_str = " | ".join(record.reasoning_trace)
+    return f"{record.fork_under_exploration} | {trace_str}".strip()
+
+
+def content_order_key(record: BranchRecord) -> Tuple[str, str, str]:
+    """
+    Canonical tie-break for selection: the branch's ID-free position, its lineage digest,
+    then its ID.
+
+    Parallel subtrees register branches (and draw IDs) in thread-scheduling order, so the
+    tracker's record order is not reproducible. Every selection decision that could tie
+    (pair order, merge orientation, contradiction loser, pre-exit order and cut) falls back
+    to this key instead, so equal evidence on equal content always resolves the same way.
+    The ID only decides between branches with the same text *and* the same ancestry.
+    """
+    return (id_free(branch_position_text(record)), record.lineage_digest, record.id)
+
+
 class PFPTracker:
     """
     Thread-safe state ledger for PFP Darwinism.
@@ -181,6 +215,7 @@ class PFPTracker:
         certainty_score: float = 0.0,
         depth: int = 0,
         origin: str = "starter",
+        merge_parents: Sequence[str] = (),
     ) -> BranchRecord:
         with self._lock:
             if branch_id in self._records:
@@ -199,6 +234,8 @@ class PFPTracker:
                 fork_under_exploration=fork_under_exploration,
                 depth=depth,
                 origin=origin,
+                merge_parents=list(merge_parents),
+                lineage_digest=self._lineage_digest(branch_id, parent, merge_parents, fork_under_exploration, origin),
                 created_at=now,
                 last_tested_at=now,
                 state_history=[
@@ -212,6 +249,21 @@ class PFPTracker:
             )
             self._records[branch_id] = rec
             return rec
+
+    def _lineage_digest(
+        self,
+        branch_id: str,
+        parent: Optional[str],
+        merge_parents: Sequence[str],
+        fork: str,
+        origin: str,
+    ) -> str:
+        parent_digests = sorted(
+            {self._records[p].lineage_digest for p in [parent, *merge_parents] if p in self._records}
+        )
+        # Starter IDs ("starter_agent_N") are assigned in order and kept; branch_N IDs are blanked
+        material = json.dumps([id_free(branch_id), origin, id_free(fork), parent_digests])
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
     def get(self, branch_id: str) -> BranchRecord:
         with self._lock:

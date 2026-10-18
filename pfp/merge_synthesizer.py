@@ -253,8 +253,8 @@ class MergeSynthesizer:
             certainty_score=initial_certainty,
             depth=child_depth,
             origin="merge",
+            merge_parents=(branch_a_id, branch_b_id),
         )
-        child_rec.merge_parents = [branch_a_id, branch_b_id]
         child_rec.merge_provenance = provenance
         self.tracker.update_branch(
             child_branch_id,

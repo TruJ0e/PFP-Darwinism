@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tup
 
 from .backend import SUPER_MODEL
 from .jsonutil import as_str_list, parse_json_object
-from .tracker import BranchRecord
+from .tracker import BranchRecord, branch_position_text, content_order_key
 
 
 class AlignmentVerdict(str, Enum):
@@ -182,11 +182,6 @@ def dedup_claims(claims: Sequence[str]) -> List[str]:
     return out
 
 
-def branch_position_text(record: BranchRecord) -> str:
-    trace_str = " | ".join(record.reasoning_trace)
-    return f"{record.fork_under_exploration} | {trace_str}".strip()
-
-
 class AlignmentDetector:
     """
     Piece 4: Alignment detector — spotting mergeable branches (Pass 2: intent & refinement).
@@ -231,6 +226,10 @@ class AlignmentDetector:
             b.id: compute_branch_embedding(branch_position_text(b), dim=self.embedding_dim)
             for b in branches
         }
+        # Content order, not registration order: pair orientation (which branch is "A" in the
+        # judge and merge prompts) and similarity ties must not follow thread scheduling
+        branches = sorted(branches, key=content_order_key)
+        keys = {b.id: content_order_key(b) for b in branches}
         pairs: List[AlignmentCandidatePair] = []
         for i in range(len(branches)):
             for j in range(i + 1, len(branches)):
@@ -247,7 +246,7 @@ class AlignmentDetector:
                         passed_prefilter=(sim >= self.prefilter_threshold),
                     )
                 )
-        pairs.sort(key=lambda p: p.cosine_similarity, reverse=True)
+        pairs.sort(key=lambda p: (-p.cosine_similarity, keys[p.branch_a_id], keys[p.branch_b_id]))
         return pairs
 
     def extract_claims(self, branch: BranchRecord) -> Tuple[List[str], float]:

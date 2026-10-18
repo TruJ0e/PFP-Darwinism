@@ -1128,6 +1128,7 @@ class MainHarness:
            (higher certainty exits first; duplicate solutions collapse to one entry).
         """
         from .alignment_detector import AlignmentVerdict
+        from .tracker import content_order_key
 
         merges_performed: List[Dict[str, Any]] = []
         contradictions_resolved: List[Dict[str, Any]] = []
@@ -1212,7 +1213,7 @@ class MainHarness:
 
         # Blind variation must face selection: NS-born branches never exit untested
         if not self._should_stop():
-            for b in list(self.tracker.active_branches()):
+            for b in sorted(self.tracker.active_branches(), key=content_order_key):
                 if b.origin == "ns" and b.state == BranchState.POSSIBLE and b.survived_falsifications == 0:
                     out = self.fail_judge.falsify_branch(b.id, schedule_trigger="background_sample")
                     falsifications_run.append(out.to_dict())
@@ -1225,7 +1226,10 @@ class MainHarness:
             seen: set = set()
             top_candidates: List[BranchRecord] = []
             frontier = [r for r in self.tracker.active_branches() if r.id not in split_parents]
-            for rec in sorted(frontier, key=lambda r: r.certainty_score, reverse=True):
+            # Certainty ties (common: equal evidence -> equal certainty) resolve on content, so which
+            # duplicate stands for a solution, and who makes the max_winners cut, never follows the
+            # registration order that parallel subtrees leave to thread scheduling
+            for rec in sorted(frontier, key=lambda r: (-r.certainty_score, content_order_key(r))):
                 key = self._solution_key(rec)
                 if key in seen:
                     continue

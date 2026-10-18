@@ -218,6 +218,12 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   branch went on to win. The same mock sandbox finished at 22.5 or 31.5 depending on thread
   timing, and the paired A/B sometimes flagged an unchanged-quality candidate as degraded.
   Now equal evidence means equal certainty, and the existing content tie-break decides.
+- **Selection is invariant to parallel registration order.** Every equal-score decision now
+  uses an ID-free branch-position key plus a content-derived lineage digest: alignment pair
+  orientation and similarity ties, background sampling, contradiction ties, dependent
+  re-verification, gauntlet order, duplicate collapse and the winner cut no longer inherit
+  whichever subtree happened to acquire a branch ID first. Merge lineage hashes both parents
+  without regard to orientation, preserving distinct ancestry when branch text is identical.
 - **The winner's box is re-checked after the whole pre-exit sweep.** A later
   candidate's kill re-verifies its dependents; a winner demoted that way no longer
   exits. A contradiction tie on certainty spares the branch with more survived
@@ -324,8 +330,8 @@ python -m pytest -q
 The suite runs fully offline against the deterministic, content-addressed mock
 (same prompt → same reply regardless of thread interleaving; since v0.14 branch IDs are
 blanked from the content address, because parallel subtrees race for the run-wide ID counter
-and the same branch could otherwise draw a different reply depending on scheduling. The
-background falsifier likewise breaks certainty ties on branch content, not birth time) and a local fake
+and the same branch could otherwise draw a different reply depending on scheduling. Since
+v0.17 all selection ties use ID-free content plus a lineage digest, not registration order) and a local fake
 HTTP server for the live client. It also stress-tests concurrent cap admission
 and rejects replay logs with sequence gaps, duplicate sequence numbers, or
 missing branch snapshots.

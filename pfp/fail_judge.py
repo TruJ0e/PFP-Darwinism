@@ -24,23 +24,24 @@ exits survived — not that only one can.
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .alignment_detector import branch_position_text, fence_untrusted
+from .alignment_detector import fence_untrusted
 from .backend import SUPER_MODEL
 from .branch_spawner import BudgetLedger, HarnessEvent
 from .issue_detector import IssueDetector
 from .jsonutil import coerce_bool, parse_json_object
-from .tracker import BranchRecord, BranchState, PFPTracker, PassProvenanceRecord
-
-
-def _ID_FREE(text: str) -> str:
-    """Text with branch IDs blanked: IDs follow thread scheduling, so they can't order content."""
-    return re.sub(r"branch_\d+", "branch_#", text)
+from .tracker import (
+    BranchRecord,
+    BranchState,
+    PFPTracker,
+    PassProvenanceRecord,
+    branch_position_text,
+    content_order_key,
+)
 
 
 class FalsifierAngle(str, Enum):
@@ -565,9 +566,12 @@ class FailJudge:
         """
         Rank for the contradiction loser (lowest dies): certainty first; on a tie the
         branch with more survived falsifications, then fewer open objections, stays.
-        A full tie keeps the first branch alive deterministically (`min` picks it).
+        A full tie is settled on content (`content_order_key`), never on which branch the
+        caller happened to pass first: argument order follows tracker registration order,
+        which parallel spawning leaves to thread scheduling.
         """
-        return (rec.certainty_score, rec.survived_falsifications, -rec.open_critic_objections)
+        return (rec.certainty_score, rec.survived_falsifications, -rec.open_critic_objections,
+                content_order_key(rec))
 
     # ------------------------------------------------------------------
     # Schedule Trigger 4: Background sampling
@@ -590,9 +594,9 @@ class FailJudge:
         if untested:
             # An untested branch's last_tested_at is just its birth time, which parallel spawning
             # orders by thread scheduling; break certainty ties on content, not on the clock
-            target = min(untested, key=lambda b: (-b.certainty_score, _ID_FREE(branch_position_text(b)), b.id))
+            target = min(untested, key=lambda b: (-b.certainty_score, content_order_key(b)))
         else:
-            target = min(alive, key=lambda b: (-b.certainty_score, b.last_tested_at, b.id))
+            target = min(alive, key=lambda b: (-b.certainty_score, b.last_tested_at, content_order_key(b)))
         self.last_background_sample_at = now
         return self.falsify_branch(target.id, schedule_trigger="background_sample")
 
@@ -611,8 +615,9 @@ class FailJudge:
         else:
             candidates = self.tracker.active_branches()
 
-        # Order candidates by certainty_score descending so higher-certainty branches are tested & exit first
-        candidates.sort(key=lambda r: r.certainty_score, reverse=True)
+        # Order candidates by certainty_score descending so higher-certainty branches are tested & exit
+        # first; equal certainty is ordered on content, not on the caller's (scheduling) order
+        candidates.sort(key=lambda r: (-r.certainty_score, content_order_key(r)))
         winners: List[BranchRecord] = []
 
         for cand in candidates:
@@ -648,7 +653,7 @@ class FailJudge:
         # every Pass loss): only branches still Pass after the whole sweep are winners
         winners = [self.tracker.get(w.id) for w in winners]
         winners = [w for w in winners if w.state == BranchState.PASS]
-        winners.sort(key=lambda r: r.certainty_score, reverse=True)
+        winners.sort(key=lambda r: (-r.certainty_score, content_order_key(r)))
         return winners
 
     # ------------------------------------------------------------------
@@ -701,7 +706,7 @@ class FailJudge:
             },
         )
 
-        dependents = self.tracker.dependents_of(branch_id)
+        dependents = sorted(self.tracker.dependents_of(branch_id), key=content_order_key)
         dependent_outcomes: Dict[str, Dict[str, Any]] = {}
         for dep in dependents:
             if not dep.is_alive:

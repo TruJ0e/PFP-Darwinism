@@ -87,7 +87,8 @@ def test_skipped_pair_is_judged_on_a_later_round():
     # b and c survive (no merge happened in this unit test); the skipped (a,c)/(b,c) were not
     # marked judged, so the next round still considers them
     again = det.detect_alignments(t.active_branches(), max_pairs_to_judge=8)
-    assert {(r.branch_a_id, r.branch_b_id) for r in again} & {("a", "c"), ("b", "c")}
+    # (pair orientation is content-ordered since v0.17, so compare unordered pairs)
+    assert {frozenset((r.branch_a_id, r.branch_b_id)) for r in again} & {frozenset("ac"), frozenset("bc")}
 
 
 def test_cross_subtree_pair_wins_a_similarity_tie():
