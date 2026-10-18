@@ -104,6 +104,113 @@ class MergeSynthesizer:
         if not rec.is_alive:
             raise ValueError(f"Cannot merge non-alive branch {rec.id} (state={rec.state.value})")
 
+    def _commit_refusal(self, parent_a: BranchRecord, parent_b: BranchRecord, child_branch_id: str) -> Optional[str]:
+        """Why the merge can no longer commit (re-checked after the paid call), else None."""
+        for rec in (parent_a, parent_b):
+            if not rec.is_alive:
+                return f"Cannot merge non-alive branch {rec.id} (state={rec.state.value})"
+        if self.tracker.has(child_branch_id):
+            return f"Merge child id '{child_branch_id}' is already registered"
+        return None
+
+    def _synthesize(self, parent_a: BranchRecord, parent_b: BranchRecord, raw: str) -> tuple:
+        """Parse the Super reply into (fork, reasoning, kept, dropped, provenance)."""
+        branch_a_id, branch_b_id = parent_a.id, parent_b.id
+        data = parse_json_object(raw)
+        if data is not None:
+            unified_fork = str(
+                data.get("unified_fork")
+                or f"Merged({parent_a.fork_under_exploration} + {parent_b.fork_under_exploration})"
+            )
+            unified_reasoning = str(
+                data.get("unified_reasoning")
+                or f"Unified synthesis of {branch_a_id} and {branch_b_id}"
+            )
+            kept_claims = as_str_list(data.get("kept_claims"))
+            dropped_redundant = as_str_list(data.get("dropped_redundant"))
+            raw_prov = data.get("provenance")
+            if not isinstance(raw_prov, dict):
+                raw_prov = {}
+            prov_a = as_str_list(raw_prov.get("parent_a", raw_prov.get(branch_a_id)))
+            prov_b = as_str_list(raw_prov.get("parent_b", raw_prov.get(branch_b_id)))
+        else:
+            unified_fork = f"Merged({parent_a.fork_under_exploration} + {parent_b.fork_under_exploration})"
+            unified_reasoning = raw.strip() or f"Unified {branch_a_id} + {branch_b_id}"
+            kept_claims = []
+            dropped_redundant = []
+            prov_a = []
+            prov_b = []
+
+        if not prov_a:
+            prov_a = [parent_a.fork_under_exploration] + list(parent_a.reasoning_trace[-1:])
+        if not prov_b:
+            prov_b = [parent_b.fork_under_exploration] + list(parent_b.reasoning_trace[-1:])
+
+        provenance: Dict[str, List[str]] = {
+            branch_a_id: prov_a,
+            branch_b_id: prov_b,
+        }
+        # Also carry forward any earlier ancestor merge provenance
+        for k, v in parent_a.merge_provenance.items():
+            provenance.setdefault(k, list(v))
+        for k, v in parent_b.merge_provenance.items():
+            provenance.setdefault(k, list(v))
+        return unified_fork, unified_reasoning, kept_claims, dropped_redundant, provenance
+
+    def _commit(
+        self,
+        parent_a: BranchRecord,
+        parent_b: BranchRecord,
+        child_branch_id: str,
+        raw: str,
+        synth_cost: float,
+    ) -> tuple:
+        """Absorb both parents and register the child. Caller holds `tracker.atomic()`."""
+        branch_a_id, branch_b_id = parent_a.id, parent_b.id
+        synthesis = self._synthesize(parent_a, parent_b, raw)
+        unified_fork, unified_reasoning, _, _, provenance = synthesis
+
+        # Economics of cooperation: transfer remaining parent budgets to the child, less the
+        # part of the synthesis cost the pool can cover
+        budget_a = parent_a.budget_remaining
+        budget_b = parent_b.budget_remaining
+        combined_parent_budget = round(budget_a + budget_b, 6)
+        actual_synth_deducted = min(combined_parent_budget, synth_cost)
+        child_budget = round(max(0.0, combined_parent_budget - actual_synth_deducted), 6)
+
+        # Child starts Possible (NEVER Passed), at max depth of parents + 1
+        child_depth = max(parent_a.depth, parent_b.depth) + 1
+        combined_merges = parent_a.merges_attracted + parent_b.merges_attracted + 1
+        combined_survived = max(parent_a.survived_falsifications, parent_b.survived_falsifications)
+        initial_certainty = round(max(parent_a.certainty_score, parent_b.certainty_score) + 1.5, 4)
+
+        # Zero out parents' remaining budgets (transferred to child) and mark both ABSORBED (terminal)
+        self.tracker.update_branch(branch_a_id, budget_remaining=0.0)
+        self.tracker.update_branch(branch_b_id, budget_remaining=0.0)
+        self.tracker.transition(branch_a_id, BranchState.ABSORBED, reason=f"merged_into_{child_branch_id}")
+        self.tracker.transition(branch_b_id, BranchState.ABSORBED, reason=f"merged_into_{child_branch_id}")
+
+        child_rec = self.tracker.register_branch(
+            branch_id=child_branch_id,
+            parent=branch_a_id,
+            budget_remaining=child_budget,
+            fork_under_exploration=unified_fork,
+            state=BranchState.POSSIBLE,
+            certainty_score=initial_certainty,
+            depth=child_depth,
+            origin="merge",
+            merge_parents=(branch_a_id, branch_b_id),
+        )
+        child_rec.merge_provenance = provenance
+        self.tracker.update_branch(
+            child_branch_id,
+            survived_falsifications=combined_survived,
+            merges_attracted=combined_merges,
+            open_critic_objections=0,
+            reasoning_step=f"[Merged {branch_a_id} + {branch_b_id}] {unified_reasoning}",
+        )
+        return child_rec, budget_a, budget_b, child_budget, actual_synth_deducted, synthesis
+
     def merge_branches(
         self,
         branch_a_id: str,
@@ -165,79 +272,33 @@ class MergeSynthesizer:
             temperature=0.2,
             max_tokens=260,
         )
-        synth_cost = float(resp.usage.cost_usd)
-        # The Super call is the only window another worker could absorb or kill a parent
-        parent_a = self.tracker.get(branch_a_id)
-        parent_b = self.tracker.get(branch_b_id)
-        if self.budget_ledger is not None and not (parent_a.is_alive and parent_b.is_alive):
-            self.budget_ledger.record_spend(max(0.0, synth_cost), covered_usd=0.0)
-        self._require_alive(parent_a)
-        self._require_alive(parent_b)
+        synth_cost = max(0.0, float(resp.usage.cost_usd))
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
 
-        data = parse_json_object(raw)
-        if data is not None:
-            unified_fork = str(
-                data.get("unified_fork")
-                or f"Merged({parent_a.fork_under_exploration} + {parent_b.fork_under_exploration})"
-            )
-            unified_reasoning = str(
-                data.get("unified_reasoning")
-                or f"Unified synthesis of {branch_a_id} and {branch_b_id}"
-            )
-            kept_claims = as_str_list(data.get("kept_claims"))
-            dropped_redundant = as_str_list(data.get("dropped_redundant"))
-            raw_prov = data.get("provenance")
-            if not isinstance(raw_prov, dict):
-                raw_prov = {}
-            prov_a = as_str_list(raw_prov.get("parent_a", raw_prov.get(branch_a_id)))
-            prov_b = as_str_list(raw_prov.get("parent_b", raw_prov.get(branch_b_id)))
-        else:
-            unified_fork = f"Merged({parent_a.fork_under_exploration} + {parent_b.fork_under_exploration})"
-            unified_reasoning = raw.strip() or f"Unified {branch_a_id} + {branch_b_id}"
-            kept_claims = []
-            dropped_redundant = []
-            prov_a = []
-            prov_b = []
+        # The Super call is the window in which another worker could kill or absorb a parent, or
+        # take the child id. Re-check and write under one tracker lock so the merge lands whole
+        # (both parents absorbed, child registered) or not at all — never a parent absorbed and
+        # zeroed with no child to carry its budget. The ledger is booked after the lock is released
+        # (BudgetLedger.charge takes ledger -> tracker, so tracker -> ledger would deadlock).
+        with self.tracker.atomic():
+            parent_a = self.tracker.get(branch_a_id)
+            parent_b = self.tracker.get(branch_b_id)
+            refusal = self._commit_refusal(parent_a, parent_b, child_branch_id)
+            if refusal is None:
+                committed = self._commit(parent_a, parent_b, child_branch_id, raw, synth_cost)
+        if refusal is not None:
+            if self.budget_ledger is not None:
+                # The call was really paid for: book it as overdraft, never hide it
+                self.budget_ledger.record_spend(synth_cost, covered_usd=0.0)
+            raise ValueError(refusal)
+        child_rec, budget_a, budget_b, child_budget, actual_synth_deducted, synthesis = committed
+        unified_fork, unified_reasoning, kept_claims, dropped_redundant, provenance = synthesis
 
-        if not prov_a:
-            prov_a = [parent_a.fork_under_exploration] + list(parent_a.reasoning_trace[-1:])
-        if not prov_b:
-            prov_b = [parent_b.fork_under_exploration] + list(parent_b.reasoning_trace[-1:])
-
-        provenance: Dict[str, List[str]] = {
-            branch_a_id: prov_a,
-            branch_b_id: prov_b,
-        }
-        # Also carry forward any earlier ancestor merge provenance
-        for k, v in parent_a.merge_provenance.items():
-            provenance.setdefault(k, list(v))
-        for k, v in parent_b.merge_provenance.items():
-            provenance.setdefault(k, list(v))
-
-        # Economics of cooperation: transfer remaining parent budgets to the child
-        budget_a = parent_a.budget_remaining
-        budget_b = parent_b.budget_remaining
-        combined_parent_budget = round(budget_a + budget_b, 6)
-
-        # Deduct synthesis call cost from combined pool; the ledger records the full real
-        # cost (any part the parents could not cover is booked as overdraft)
-        actual_synth_deducted = min(combined_parent_budget, max(0.0, synth_cost))
         if self.budget_ledger is not None:
-            # Merging is selection work: a shortfall may be covered by the finish reserve
-            from_reserve = self.budget_ledger.cover_from_finish_reserve(
-                max(0.0, synth_cost) - actual_synth_deducted
-            )
-            self.budget_ledger.record_spend(
-                max(0.0, synth_cost), covered_usd=actual_synth_deducted + from_reserve
-            )
-        child_budget = round(max(0.0, combined_parent_budget - actual_synth_deducted), 6)
-
-        # Zero out parents' remaining budgets (transferred to child) and mark both ABSORBED (terminal)
-        self.tracker.update_branch(branch_a_id, budget_remaining=0.0)
-        self.tracker.update_branch(branch_b_id, budget_remaining=0.0)
-        self.tracker.transition(branch_a_id, BranchState.ABSORBED, reason=f"merged_into_{child_branch_id}")
-        self.tracker.transition(branch_b_id, BranchState.ABSORBED, reason=f"merged_into_{child_branch_id}")
+            # Deducted from the parents' pool; merging is selection work, so a shortfall may be
+            # covered by the finish reserve, and anything still uncovered is booked as overdraft
+            from_reserve = self.budget_ledger.cover_from_finish_reserve(synth_cost - actual_synth_deducted)
+            self.budget_ledger.record_spend(synth_cost, covered_usd=actual_synth_deducted + from_reserve)
 
         self._emit(
             "budget_change",
@@ -258,32 +319,6 @@ class MergeSynthesizer:
                 "transferred_usd": round(budget_b, 6),
                 "budget_remaining": 0.0,
             },
-        )
-
-        # Child starts Possible (NEVER Passed), at max depth of parents + 1
-        child_depth = max(parent_a.depth, parent_b.depth) + 1
-        combined_merges = parent_a.merges_attracted + parent_b.merges_attracted + 1
-        combined_survived = max(parent_a.survived_falsifications, parent_b.survived_falsifications)
-        initial_certainty = round(max(parent_a.certainty_score, parent_b.certainty_score) + 1.5, 4)
-
-        child_rec = self.tracker.register_branch(
-            branch_id=child_branch_id,
-            parent=branch_a_id,
-            budget_remaining=child_budget,
-            fork_under_exploration=unified_fork,
-            state=BranchState.POSSIBLE,
-            certainty_score=initial_certainty,
-            depth=child_depth,
-            origin="merge",
-            merge_parents=(branch_a_id, branch_b_id),
-        )
-        child_rec.merge_provenance = provenance
-        self.tracker.update_branch(
-            child_branch_id,
-            survived_falsifications=combined_survived,
-            merges_attracted=combined_merges,
-            open_critic_objections=0,
-            reasoning_step=f"[Merged {branch_a_id} + {branch_b_id}] {unified_reasoning}",
         )
 
         res = MergeSynthesisResult(

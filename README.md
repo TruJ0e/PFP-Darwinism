@@ -211,6 +211,10 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   one budget), a child id already in the ledger, and an alignment verdict for a different pair
   are rejected before the Super call. A parent killed while synthesis is in flight leaves both
   parents and their budgets intact; the paid call is still booked, as overdraft.
+- **A merge commits whole or not at all.** After the Super call, the parent re-check, both
+  absorptions and the child's registration run under one tracker lock (`PFPTracker.atomic()`),
+  so a worker can't kill a parent, or take the child id, halfway through and strand an absorbed,
+  zeroed parent with no child to carry its budget.
 - **Selection is paid for.** Each branch keeps a protected verification share
   (30% by default) that exploration and child spawning can't touch; split
   parents' idle budgets return to the finish reserve when selection begins.

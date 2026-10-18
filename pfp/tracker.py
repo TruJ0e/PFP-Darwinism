@@ -31,9 +31,10 @@ import math
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple
 
 _BRANCH_ID = re.compile(r"branch_\d+")
 
@@ -264,6 +265,17 @@ class PFPTracker:
         # Starter IDs ("starter_agent_N") are assigned in order and kept; branch_N IDs are blanked
         material = json.dumps([id_free(branch_id), origin, id_free(fork), parent_digests])
         return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+    @contextmanager
+    def atomic(self) -> Iterator["PFPTracker"]:
+        """
+        Hold the ledger lock across a multi-record check-then-act (e.g. a merge commit), so no
+        other worker can kill, absorb or register a branch between the check and the writes.
+        Never call into the BudgetLedger while holding it: `BudgetLedger.charge` takes the
+        ledger lock first and the tracker lock second.
+        """
+        with self._lock:
+            yield self
 
     def has(self, branch_id: str) -> bool:
         with self._lock:
