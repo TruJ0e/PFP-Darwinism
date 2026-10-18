@@ -55,7 +55,7 @@ stored case's `wins` instead of piling up duplicates. Real scale is `--starters 
 | `--k-probes` | 3 | blind continuations per divergence check |
 | `--gauntlet-rounds` | 3 | rotated falsification rounds to earn Pass |
 | `--selection-rounds` | 3 | align → clash → merge rounds (merged children can merge again) |
-| `--state-dir` | — | persist registry + case bank across runs (one run at a time: `.pfp.lock`, auto-reclaiming dead local PIDs) |
+| `--state-dir` | — | persist registry + case bank across runs (one run at a time: token-owned `.pfp.lock`, auto-reclaiming dead local PIDs) |
 | `--pin-version` | — | pin a registry version in `--state-dir` before running |
 | `--unpin` | off | clear any manual version pin in `--state-dir` before running |
 | `--restore-version` | — | restore a registry version in `--state-dir` before running |
@@ -290,11 +290,13 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   non-numeric / non-finite / negative certainty becomes 0 (it would otherwise
   poison the certainty-weighted starter split), text is length-capped, and the
   bank is bounded (`max_cases`, default 500, keeping the most-won cases).
-- **One run per state dir.** `--state-dir` is held with an atomic `O_EXCL` lock file
-  (`.pfp.lock`, naming pid/host/time) for the whole command; a second run refuses
+- **One run per state dir.** `--state-dir` is held with an atomic, token-owned lock directory
+  (`.pfp.lock/owner.json`, naming pid/host/time/token) for the whole command; a second run refuses
   before spending instead of loading the same registry and overwriting the first
   run's versions and wins on save. A lock left on the same host by a dead process
   PID is reclaimed automatically; foreign-host or live-PID locks are strictly respected.
+  Release verifies the ownership token, so delayed cleanup cannot erase a successor's lock;
+  legacy lock files are recognized and migrated on acquisition.
 - A malformed registry refuses to load instead of half-loading; every persisted
   artifact (stream, HTML, registry, case bank, summary, report) is written via
   `pfp/fsutil.py`: temp file → fsync → atomic replace.

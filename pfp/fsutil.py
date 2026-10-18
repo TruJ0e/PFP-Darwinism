@@ -14,6 +14,7 @@ import os
 import socket
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -101,50 +102,99 @@ def _is_stale_local_lock(holder_text: str) -> bool:
     return not _pid_is_alive(pid)
 
 
+_LOCK_OWNER_FILE = "owner.json"
+
+
+def _lock_holder(path: Path) -> str:
+    """Read either a v0.18 lock directory or the legacy lock-file payload."""
+    try:
+        source = path / _LOCK_OWNER_FILE if path.is_dir() else path
+        return source.read_text(encoding="utf-8").strip()[:1000]
+    except OSError:
+        return ""
+
+
+def _remove_stale_lock(path: Path, holder: str) -> bool:
+    """Remove a known-stale lock without ever deleting a differently owned lock."""
+    if not holder or not _is_stale_local_lock(holder):
+        return False
+    try:
+        if path.is_dir():
+            owner = path / _LOCK_OWNER_FILE
+            # Re-read immediately before removal. A token/PID change means ownership changed.
+            if owner.read_text(encoding="utf-8").strip()[:1000] != holder:
+                return False
+            owner.unlink()
+            path.rmdir()
+        else:
+            # Legacy O_EXCL lock files have no ownership token. Removing the stale inode
+            # creates the contention point; the following mkdir decides exactly one winner.
+            if path.read_text(encoding="utf-8").strip()[:1000] != holder:
+                return False
+            path.unlink()
+        return True
+    except OSError:
+        return False
+
+
 @contextmanager
 def exclusive_lock(path: str | Path) -> Iterator[Path]:
     """
-    Hold ``path`` as an exclusive lock file for the duration of the block.
+    Hold ``path`` as an exclusive, token-owned lock directory for the duration.
 
     Two runs sharing one ``--state-dir`` would each load the registry and case bank, then
     the later save would silently discard the earlier run's versions and wins (a lost
-    update on the failsafe). Creation is atomic (``O_CREAT | O_EXCL``), so exactly one
-    holder wins; the loser fails before any client exists. The file names its holder,
-    and a lock left behind by a killed local process is reclaimed automatically (or can
-    be cleared by deleting it).
+    update on the failsafe). Directory creation is atomic, so exactly one holder wins;
+    the loser fails before any client exists. ``owner.json`` names the holder and carries
+    an unguessable ownership token. Cleanup verifies that token, so a late ``finally``
+    can never remove a successor's lock. A dead local holder is reclaimed automatically.
+    Legacy JSON lock files from v0.17 and earlier are recognized and safely migrated.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = None
+    token = uuid.uuid4().hex
+    metadata = json.dumps(
+        {"pid": os.getpid(), "host": socket.gethostname(), "acquired": round(time.time(), 3), "token": token}
+    )
+    acquired = False
     for attempt in range(2):
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            path.mkdir()
+            try:
+                # The directory already excludes contenders. Write ownership durably before yielding.
+                atomic_write_text(path / _LOCK_OWNER_FILE, metadata)
+            except BaseException:
+                try:
+                    (path / _LOCK_OWNER_FILE).unlink(missing_ok=True)
+                    path.rmdir()
+                finally:
+                    raise
+            acquired = True
             break
         except FileExistsError:
-            try:
-                holder = path.read_text(encoding="utf-8").strip()[:300]
-            except OSError:
-                holder = ""
-            if attempt == 0 and holder and _is_stale_local_lock(holder):
-                try:
-                    path.unlink(missing_ok=True)
-                    continue
-                except OSError:
-                    pass
+            holder = _lock_holder(path)
+            if attempt == 0 and _remove_stale_lock(path, holder):
+                continue
             raise StateLockError(
                 f"{path} is held by another run ({holder or 'unknown holder'}); "
-                "if no run is active, delete the lock file and retry"
+                "if no run is active, remove the lock and retry"
             ) from None
-    assert fd is not None
+    if not acquired:
+        raise StateLockError(f"Could not acquire {path}")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {"pid": os.getpid(), "host": socket.gethostname(), "acquired": round(time.time(), 3)}
-                )
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
         yield path
     finally:
-        path.unlink(missing_ok=True)
+        # Only the owner may release. If the path was externally replaced, leave it alone.
+        owner = path / _LOCK_OWNER_FILE
+        try:
+            current = json.loads(owner.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            current = {}
+        if isinstance(current, dict) and current.get("token") == token:
+            try:
+                owner.unlink()
+                path.rmdir()
+            except OSError:
+                # Unknown files or a racing external mutation make fail-closed retention
+                # safer than deleting a lock we can no longer prove we wholly own.
+                pass

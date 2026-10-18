@@ -147,7 +147,7 @@ def test_exclusive_lock_reclaims_stale_local_pid_lock(tmp_path):
 
     with exclusive_lock(lock_file) as acquired:
         assert acquired == lock_file
-        meta = json.loads(lock_file.read_text(encoding="utf-8"))
+        meta = json.loads((lock_file / "owner.json").read_text(encoding="utf-8"))
         assert meta["pid"] == os.getpid()
     assert not lock_file.exists()
 
