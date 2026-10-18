@@ -209,6 +209,8 @@ post-run replay — same data.
   gauntlet length), never on the dials under test: a rewrite that only changes how
   certainty is counted must not look like better or worse reasoning.
 - Manual pin: any version, anytime; all future runs use it.
+  A candidate proposed under a pin is held, and only it can be reverted for its own
+  sandbox score: the pinned version is never judged on evidence it didn't produce.
 - Run-boundary switching: versions change between runs, never mid-arena.
   Emergency stop kills the run; rollback applies next.
 - Failed versions feed back into the anti-model as failed experiments.

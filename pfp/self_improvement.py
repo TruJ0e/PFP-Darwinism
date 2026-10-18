@@ -42,7 +42,14 @@ from .alignment_detector import _UNTRUSTED_NOTICE, fence_untrusted
 from .arena import ARENA_LEVEL_EVENT_TYPES, CANONICAL_EVENT_TYPES, ArenaEvent
 from .backend import SUPER_MODEL
 from .fsutil import atomic_write_text
-from .dials import DEFAULT_DIALS, evidence_score, resolve_dials, sanitize_dials, weights_from_dials
+from .dials import (
+    DEFAULT_DIALS,
+    _evidence_count,
+    evidence_score,
+    resolve_dials,
+    sanitize_dials,
+    weights_from_dials,
+)
 from .issue_detector import _jaccard_similarity
 from .jsonutil import as_str_list, parse_json_object
 
@@ -50,7 +57,18 @@ from .jsonutil import as_str_list, parse_json_object
 # What `SandboxResult.score` measures (recorded on every sandbox record; see dials.evidence_score)
 SCORE_YARDSTICK = "reference_evidence_v1"
 
-_SNAPSHOT_STATUSES = frozenset({"baseline", "adopted", "reverted", "rejected_sandbox"})
+# "held_by_pin": the sandbox passed but a manual pin kept it from becoming active (v0.32)
+_SNAPSHOT_STATUSES = frozenset(
+    {"baseline", "adopted", "held_by_pin", "reverted", "rejected_sandbox"}
+)
+
+
+def _snapshot_number(value: Any) -> float:
+    """A finite float from an untrusted journal snapshot, else 0.0 (the miner never raises on data)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    num = float(value)
+    return num if math.isfinite(num) else 0.0
 
 
 def _finite_number(value: Any, name: str) -> float:
@@ -145,10 +163,10 @@ class EventLogMiner:
                         "child_branch_id": evt.branch_id,
                         "parent_a_id": det.get("parent_a_id", ""),
                         "parent_b_id": det.get("parent_b_id", ""),
-                        "transferred_budget_usd": float(det.get("transferred_budget_usd", 0.0)),
+                        "transferred_budget_usd": _snapshot_number(det.get("transferred_budget_usd")),
                     }
                 )
-                synth_spent = float(det.get("synthesis_cost_usd", 0.0) or 0.0)
+                synth_spent = _snapshot_number(det.get("synthesis_cost_usd"))
                 if math.isfinite(synth_spent) and synth_spent > 0.0:
                     spend_by_reason["merge_synthesis"] = round(
                         spend_by_reason.get("merge_synthesis", 0.0) + synth_spent, 6
@@ -166,7 +184,7 @@ class EventLogMiner:
                 else:
                     entry["survivals"] += 1
             elif et == "budget_change":
-                spent = float(det.get("spent_usd", 0.0) or 0.0)
+                spent = _snapshot_number(det.get("spent_usd"))
                 if math.isfinite(spent) and spent > 0.0:
                     reason = str(det.get("reason", "other"))
                     spend_by_reason[reason] = round(spend_by_reason.get(reason, 0.0) + spent, 6)
@@ -178,19 +196,23 @@ class EventLogMiner:
 
         # Winning branch shapes (all branches that ended in Pass)
         winners = [b for b in branches.values() if b.get("state") == "Pass"]
-        winners.sort(key=lambda b: float(b.get("certainty_score", 0.0)), reverse=True)
+        # Snapshots are journal data (a replayed or legacy v1 file is untrusted): a malformed
+        # field counts for nothing instead of crashing the cycle before anything is recorded
+        winners.sort(key=lambda b: _snapshot_number(b.get("certainty_score")), reverse=True)
         winning_shapes: List[Dict[str, Any]] = []
         for w in winners:
+            parents = w.get("merge_parents")
+            parents = [str(x) for x in parents] if isinstance(parents, list) else []
             winning_shapes.append(
                 {
                     "branch_id": w.get("id"),
-                    "depth": int(w.get("depth", 0)),
-                    "is_merged_branch": bool(w.get("merge_parents")),
-                    "merge_parents": list(w.get("merge_parents", [])),
-                    "merges_attracted": int(w.get("merges_attracted", 0)),
-                    "survived_falsifications": int(w.get("survived_falsifications", 0)),
-                    "open_critic_objections": int(w.get("open_critic_objections", 0) or 0),
-                    "certainty_score": float(w.get("certainty_score", 0.0)),
+                    "depth": _evidence_count(w.get("depth")),
+                    "is_merged_branch": bool(parents),
+                    "merge_parents": parents,
+                    "merges_attracted": _evidence_count(w.get("merges_attracted")),
+                    "survived_falsifications": _evidence_count(w.get("survived_falsifications")),
+                    "open_critic_objections": _evidence_count(w.get("open_critic_objections")),
+                    "certainty_score": _snapshot_number(w.get("certainty_score")),
                     "evidence_score": evidence_score(w),
                     "fork_shape": str(w.get("fork_under_exploration", "")),
                     "solution": str(w.get("solution", "")),
@@ -221,12 +243,12 @@ class EventLogMiner:
 
         # Spend vs certainty efficiency
         max_winner_certainty = (
-            max((float(w.get("certainty_score", 0.0)) for w in winners), default=0.0)
+            max((_snapshot_number(w.get("certainty_score")) for w in winners), default=0.0)
         )
         # The version-invariant yardstick (dials.evidence_score): the sandbox A/B baseline
         max_winner_evidence = max((evidence_score(w) for w in winners), default=0.0)
         mean_certainty = (
-            sum(float(b.get("certainty_score", 0.0)) for b in branches.values())
+            sum(_snapshot_number(b.get("certainty_score")) for b in branches.values())
             / float(max(1, len(branches)))
         )
         denom = max(1e-6, total_spent_usd)
@@ -506,6 +528,9 @@ class VersionRegistry:
         # If manual pin is active, do not override pinned version
         if adopt and self.pinned_version_id is None:
             self.active_version_id = vid
+        elif adopt and status == "adopted":
+            # Never active, so never "adopted": the pin holds it until an operator restores it
+            snap.status = "held_by_pin"
         return snap
 
     # ------------------------------------------------------------------
@@ -720,7 +745,13 @@ class VersionRegistry:
             )
         self.pinned_version_id = version_id
         self.active_version_id = version_id
+        self._release_held(version_id)
         return self._versions[version_id]
+
+    def _release_held(self, version_id: str) -> None:
+        """An operator chose a candidate a pin had held: from now on it is simply adopted."""
+        if self._versions[version_id].status == "held_by_pin":
+            self._versions[version_id].status = "adopted"
 
     def unpin(self) -> None:
         self.pinned_version_id = None
@@ -737,16 +768,25 @@ class VersionRegistry:
             )
         self.pinned_version_id = None
         self.active_version_id = version_id
+        self._release_held(version_id)
         return self._versions[version_id]
 
     def evaluate_and_auto_revert(
         self,
         measured_score: float,
         baseline_score: float,
+        version_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Auto-revert on measured degradation past threshold (no human needed).
         Failed versions feed back into the anti-model as failed experiments.
+
+        `version_id` names the version the scores were measured on (default: the current one).
+        Pass it whenever the measured version may not be current: under a manual pin a fresh
+        candidate is registered but held, and judging the pinned version on the candidate's
+        score would revert (and unpin) the operator's choice while the bad candidate stayed
+        clean. A degraded version that is not the active one is marked reverted and recorded
+        as a failed experiment; the active version and any pin are left untouched.
         """
         if self.run_in_progress:
             raise RunBoundarySwitchError("Auto-revert evaluation must run between runs, not mid-run.")
@@ -756,7 +796,8 @@ class VersionRegistry:
         if measured_score < 0.0 or baseline_score < 0.0:
             raise ValueError("measured_score and baseline_score must be non-negative.")
 
-        cur = self.get_version()
+        cur = self.get_version(version_id)
+        is_active = cur.version_id == self.active_version_id
         if baseline_score <= 0:
             degradation_ratio = 0.0
         else:
@@ -765,10 +806,15 @@ class VersionRegistry:
         if degradation_ratio > self.degradation_threshold and cur.parent_version_id is not None:
             reverted_from = cur.version_id
             cur.status = "reverted"
-            fallback_id = cur.parent_version_id
-            if self.pinned_version_id == reverted_from:
-                self.pinned_version_id = None
-            self.active_version_id = fallback_id
+            if is_active:
+                fallback_id = cur.parent_version_id
+                if self.pinned_version_id == reverted_from:
+                    self.pinned_version_id = None
+                self.active_version_id = fallback_id
+            else:
+                fallback_id = self.get_version().version_id
+            if self.pending_next_run_version_id == reverted_from:
+                self.pending_next_run_version_id = None
             self.failed_experiments.append(
                 {
                     "version_id": reverted_from,
@@ -788,7 +834,7 @@ class VersionRegistry:
 
         return {
             "reverted": False,
-            "active_version_id": cur.version_id,
+            "active_version_id": self.get_version().version_id,
             "degradation_ratio": round(degradation_ratio, 4),
         }
 
@@ -1369,9 +1415,11 @@ class SelfImprovementLoop:
 
         revert_check = {"reverted": False, "active_version_id": self.registry.active_version_id}
         if sb_res.coherent:
+            # The scores belong to the candidate just registered, not to whatever a pin keeps current
             revert_check = self.registry.evaluate_and_auto_revert(
                 measured_score=sb_res.score,
                 baseline_score=baseline_score,
+                version_id=snap.version_id,
             )
 
         return {

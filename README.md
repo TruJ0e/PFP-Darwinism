@@ -339,6 +339,18 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`dials.REFERENCE_WEIGHTS`), with survivals from gauntlet rounds past the reference three left
   uncounted (a candidate that runs fewer rounds still loses what it skipped). Every sandbox record
   names its `score_yardstick` and keeps the candidate-weight figure as `certainty_score`.
+- **Auto-revert judges the version that was measured; a pin is never collateral.** Under a manual
+  pin the post-run candidate is registered but held (status `held_by_pin`, not `adopted`), and
+  before v0.32 the degradation check then ran on the *current* version, which is the pinned one:
+  a candidate that dropped `gauntlet_rounds` to 1 got the operator's pinned version marked
+  `reverted`, unpinned and replaced by its parent, while the bad candidate stayed `adopted` and
+  never reached `failed_experiments`. `evaluate_and_auto_revert(..., version_id=)` now names the
+  measured version: a degraded held candidate is reverted and logged as a failed experiment, and
+  the active version, the pin and the next-run queue are left alone (a reverted version is also
+  dropped from `pending_next_run_version_id`). Pinning or restoring a held candidate adopts it.
+- The event-log miner treats journal snapshots as untrusted: a malformed count, certainty, depth,
+  `merge_parents` or spend figure in a replayed or legacy v1 journal counts for nothing instead of
+  crashing the Piece 8 cycle before anything is recorded.
 - Proposed dial changes are untrusted input: `pfp/dials.py` rejects unknown
   keys, non-numeric values, NaN/inf, and anything outside the safe envelope
   (e.g. `gauntlet_rounds: 0`, rewarding open objections). Rejections are
