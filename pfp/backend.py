@@ -807,7 +807,10 @@ class _MockChatCompletions:
         lower = prompt_text.lower()
         # Content-addressed choices: the same prompt always yields the same reply, no matter
         # how parallel branches interleave — runs and replays are reproducible
-        digest = int(hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()[:8], 16)
+        # Branch IDs come from one run-wide counter that parallel subtrees race for, so the same
+        # branch can be branch_0012 in one run and branch_0013 in the next: address content by
+        # what the prompt says, not by which thread happened to claim the next ID
+        digest = int(hashlib.sha1(_mock_key(prompt_text)).hexdigest()[:8], 16)
         # A single-sample top-up for sample k of a K batch (see IssueDetector._sample_choices)
         # is the k-th choice a provider honoring `n` would have returned
         marker = _SAMPLE_MARKER.search(lower)
@@ -913,7 +916,7 @@ class _MockChatCompletions:
 
         # 5. Compression / Directive summary
         if "compress parent reasoning" in lower:
-            digest = hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()[:8]
+            digest = hashlib.sha1(_mock_key(prompt_text)).hexdigest()[:8]
             return f"Compressed parent trace [{digest}]: evaluated SSH asymmetry hypotheses; narrowing active fork.", False
 
         # 6. Piece 4: Claim extraction for a branch
@@ -1212,6 +1215,14 @@ class _MockChatCompletions:
 class _MockChatNamespace:
     def __init__(self, completions: _MockChatCompletions):
         self.completions = completions
+
+
+_MOCK_BRANCH_ID = re.compile(r"branch_\d+")
+
+
+def _mock_key(prompt_text: str) -> bytes:
+    """The mock's content address: the prompt with scheduling-dependent branch IDs blanked."""
+    return _MOCK_BRANCH_ID.sub("branch_#", prompt_text).encode("utf-8")
 
 
 class MockOpenAIClient:

@@ -24,6 +24,7 @@ exits survived — not that only one can.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -35,6 +36,11 @@ from .branch_spawner import BudgetLedger, HarnessEvent
 from .issue_detector import IssueDetector
 from .jsonutil import coerce_bool, parse_json_object
 from .tracker import BranchRecord, BranchState, PFPTracker, PassProvenanceRecord
+
+
+def _ID_FREE(text: str) -> str:
+    """Text with branch IDs blanked: IDs follow thread scheduling, so they can't order content."""
+    return re.sub(r"branch_\d+", "branch_#", text)
 
 
 class FalsifierAngle(str, Enum):
@@ -581,8 +587,12 @@ class FailJudge:
 
         # Prioritize branches with 0 survived_falsifications, ordered by certainty_score descending
         untested = [b for b in alive if b.survived_falsifications == 0]
-        pool = untested if untested else alive
-        target = max(pool, key=lambda b: (b.certainty_score, -b.last_tested_at))
+        if untested:
+            # An untested branch's last_tested_at is just its birth time, which parallel spawning
+            # orders by thread scheduling; break certainty ties on content, not on the clock
+            target = min(untested, key=lambda b: (-b.certainty_score, _ID_FREE(branch_position_text(b)), b.id))
+        else:
+            target = min(alive, key=lambda b: (-b.certainty_score, b.last_tested_at, b.id))
         self.last_background_sample_at = now
         return self.falsify_branch(target.id, schedule_trigger="background_sample")
 

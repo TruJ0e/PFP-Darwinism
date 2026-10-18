@@ -306,7 +306,10 @@ python -m pytest -q
 ```
 
 The suite runs fully offline against the deterministic, content-addressed mock
-(same prompt → same reply regardless of thread interleaving) and a local fake
+(same prompt → same reply regardless of thread interleaving; since v0.14 branch IDs are
+blanked from the content address, because parallel subtrees race for the run-wide ID counter
+and the same branch could otherwise draw a different reply depending on scheduling. The
+background falsifier likewise breaks certainty ties on branch content, not birth time) and a local fake
 HTTP server for the live client. It also stress-tests concurrent cap admission
 and rejects replay logs with sequence gaps, duplicate sequence numbers, or
 missing branch snapshots.
