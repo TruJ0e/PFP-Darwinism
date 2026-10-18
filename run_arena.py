@@ -85,12 +85,15 @@ def _replay(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir) if args.state_dir else None
     improvement_result = None
     improvement_spend_usd = 0.0
+    exit_code = 0
     if state_dir is not None and not args.no_improve:
         try:
             with exclusive_lock(state_dir / ".pfp.lock"):
                 rc, improvement_result, improvement_spend_usd = _replay_improve(args, state_dir, feed, problem)
                 if rc != 0:
                     return rc
+                if improvement_result.get("interrupted"):
+                    exit_code = 2
         except StateLockError as exc:
             print(f"[pfp] refusing to run: {exc}", file=sys.stderr)
             return 1
@@ -113,7 +116,7 @@ def _replay(args: argparse.Namespace) -> int:
             replay_summary["self_improvement_spend_usd"] = improvement_spend_usd
         atomic_write_text(Path(args.summary_out), json.dumps(replay_summary, indent=2, default=str))
     print(f"[pfp] REPLAY | {len(feed)} events from {args.replay}", file=sys.stderr)
-    return 0
+    return exit_code
 
 
 def _replay_improve(
@@ -149,6 +152,9 @@ def _replay_improve(
         )
     except (HardCapExceededError, BackendError) as exc:
         res = {"skipped": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    except KeyboardInterrupt:
+        # Nothing was registered yet (that is the cycle's last step); keep what was paid for
+        res = {"skipped": "interrupted by the operator (Ctrl-C)", "interrupted": True}
     finally:
         loop.client = client
     registry.save(registry_path)
@@ -182,6 +188,11 @@ def _run_improvement(
         )
     except (HardCapExceededError, BackendError) as exc:
         summary["self_improvement"] = {"skipped": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    except KeyboardInterrupt:
+        # Ctrl-C during Piece 8 must not lose the arena run: its stream, HTML, report and
+        # summary are still written, and nothing half-done reaches the registry (registering
+        # the new version is the cycle's last step).
+        summary["self_improvement"] = {"skipped": "interrupted by the operator (Ctrl-C)", "interrupted": True}
     finally:
         loop.client = client
     summary["self_improvement_spend_usd"] = meter.stats()["total_cost_usd"]
@@ -360,7 +371,8 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
     if args.json:
         print("\n--- RUN SUMMARY JSON ---")
         print(json.dumps(summary, indent=2))
-    return 0 if summary["halted_reason"] is None else 2
+    interrupted = bool(summary.get("self_improvement", {}).get("interrupted"))
+    return 0 if summary["halted_reason"] is None and not interrupted else 2
 
 
 if __name__ == "__main__":

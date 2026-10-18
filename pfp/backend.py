@@ -20,6 +20,7 @@ import json
 import math
 import os
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -89,6 +90,58 @@ def _non_negative_int(value: Any) -> Optional[int]:
     if not math.isfinite(number):
         return None
     return max(0, int(number))
+
+
+def _finite_float(value: Any, default: float) -> float:
+    """Provider number -> float; garbage, bools and non-finite values become `default`."""
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _message_text(value: Any) -> str:
+    """Normalize message content: providers may send null, a string, or a list of content parts."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "".join(parts)
+    return str(value)
+
+
+def _parse_logprobs(lp_raw: Any) -> Optional["ChoiceLogprobs"]:
+    """Tolerant logprob parsing: malformed token entries are dropped or defaulted, never fatal."""
+    if not isinstance(lp_raw, dict) or not isinstance(lp_raw.get("content"), list):
+        return None
+    tokens: List[TokenLogprob] = []
+    for t in lp_raw["content"]:
+        if not isinstance(t, dict):
+            continue
+        raw_tops = t.get("top_logprobs")
+        tops = [
+            TopLogprob(token=str(tp.get("token", "")), logprob=_finite_float(tp.get("logprob"), -10.0))
+            for tp in (raw_tops if isinstance(raw_tops, list) else [])
+            if isinstance(tp, dict)
+        ]
+        tokens.append(
+            TokenLogprob(
+                token=str(t.get("token", "")),
+                logprob=_finite_float(t.get("logprob"), -0.5),
+                top_logprobs=tops,
+            )
+        )
+    return ChoiceLogprobs(content=tokens)
 
 
 @dataclass
@@ -192,10 +245,13 @@ class ChatCompletionResponse:
 class BackendError(RuntimeError):
     """Raised when the live endpoint fails after all retries (carries HTTP status + body snippet)."""
 
-    def __init__(self, message: str, status: Optional[int] = None, body: str = ""):
+    def __init__(self, message: str, status: Optional[int] = None, body: str = "", billed_usd: float = 0.0):
         super().__init__(message)
         self.status = status
         self.body = body
+        # Conservative charge for attempts the provider answered (HTTP 200) with an unusable
+        # body: it billed them, so `MeteredClient` books this instead of treating them as free.
+        self.billed_usd = billed_usd
 
 
 class HardCapExceededError(RuntimeError):
@@ -243,8 +299,14 @@ class _LiveChatCompletions:
         # Exponential backoff with full jitter so hundreds of parallel branches don't stampede
         return random.uniform(0.0, self.backoff_base_s * (2 ** attempt))
 
-    def _post_with_retries(self, body: bytes) -> Dict[str, Any]:
+    def _post_with_retries(self, body: bytes, attempt_bound_usd: float = 0.0) -> tuple[Dict[str, Any], int]:
+        """
+        POST with retries. Returns `(json_object, unusable_billed_attempts)`: attempts the
+        provider answered with HTTP 200 but an unreadable body (non-JSON, non-object, or a
+        connection dropped mid-body) were most likely billed, so the caller charges them.
+        """
         last_error: Optional[BackendError] = None
+        unusable_billed = 0
         for attempt in range(self.max_retries + 1):
             req = urllib.request.Request(
                 f"{self.base_url}/chat/completions",
@@ -257,7 +319,20 @@ class _LiveChatCompletions:
             retry_after: Optional[str] = None
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    return json.load(resp)
+                    try:
+                        raw = json.load(resp)
+                    except (ValueError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+                        # ValueError covers JSONDecodeError and undecodable bytes; the others a
+                        # connection dropped mid-body. Either way the provider already answered.
+                        unusable_billed += 1
+                        last_error = BackendError(f"Unreadable response body from {self.base_url}: {exc}")
+                    else:
+                        if isinstance(raw, dict):
+                            return raw, unusable_billed
+                        unusable_billed += 1
+                        last_error = BackendError(
+                            f"Response from {self.base_url} is JSON {type(raw).__name__}, not an object"
+                        )
             except urllib.error.HTTPError as exc:
                 snippet = ""
                 try:
@@ -268,6 +343,7 @@ class _LiveChatCompletions:
                     f"HTTP {exc.code} from {self.base_url}/chat/completions: {snippet}",
                     status=exc.code,
                     body=snippet,
+                    billed_usd=unusable_billed * attempt_bound_usd,
                 )
                 if exc.code not in RETRYABLE_STATUSES:
                     raise last_error from exc
@@ -275,11 +351,10 @@ class _LiveChatCompletions:
             except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
                 # HTTPException covers IncompleteRead / BadStatusLine from a dropped connection
                 last_error = BackendError(f"Network error calling {self.base_url}: {exc}")
-            except json.JSONDecodeError as exc:
-                last_error = BackendError(f"Non-JSON response from {self.base_url}: {exc}")
             if attempt < self.max_retries:
                 self._sleep(self._backoff_delay(attempt, retry_after))
         assert last_error is not None
+        last_error.billed_usd = unusable_billed * attempt_bound_usd
         raise last_error
 
     def create(
@@ -309,38 +384,29 @@ class _LiveChatCompletions:
         payload.update(kwargs)
 
         body = json.dumps(payload).encode("utf-8")
-        raw = self._post_with_retries(body)
+        completion_bound = max(0, int(max_tokens)) * max(1, int(n))
+        attempt_bound_usd = estimate_call_cost_usd(prompt_token_upper_bound(messages), completion_bound, target_model)
+        raw, unusable_billed = self._post_with_retries(body, attempt_bound_usd)
 
+        # The call is billed from here on: a malformed reply must degrade, never raise,
+        # or the meter would release the reservation and book a paid call as free.
         choices: List[Choice] = []
-        for idx, ch in enumerate(raw.get("choices", [])):
-            msg = ch.get("message", {})
-            lp_raw = ch.get("logprobs")
-            lp_obj: Optional[ChoiceLogprobs] = None
-            if isinstance(lp_raw, dict) and isinstance(lp_raw.get("content"), list):
-                tokens: List[TokenLogprob] = []
-                for t in lp_raw["content"]:
-                    tops = [
-                        TopLogprob(token=str(tp.get("token", "")), logprob=float(tp.get("logprob", -1.0)))
-                        for tp in t.get("top_logprobs", [])
-                    ]
-                    tokens.append(
-                        TokenLogprob(
-                            token=str(t.get("token", "")),
-                            logprob=float(t.get("logprob", -0.5)),
-                            top_logprobs=tops,
-                        )
-                    )
-                lp_obj = ChoiceLogprobs(content=tokens)
+        raw_choices = raw.get("choices")
+        for idx, ch in enumerate(raw_choices if isinstance(raw_choices, list) else []):
+            if not isinstance(ch, dict):
+                continue
+            msg = ch.get("message") if isinstance(ch.get("message"), dict) else {}
+            index = _non_negative_int(ch.get("index"))
             choices.append(
                 Choice(
-                    index=ch.get("index", idx),
+                    index=idx if index is None else index,
                     message=ChatMessage(
-                        role=msg.get("role") or "assistant",
+                        role=str(msg.get("role") or "assistant"),
                         # Reasoning models may return null content with the answer in reasoning_content
-                        content=msg.get("content") or msg.get("reasoning_content") or "",
+                        content=_message_text(msg.get("content")) or _message_text(msg.get("reasoning_content")),
                     ),
-                    finish_reason=ch.get("finish_reason") or "stop",
-                    logprobs=lp_obj,
+                    finish_reason=str(ch.get("finish_reason") or "stop"),
+                    logprobs=_parse_logprobs(ch.get("logprobs")),
                 )
             )
 
@@ -359,6 +425,10 @@ class _LiveChatCompletions:
         if t_tok is None or estimated:
             t_tok = p_tok + c_tok
         cost = estimate_call_cost_usd(p_tok, c_tok, target_model)
+        if unusable_billed:
+            # Earlier attempts came back 200 with an unreadable body: billed, so never free
+            cost += unusable_billed * attempt_bound_usd
+            estimated = True
 
         return ChatCompletionResponse(
             id=str(raw.get("id", f"chatcmpl-{int(time.time() * 1000)}")),
@@ -504,10 +574,17 @@ class MeteredClient:
         try:
             with self._slots:
                 resp = self.inner.chat.completions.create(*args, **kwargs)
-        except BaseException:  # incl. KeyboardInterrupt: never strand an in-flight reservation
+        except BaseException as exc:  # incl. KeyboardInterrupt: never strand an in-flight reservation
+            billed = _finite_float(getattr(exc, "billed_usd", 0.0), 0.0)
+            model = str(kwargs.get("model") or self.model)
             with self._lock:
                 self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - reservation)
                 self.failed_calls += 1
+                if billed > 0:
+                    # The provider billed attempts it answered unusably: true spend includes them
+                    self.estimated_usage_calls += 1
+                    self.total_cost_usd = round(self.total_cost_usd + billed, 8)
+                    self.cost_by_model[model] = round(self.cost_by_model.get(model, 0.0) + billed, 8)
             raise
         usage = getattr(resp, "usage", None)
         try:
@@ -550,6 +627,8 @@ class MeteredClient:
 # ---------------------------------------------------------------------------
 # Mock Backend (plausible diverse responses, zero code changes needed for live)
 # ---------------------------------------------------------------------------
+
+_SAMPLE_MARKER = re.compile(r"independent sample (\d+) of \d+")
 
 _PLAUS_FORK_POOL = [
     {
@@ -674,6 +753,11 @@ class _MockChatCompletions:
         # Content-addressed choices: the same prompt always yields the same reply, no matter
         # how parallel branches interleave — runs and replays are reproducible
         digest = int(hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()[:8], 16)
+        # A single-sample top-up for sample k of a K batch (see IssueDetector._sample_choices)
+        # is the k-th choice a provider honoring `n` would have returned
+        marker = _SAMPLE_MARKER.search(lower)
+        if marker:
+            choice_idx += max(0, int(marker.group(1)) - 1)
 
         # 1. Difficulty estimation probe call
         if "difficulty_estimate" in lower or "size the problem" in lower:

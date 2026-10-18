@@ -428,10 +428,16 @@ class MiniHarness:
         initial_certainty: float = 0.0,
         origin: str = "starter",
         should_stop: Optional[Callable[[], bool]] = None,
+        abort_run: Optional[Callable[[], None]] = None,
+        stop_reason: Optional[Callable[[], str]] = None,
     ) -> None:
         self.branch_id = branch_id
         self.origin = origin
         self.should_stop: Callable[[], bool] = should_stop or (lambda: False)
+        # Trips the run-wide stop when any branch fails, so its siblings and cousins start
+        # no further paid calls while the failure propagates (nested pools wait on them).
+        self.abort_run: Callable[[], None] = abort_run or (lambda: None)
+        self.stop_reason: Callable[[], str] = stop_reason or (lambda: "emergency_stop")
         self.parent_id = parent_id
         self.problem = problem
         self.directive = directive
@@ -666,6 +672,8 @@ class MiniHarness:
                 initial_certainty=round(fork.support_score, 4),
                 origin=trigger,
                 should_stop=self.should_stop,
+                abort_run=self.abort_run,
+                stop_reason=self.stop_reason,
             )
             child.tracker.update_branch(
                 child_id,
@@ -693,8 +701,15 @@ class MiniHarness:
             return
         with ThreadPoolExecutor(max_workers=len(children)) as pool:
             futs = [pool.submit(c.step) for c in children]
-            for f in as_completed(futs):
-                f.result()
+            try:
+                for f in as_completed(futs):
+                    f.result()
+            except BaseException:
+                # Leaving the `with` waits for every sibling: stop them starting paid calls first
+                self.abort_run()
+                for f in futs:
+                    f.cancel()
+                raise
 
     def _run_to_conclusion(self) -> None:
         """
@@ -757,8 +772,8 @@ class MiniHarness:
             self._emit("kill", {"reason": reason})
             return
         if self.should_stop():
-            # Emergency stop kills the run; the ledger keeps the branch as-is for post-mortem
-            self._emit("kill", {"reason": "emergency_stop"})
+            # A run-wide stop kills the branch; the ledger keeps it as-is for post-mortem
+            self._emit("kill", {"reason": self.stop_reason()})
             return
 
         rec = self.tracker.get(self.branch_id)
@@ -785,7 +800,7 @@ class MiniHarness:
         )
 
         if self.should_stop():
-            self._emit("kill", {"reason": "emergency_stop"})
+            self._emit("kill", {"reason": self.stop_reason()})
             return
 
         if plaus_res.should_split and not self.spawns_stopped:
@@ -912,6 +927,7 @@ class MainHarness:
         self._seq = 0
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._abort_reason: Optional[str] = None
 
         self.alignment_detector = AlignmentDetector(self.client)
         self.merge_synthesizer = MergeSynthesizer(
@@ -950,6 +966,16 @@ class MainHarness:
     def emergency_stop(self) -> None:
         """Kill the live run: no new model calls start in any branch; selection is skipped."""
         self._stop_event.set()
+
+    def _abort_run(self) -> None:
+        """A branch failed: stop every other branch before the failure reaches `run`."""
+        with self._lock:
+            if self._abort_reason is None and not self._stop_event.is_set():
+                self._abort_reason = "run_halted"
+        self._stop_event.set()
+
+    def _stop_reason(self) -> str:
+        return self._abort_reason or "emergency_stop"
 
     def _should_stop(self) -> bool:
         if self._stop_event.is_set():
@@ -1211,6 +1237,8 @@ class MainHarness:
                     branch_counter=self._next_branch_id,
                     origin="starter",
                     should_stop=self._should_stop,
+                    abort_run=self._abort_run,
+                    stop_reason=self._stop_reason,
                 )
             )
 
@@ -1266,7 +1294,7 @@ class MainHarness:
                     except BaseException:
                         # One starter failing (or Ctrl-C) stops every other branch from
                         # starting new paid calls before the pool drains.
-                        self._stop_event.set()
+                        self._abort_run()
                         raise
 
                 if self.enable_selection and not self._should_stop():
@@ -1285,6 +1313,12 @@ class MainHarness:
                 self._stop_event.set()
                 self.halted_reason = "interrupted"
                 self._emit_halt("interrupted", "Operator interrupted the run (Ctrl-C); partial results kept.")
+            except Exception as exc:
+                # A defect (or a reply shape nothing anticipated) must not lose the money already
+                # spent: halt like any other failure so the stream, HTML and summary survive.
+                self._stop_event.set()
+                self.halted_reason = "internal_error"
+                self._emit_halt("internal_error", f"{type(exc).__name__}: {str(exc)[:480]}")
             if self.halted_reason is None and self._should_stop():
                 self.halted_reason = "emergency_stop"
                 self._emit_halt("emergency_stop", "Emergency stop killed the run; rollback applies next run.")
@@ -1317,6 +1351,8 @@ class MainHarness:
                     "api_spend_by_model": meter["cost_by_model"],
                     "api_failed_calls": meter.get("failed_calls", 0),
                     "api_estimated_usage_calls": meter.get("estimated_usage_calls", 0),
+                    "api_reservation_overruns": meter.get("reservation_overruns", 0),
+                    "api_n_topup_calls": self.detector.n_topup_calls,
                 },
                 "total_branches_spawned": len(self.tracker.all_records()),
                 "selection": selection_summary,

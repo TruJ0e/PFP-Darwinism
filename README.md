@@ -62,7 +62,8 @@ or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
 | `--replay` | — | re-render a saved `--stream-out` JSONL to ASCII / `--html-out` / `--summary-out`; runs post-replay improvement if `--state-dir` is given without `--no-improve` |
 
 Exit code is `0` for a completed run, `2` if the run halted (`hard_cap`,
-`emergency_stop`, `backend_error`, or `interrupted` by Ctrl-C) and `1` for an
+`emergency_stop`, `backend_error`, `internal_error`, or `interrupted` by Ctrl-C) or
+Ctrl-C cut the post-run self-improvement short, and `1` for an
 unreadable replay, an unknown version ID, a corrupt `--state-dir`, or a `--state-dir`
 another live run is using (all checked before any client exists, so nothing is spent
 and the bad file is left in place for inspection). A halted run still writes its
@@ -161,6 +162,25 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   or negative difficulty estimate falls back to the default instead of becoming
   the root budget.
 - Bounded concurrency (`max_concurrent_calls`, default 32) across all branches.
+- **A billed reply never crashes the meter.** Once the provider answers, the response
+  is parsed tolerantly: non-object choices are skipped, content-part lists are joined,
+  garbage / NaN / positive logprobs are defaulted (no `OverflowError` in the entropy
+  signal). An HTTP 200 whose body is unreadable (non-JSON, a JSON array, a connection
+  dropped mid-body) is charged at its reservation bound, both when a retry then
+  succeeds and when every attempt fails (`BackendError.billed_usd`, booked by
+  `MeteredClient`). Unreachable endpoints are not charged.
+- **Providers that ignore `n` still split.** If a K-probe batch comes back with one
+  choice, the detector tops it up with single-sample calls (distinct prompts, each
+  metered) and, having learned the provider drops `n`, stops sending wasted
+  multi-sample requests; `budget.api_n_topup_calls` counts them. Without this every
+  batch has one member, nothing can diverge, and a live arena never branches.
+- **Fail fast across the branch tree.** A branch that fails trips a run-wide stop
+  before its nested pool waits on siblings, so they start no further paid calls; their
+  kills are labelled `run_halted`, not `emergency_stop`.
+- **Defects halt, they don't lose money.** An unexpected exception mid-run halts as
+  `internal_error` (type and message in the `halt` event) with the stream, HTML,
+  report and summary still written. Ctrl-C during Piece 8 keeps the finished arena
+  run, and an interrupted sandbox is never recorded as a failed experiment.
 
 ## Self-improvement guardrails
 

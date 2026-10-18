@@ -995,6 +995,10 @@ class SelfImprovementLoop:
         harness.detector.probe_hint = str((candidate_prompts or {}).get("plaus_probe_hint", ""))
 
         summary = harness.run(test_problem)
+        if summary.get("halted_reason") == "interrupted":
+            # The operator's Ctrl-C is not evidence against the candidate: stop the whole
+            # cycle instead of recording a failed experiment the anti-model would learn from.
+            raise KeyboardInterrupt("sandbox run interrupted by the operator")
         winners = summary.get("winners_box", [])
         passed_count = len(winners)
         top_cert = max((float(w.get("certainty_score", 0.0)) for w in winners), default=0.0)
