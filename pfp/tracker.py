@@ -25,11 +25,25 @@ Refinements in Pass 2 (by what was meant):
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, FrozenSet, List, Optional
+
+
+def _finite_number(value: Any, field_name: str) -> float:
+    """Validate numeric ledger inputs before they can poison ordering or JSON custody."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a finite number, not bool.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite number.") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be finite.")
+    return number
 
 
 class BranchState(str, Enum):
@@ -172,14 +186,16 @@ class PFPTracker:
             if branch_id in self._records:
                 # Re-registering would silently resurrect / overwrite history — never allowed
                 raise ValueError(f"Branch id '{branch_id}' is already registered in the ledger.")
+            clean_budget = _finite_number(budget_remaining, "budget_remaining")
+            clean_certainty = _finite_number(certainty_score, "certainty_score")
             now = time.time()
             rec = BranchRecord(
                 id=branch_id,
                 parent=parent,
                 state=state,
-                certainty_score=certainty_score,
+                certainty_score=clean_certainty,
                 time_alive=0.0,
-                budget_remaining=round(max(0.0, budget_remaining), 6),
+                budget_remaining=round(max(0.0, clean_budget), 6),
                 fork_under_exploration=fork_under_exploration,
                 depth=depth,
                 origin=origin,
@@ -344,9 +360,10 @@ class PFPTracker:
             rec = self.get(branch_id)
             now = time.time()
             if certainty_score is not None:
-                rec.certainty_score = certainty_score
+                rec.certainty_score = _finite_number(certainty_score, "certainty_score")
             if budget_remaining is not None:
-                rec.budget_remaining = round(max(0.0, budget_remaining), 6)
+                clean_budget = _finite_number(budget_remaining, "budget_remaining")
+                rec.budget_remaining = round(max(0.0, clean_budget), 6)
             if fork_under_exploration is not None:
                 rec.fork_under_exploration = fork_under_exploration
             if survived_falsifications is not None:

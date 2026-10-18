@@ -24,9 +24,12 @@ _FALSE_WORDS = {"false", "no", "n", "0", "failed", "fail", "killed", "falsified"
 
 def _candidate_texts(raw: str) -> list[str]:
     text = _THINK_RE.sub("", raw or "")
-    # An unterminated <think> block (truncated reply) — keep only what follows it, if anything
-    if "<think>" in text.lower() and "</think>" not in text.lower():
-        text = text[text.lower().rfind("<think>") + len("<think>"):]
+    # A truncated hidden reasoning block has no trustworthy visible answer.  Parsing JSON
+    # from inside it could turn a hypothesis such as {"survived": true} into a verdict.
+    # Keep only visible text before the unmatched opener and fail closed if there is none.
+    lowered = text.lower()
+    if "<think>" in lowered and "</think>" not in lowered:
+        text = text[:lowered.rfind("<think>")]
     candidates = [m.strip() for m in _FENCE_RE.findall(text)]
     candidates.append(text.strip())
     return [c for c in candidates if c]

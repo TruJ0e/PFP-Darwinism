@@ -60,7 +60,16 @@ def _event_digest(
         "previous_digest": previous_digest,
         "journal_version": journal_version,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"ArenaEvent payload must be finite, JSON-serializable data: {exc}") from exc
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -255,15 +264,19 @@ class ArenaFeed:
             event_details = copy.deepcopy(details or {})
             event_snapshot = copy.deepcopy(snapshot)
             previous_digest = self._events[-1].digest if self._events else ""
-            digest = _event_digest(
-                seq=self._seq,
-                event_type=event_type,
-                branch_id=branch_id,
-                timestamp=event_timestamp,
-                details=event_details,
-                snapshot=event_snapshot,
-                previous_digest=previous_digest,
-            )
+            try:
+                digest = _event_digest(
+                    seq=self._seq,
+                    event_type=event_type,
+                    branch_id=branch_id,
+                    timestamp=event_timestamp,
+                    details=event_details,
+                    snapshot=event_snapshot,
+                    previous_digest=previous_digest,
+                )
+            except (TypeError, ValueError):
+                self._seq -= 1
+                raise
             evt = ArenaEvent(
                 seq=self._seq,
                 event_type=event_type,
@@ -313,7 +326,7 @@ class ArenaFeed:
 
     def to_jsonl(self) -> str:
         with self._lock:
-            return "\n".join(json.dumps(e.to_dict()) for e in self._events)
+            return "\n".join(json.dumps(e.to_dict(), allow_nan=False) for e in self._events)
 
     def save_jsonl(self, path: str | Path) -> Path:
         return _atomic_write_text(Path(path), self.to_jsonl() + "\n")
@@ -349,6 +362,16 @@ class ArenaFeed:
                     )
                 if not math.isfinite(evt.timestamp):
                     raise ValueError(f"Arena event {evt.seq} has a non-finite timestamp.")
+                try:
+                    json.dumps(
+                        {"details": evt.details, "snapshot": evt.snapshot},
+                        allow_nan=False,
+                        sort_keys=True,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Arena event {evt.seq} has a non-finite or non-JSON payload: {exc}"
+                    ) from exc
                 if not evt.snapshot or "id" not in evt.snapshot or "state" not in evt.snapshot:
                     raise ValueError(
                         f"Arena event {evt.seq} lacks the required full branch snapshot ('id', 'state')."

@@ -194,6 +194,9 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   `<think>` blocks are handled; `"survived": "false"` is false (plain
   `bool("false")` would be true), and non-finite floats (`nan`, `inf`) return
   `default` instead of `True`.
+- **Hidden reasoning cannot become a verdict.** A truncated, unterminated `<think>`
+  block is discarded instead of being searched for JSON, so a hypothesis inside a
+  cut-off chain of thought cannot accidentally pass or kill a branch.
 - **Falsification fails closed.** A judge reply with no readable verdict is
   *inconclusive*: no survival credit, no kill, no appeal consumed, and no Pass.
 - **The alignment pre-filter matches concepts on whole words.** Concept anchors used
@@ -286,6 +289,12 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   `winner_exit` only counts with a Pass snapshot, and any later `fail`, `kill`,
   `revocation`, or non-Pass state evicts the claim from the winner's box. A UI
   event cannot manufacture a certified result.
+- **Journal numbers are standards-compliant and sortable.** The ledger rejects
+  NaN/Infinity budgets and certainty scores at registration and update time; the
+  arena rejects non-finite values anywhere in nested snapshots/details without
+  consuming a sequence number. JSONL export and replay therefore never admit the
+  non-standard `NaN`/`Infinity` tokens that can poison ranking and cross-language
+  verification.
 
 ## The arena player
 
