@@ -31,5 +31,6 @@ jobs:
         shell: bash
         run: |
           python run_arena.py --mock --quiet --no-improve --stream-out out/run.jsonl --html-out out/arena.html --report-out out/proof.json
-          python run_arena.py --replay out/run.jsonl --quiet --report-out out/replay.json
+          python run_arena.py --replay out/run.jsonl --quiet --report-out out/replay.json --expect-head out/proof.json
+          python run_arena.py --verify out/run.jsonl --expect-head out/proof.json
           python -c "import json; a=json.load(open('out/proof.json')); b=json.load(open('out/replay.json')); [d.pop(k, None) for d in (a, b) for k in ('spend',)]; assert a['problem'], 'stream lost its problem'; assert a == b, 'replay report diverged'; assert a['winners'], 'no winners'"

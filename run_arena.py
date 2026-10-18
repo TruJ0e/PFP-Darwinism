@@ -33,7 +33,7 @@ from pfp import (
     VersionRegistry,
     create_client,
 )
-from pfp.arena import stream_problem
+from pfp.arena import is_journal_digest, stream_problem
 from pfp.fsutil import StateLockError, atomic_write_text, exclusive_lock
 from pfp.proof_report import write_proof_report
 
@@ -65,13 +65,71 @@ def _positive_float(text: str) -> float:
     return val
 
 
+def _expected_head(value: str) -> str:
+    """
+    --expect-head: a 64-hex journal head digest, or a JSON file carrying one (a run summary
+    or a `.json` proof report, both of which record `journal.head_digest`).
+    """
+    text = value.strip().lower()
+    if is_journal_digest(text):
+        return text
+    try:
+        raw = json.loads(Path(value).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"--expect-head is neither a 64-hex digest nor a readable JSON file: {exc}") from None
+    head = raw.get("journal", {}).get("head_digest") if isinstance(raw, dict) and isinstance(raw.get("journal"), dict) else None
+    if not is_journal_digest(head):
+        raise ValueError(f"--expect-head file {value} has no valid journal.head_digest")
+    return str(head)
+
+
+def _load_anchored_feed(path: str, expect_head: str, *, allow_legacy: bool) -> ArenaFeed:
+    """Load and verify a journal; with --expect-head its head must match (a truncated copy cannot)."""
+    expected = _expected_head(expect_head) if expect_head else ""
+    # A legacy v1 journal is re-hashed on load exactly as the live run hashed it, so a
+    # matching anchor authenticates it even though the file carries no digests.
+    feed = ArenaFeed.load_jsonl(Path(path), allow_legacy=allow_legacy or bool(expected))
+    if expected:
+        if feed.head_digest != expected:
+            anchor = feed.anchor()
+            raise AppendOnlyViolationError(
+                f"journal head {anchor['head_digest'] or '(empty)'} after {anchor['events']} events does not match "
+                f"the expected head {expected}: the journal was truncated, extended or replaced"
+            )
+        feed.legacy_unverified = False
+    return feed
+
+
+def _verify(args: argparse.Namespace) -> int:
+    """--verify: check a journal's hash chain (and its anchor) without rendering or calling a model."""
+    try:
+        feed = _load_anchored_feed(args.verify, args.expect_head, allow_legacy=False)
+    except (OSError, ValueError, AppendOnlyViolationError) as exc:
+        print(f"[pfp] VERIFY FAILED {args.verify}: {exc}", file=sys.stderr)
+        return 1
+    result = {"journal": str(args.verify), **feed.anchor(), "expected_head_matched": bool(args.expect_head) or None}
+    print(json.dumps(result, indent=2))
+    if not args.expect_head:
+        print(
+            "[pfp] chain OK — without --expect-head a copy cut short at the tail would also pass; "
+            "anchor it with the head digest from the run summary or proof report",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def _replay(args: argparse.Namespace) -> int:
     """Re-render a saved arena stream: no model calls unless --state-dir triggers post-replay improvement."""
     try:
-        feed = ArenaFeed.load_jsonl(Path(args.replay))
+        feed = _load_anchored_feed(args.replay, args.expect_head, allow_legacy=True)
     except (OSError, ValueError, AppendOnlyViolationError) as exc:
         print(f"[pfp] cannot replay {args.replay}: {exc}", file=sys.stderr)
         return 1
+    if feed.legacy_unverified:
+        print(
+            f"[pfp] WARNING: {args.replay} is a legacy v1 journal with no hash chain; its content is unverified",
+            file=sys.stderr,
+        )
     # The journal records its own problem; --problem only overrides the title.
     problem = args.problem or stream_problem(feed.events)
     renderer = TronArenaRenderer()
@@ -110,6 +168,7 @@ def _replay(args: argparse.Namespace) -> int:
             "winners_box": state["winners_box"],
             "scoreboard": state["scoreboard"],
             "mined_metrics": mined,
+            "journal": feed.anchor(),
         }
         if improvement_result is not None:
             replay_summary["self_improvement"] = improvement_result
@@ -228,8 +287,26 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional proof-trail report path (.md Markdown, .json structured); works with --replay",
     )
     parser.add_argument("--replay", type=str, default="", help="Re-render a saved --stream-out JSONL (no model calls)")
+    parser.add_argument(
+        "--verify",
+        type=str,
+        default="",
+        help="Verify a saved --stream-out JSONL's hash chain and print its anchor (no model calls), then exit",
+    )
+    parser.add_argument(
+        "--expect-head",
+        type=str,
+        default="",
+        help="With --verify/--replay: required journal head digest (64 hex, or a summary/proof .json carrying it)",
+    )
     args = parser.parse_args(argv)
 
+    if args.verify and args.replay:
+        parser.error("--verify and --replay are mutually exclusive")
+    if args.expect_head and not (args.verify or args.replay):
+        parser.error("--expect-head requires --verify or --replay")
+    if args.verify:
+        return _verify(args)
     if args.replay:
         return _replay(args)
     if (args.pin_version or args.unpin or args.restore_version or args.list_versions) and not args.state_dir:
@@ -340,6 +417,8 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
     summary["total_api_spend_usd"] = round(
         summary["budget"]["api_spend_usd"] + summary.get("self_improvement_spend_usd", 0.0), 6
     )
+    # Anchor the journal outside the JSONL so a copy cut short at the tail is detectable
+    summary["journal"] = harness.arena_feed.anchor()
 
     if args.stream_out:
         harness.arena_feed.save_jsonl(Path(args.stream_out))
@@ -365,7 +444,8 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         f"improve ${summary.get('self_improvement_spend_usd', 0.0):.4f}; root ${b['root_budget_usd']:.4f}, "
         f"overdraft ${b['overdraft_usd']:.4f}, cap ${b['hard_cap_usd']:.2f}) "
         f"| version={summary['active_version_id']}"
-        + (f" | HALTED: {summary['halted_reason']}" if summary["halted_reason"] else ""),
+        + (f" | HALTED: {summary['halted_reason']}" if summary["halted_reason"] else "")
+        + f" | journal {summary['journal']['events']} events head {summary['journal']['head_digest'][:16]}",
         file=sys.stderr,
     )
     if args.json:

@@ -49,11 +49,12 @@ class _RawServer:
     def __init__(self, plan: List[tuple[int, bytes]]):
         self.plan = list(plan)
         self.hits = 0
+        self.bodies: List[dict] = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
-                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                outer.bodies.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}"))
                 outer.hits += 1
                 status, payload = outer.plan.pop(0)
                 self.send_response(status)

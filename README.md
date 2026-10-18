@@ -60,6 +60,8 @@ or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
 | `--summary-out` | — | write the run summary JSON (spend, winners, self-improvement; also works with `--replay`) |
 | `--report-out` | — | write the proof trail: `.md` Markdown or `.json` structured (also works with `--replay`) |
 | `--replay` | — | re-render a saved `--stream-out` JSONL to ASCII / `--html-out` / `--summary-out`; runs post-replay improvement if `--state-dir` is given without `--no-improve` |
+| `--verify` | — | check a saved `--stream-out` JSONL's hash chain and print its anchor (event count + head digest) as JSON; exit `1` on any break or a legacy unchained journal |
+| `--expect-head` | — | with `--verify` / `--replay`: required journal head (64 hex, or a summary / `.json` proof report carrying `journal.head_digest`); a truncated, extended or replaced journal is refused |
 
 Exit code is `0` for a completed run, `2` if the run halted (`hard_cap`,
 `emergency_stop`, `backend_error`, `internal_error`, or `interrupted` by Ctrl-C) or
@@ -94,6 +96,25 @@ structured form.
 ```bash
 python run_arena.py --replay arena_out/run.jsonl --quiet --report-out arena_out/proof.md
 ```
+
+### Anchoring the journal
+
+The hash chain proves each event is consistent with everything before it, but a copy
+cut short at the tail is still a valid chain: drop a trailing `revocation` and a revoked
+winner is back in the box. So every run records the journal's **anchor** — event count
+plus the head digest — in the summary (`journal`), the proof report (`journal`, and a
+`Journal:` line in Markdown) and the final stderr line. Keep or publish it apart from the
+JSONL, then check any copy against it:
+
+```bash
+python run_arena.py --verify arena_out/run.jsonl --expect-head arena_out/summary.json
+python run_arena.py --replay arena_out/run.jsonl --expect-head 3f9c…e1 --html-out arena_out/replay.html
+```
+
+A legacy v1 journal (no digests) still replays for old recordings, but with a warning and
+`verified_chain: false`: anyone can strip a chained journal's digests, edit it and relabel
+it v1. `--verify` refuses one unless `--expect-head` is given — it is re-hashed exactly as
+the live run hashed it, so only an unedited copy matches the anchor.
 
 ## How it maps to the design
 
@@ -130,7 +151,9 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   instead of an optimistic cheap-model fallback. Live reservations cover every
   potentially billable retry, not just the final attempt, and positional
   OpenAI-style arguments receive the same prompt / output / `n` preflight as
-  keyword calls.
+  keyword calls. The output bound honors both `max_tokens` and `max_completion_tokens`
+  (the larger, if both are sent), and a call with no limit (`max_tokens=None`) reserves
+  a full context window (131,072 tokens) rather than the 256-token default.
 - **One cap for the whole command.** The post-run self-improvement loop
   (assessment, anti-model, proposition, sandbox run) is metered against what the
   arena left under `--hard-cap`; the summary reports `total_api_spend_usd` =

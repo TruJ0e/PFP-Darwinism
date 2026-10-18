@@ -64,6 +64,8 @@ from .arena import (
     ArenaEvent,
     ArenaFeed,
     TronArenaRenderer,
+    is_journal_digest,
+    journal_anchor,
     stream_problem,
 )
 from .self_improvement import (
@@ -142,6 +144,8 @@ __all__ = [
     "write_proof_report",
     "build_arena_html",
     "stream_problem",
+    "is_journal_digest",
+    "journal_anchor",
     "StateLockError",
     "exclusive_lock",
 ]

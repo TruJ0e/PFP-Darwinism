@@ -64,7 +64,7 @@ def build_proof_report(
     summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Structured proof trail reduced from the stream (JSON-serialisable)."""
-    from .arena import TronArenaRenderer, stream_problem
+    from .arena import TronArenaRenderer, journal_anchor, stream_problem
 
     events = list(events)
     state = TronArenaRenderer.reconstruct_state_from_stream(events)
@@ -123,6 +123,8 @@ def build_proof_report(
         "revocations": len(state["revocations"]),
         "halted": state["halted"],
         "winners": winners,
+        # Detects a journal cut short at the tail, which the chain alone cannot: keep it apart from the JSONL
+        "journal": journal_anchor(events),
     }
     if summary:
         b = summary.get("budget", {}) or {}
@@ -162,6 +164,12 @@ def render_proof_markdown(report: Dict[str, Any]) -> str:
         f"- Splits: {report.get('splits', 0)} · merges: {report.get('merges', 0)} · "
         f"crashes into the main line: {report.get('crashes', 0)} · Pass revocations: {report.get('revocations', 0)}",
     ]
+    journal = report.get("journal")
+    if journal and journal.get("head_digest"):
+        out.append(
+            f"- Journal: {int(journal.get('events') or 0)} events · head {_code(journal.get('head_digest'), 80)} "
+            f"(check a copy with `run_arena.py --verify <run.jsonl> --expect-head <head>`)"
+        )
     spend = report.get("spend")
     if spend:
         def money(v: Any) -> str:

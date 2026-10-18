@@ -88,6 +88,33 @@ ARENA_LEVEL_EVENT_TYPES: Tuple[str, ...] = ("halt",)
 # Longest problem statement a starter spawn event carries (the replay title, not a dump).
 MAX_STREAM_PROBLEM_CHARS = 4000
 
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def is_journal_digest(value: Any) -> bool:
+    """True for a well-formed journal digest: 64 lowercase hex characters (SHA-256)."""
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _HEX_DIGITS
+
+
+def journal_anchor(events: Iterable[Any]) -> Dict[str, Any]:
+    """
+    The journal's anchor: event count + head digest (the last event's chained SHA-256).
+
+    The hash chain proves every event is consistent with its predecessors, but a copy cut
+    short at the tail is still a valid chain: drop a trailing `revocation` and a revoked
+    winner is back in the box. Kept apart from the JSONL (run summary, proof report,
+    a chat message), the anchor detects that: `--verify --expect-head` / `--replay
+    --expect-head` refuse a journal whose head differs. It is a pure function of the
+    stream, so a live run and its replay report the same anchor.
+    """
+    count = 0
+    head = ""
+    for e in events:
+        count += 1
+        raw = e.to_dict() if isinstance(e, ArenaEvent) else e
+        head = str(raw.get("digest", "")) if isinstance(raw, dict) else ""
+    return {"events": count, "head_digest": head}
+
 
 def stream_problem(events: Iterable[Any]) -> str:
     """
@@ -195,6 +222,9 @@ class ArenaFeed:
         self._seq: int = 0
         self._lock = threading.RLock()
         self._subscribers: List[Callable[[ArenaEvent], None]] = []
+        # True when loaded from a legacy (v1, unchained) journal: its events were hashed on
+        # load, so the chain proves nothing about what was on disk.
+        self.legacy_unverified: bool = False
 
     def subscribe(self, callback: Callable[[ArenaEvent], None]) -> None:
         with self._lock:
@@ -268,6 +298,19 @@ class ArenaFeed:
         with self._lock:
             return len(self._events)
 
+    @property
+    def head_digest(self) -> str:
+        """Digest of the newest event ("" for an empty feed): anchors the whole chain."""
+        with self._lock:
+            return self._events[-1].digest if self._events else ""
+
+    def anchor(self) -> Dict[str, Any]:
+        """`journal_anchor` of this feed plus whether its chain was verified on disk."""
+        with self._lock:
+            out = journal_anchor(self._events)
+            out["verified_chain"] = bool(self._events) and not self.legacy_unverified
+            return out
+
     def to_jsonl(self) -> str:
         with self._lock:
             return "\n".join(json.dumps(e.to_dict()) for e in self._events)
@@ -276,7 +319,13 @@ class ArenaFeed:
         return _atomic_write_text(Path(path), self.to_jsonl() + "\n")
 
     @classmethod
-    def from_jsonl(cls, jsonl_text: str) -> "ArenaFeed":
+    def from_jsonl(cls, jsonl_text: str, *, allow_legacy: bool = True) -> "ArenaFeed":
+        """
+        Parse and verify a JSONL journal. A legacy v1 journal (no hash chain) is accepted
+        for old recordings unless `allow_legacy=False`, and marks the feed
+        `legacy_unverified`: anyone can strip the digests from a chained journal, edit it
+        and relabel it v1, so its content is unauthenticated.
+        """
         feed = cls()
         expected_seq = 1
         previous_digest = ""
@@ -315,6 +364,11 @@ class ArenaFeed:
                     )
                 if chain_mode is None:
                     chain_mode = has_chain
+                    if not has_chain and not allow_legacy:
+                        raise AppendOnlyViolationError(
+                            "Arena journal is legacy v1 (no hash chain): its content cannot be verified."
+                        )
+                    feed.legacy_unverified = not has_chain
                 elif has_chain != chain_mode:
                     raise AppendOnlyViolationError("Arena replay mixes chained and legacy events.")
                 if has_chain:
@@ -362,8 +416,8 @@ class ArenaFeed:
         return feed
 
     @classmethod
-    def load_jsonl(cls, path: str | Path) -> "ArenaFeed":
-        return cls.from_jsonl(Path(path).read_text(encoding="utf-8"))
+    def load_jsonl(cls, path: str | Path, *, allow_legacy: bool = True) -> "ArenaFeed":
+        return cls.from_jsonl(Path(path).read_text(encoding="utf-8"), allow_legacy=allow_legacy)
 
 
 class TronArenaRenderer:

@@ -79,6 +79,30 @@ def prompt_token_upper_bound(messages: Any) -> int:
     return total
 
 
+# A request with no completion limit (`max_tokens=None`) may run to the model's context
+# window; reserve that much rather than an optimistic default.
+UNBOUNDED_COMPLETION_TOKENS = 131_072
+
+
+def completion_token_bound(max_tokens: Any = 256, n: Any = 1, max_completion_tokens: Any = None) -> int:
+    """
+    Upper bound on billable completion tokens for one request attempt.
+
+    Honors both OpenAI limit spellings (`max_tokens` and the newer `max_completion_tokens`):
+    when both are sent the provider may apply either, so the larger one bounds the bill.
+    A missing (None) or unreadable `max_tokens` is unbounded, never the cheap default.
+    """
+    limits: List[int] = []
+    for raw in (max_tokens, max_completion_tokens):
+        if raw is None:
+            continue
+        parsed = _non_negative_int(raw)
+        limits.append(UNBOUNDED_COMPLETION_TOKENS if parsed is None else min(parsed, UNBOUNDED_COMPLETION_TOKENS))
+    limit = max(limits) if limits else UNBOUNDED_COMPLETION_TOKENS
+    samples = _non_negative_int(n)
+    return limit * max(1, samples if samples is not None else 1)
+
+
 def _non_negative_int(value: Any) -> Optional[int]:
     """Parse a provider token count; None when absent or unreadable (never negative)."""
     if value is None or isinstance(value, bool):
@@ -375,6 +399,9 @@ class _LiveChatCompletions:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if max_tokens is None:
+            # No limit: let the provider apply its own default instead of sending null
+            del payload["max_tokens"]
         if logprobs:
             payload["logprobs"] = True
             if top_logprobs is not None:
@@ -384,7 +411,7 @@ class _LiveChatCompletions:
         payload.update(kwargs)
 
         body = json.dumps(payload).encode("utf-8")
-        completion_bound = max(0, int(max_tokens)) * max(1, int(n))
+        completion_bound = completion_token_bound(max_tokens, n, kwargs.get("max_completion_tokens"))
         attempt_bound_usd = estimate_call_cost_usd(prompt_token_upper_bound(messages), completion_bound, target_model)
         raw, unusable_billed = self._post_with_retries(body, attempt_bound_usd)
 
@@ -420,7 +447,8 @@ class _LiveChatCompletions:
             if p_tok is None:
                 p_tok = prompt_token_upper_bound(messages)
             if c_tok is None:
-                c_tok = max(0, int(max_tokens)) * max(1, len(choices), int(n))
+                per_choice = completion_token_bound(max_tokens, 1, kwargs.get("max_completion_tokens"))
+                c_tok = per_choice * max(1, len(choices), _non_negative_int(n) or 1)
         t_tok = _non_negative_int(usage_raw.get("total_tokens"))
         if t_tok is None or estimated:
             t_tok = p_tok + c_tok
@@ -571,9 +599,12 @@ class MeteredClient:
         model = str(self._call_parameter(args, kwargs, "model", None) or self.model)
         messages = self._call_parameter(args, kwargs, "messages", [])
         prompt_bound = self._prompt_token_upper_bound(messages)
-        completion_bound = max(0, int(self._call_parameter(args, kwargs, "max_tokens", 256)))
-        n = max(1, int(self._call_parameter(args, kwargs, "n", 1)))
-        per_attempt = estimate_call_cost_usd(prompt_bound, completion_bound * n, model) * self.cost_scale
+        completion_bound = completion_token_bound(
+            self._call_parameter(args, kwargs, "max_tokens", 256),
+            self._call_parameter(args, kwargs, "n", 1),
+            kwargs.get("max_completion_tokens"),
+        )
+        per_attempt = estimate_call_cost_usd(prompt_bound, completion_bound, model) * self.cost_scale
         reservation = per_attempt * self.max_billable_attempts
         with self._lock:
             projected = self.total_cost_usd + self._reserved_cost_usd + reservation
