@@ -207,6 +207,10 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   falsification, and the child it makes still needs the Pass gauntlet plus a pre-exit check.
   After the first merge the harness learns that round-trip cost and stops merging once the
   root budget can't cover one more merge *and* `gauntlet_rounds + 1` falsifications.
+- **A refused merge costs nothing and absorbs nothing.** Self-merges (which would double-count
+  one budget), a child id already in the ledger, and an alignment verdict for a different pair
+  are rejected before the Super call. A parent killed while synthesis is in flight leaves both
+  parents and their budgets intact; the paid call is still booked, as overdraft.
 - **Selection is paid for.** Each branch keeps a protected verification share
   (30% by default) that exploration and child spawning can't touch; split
   parents' idle budgets return to the finish reserve when selection begins.

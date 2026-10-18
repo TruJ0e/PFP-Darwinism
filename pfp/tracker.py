@@ -265,6 +265,10 @@ class PFPTracker:
         material = json.dumps([id_free(branch_id), origin, id_free(fork), parent_digests])
         return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
+    def has(self, branch_id: str) -> bool:
+        with self._lock:
+            return branch_id in self._records
+
     def get(self, branch_id: str) -> BranchRecord:
         with self._lock:
             if branch_id not in self._records:

@@ -22,7 +22,7 @@ from .alignment_detector import AlignmentJudgeResult, branch_position_text, fenc
 from .backend import SUPER_MODEL
 from .branch_spawner import BudgetLedger, HarnessEvent
 from .jsonutil import as_str_list, parse_json_object
-from .tracker import BranchState, PFPTracker
+from .tracker import BranchRecord, BranchState, PFPTracker
 
 
 @dataclass
@@ -99,6 +99,11 @@ class MergeSynthesizer:
             )
         )
 
+    @staticmethod
+    def _require_alive(rec: BranchRecord) -> None:
+        if not rec.is_alive:
+            raise ValueError(f"Cannot merge non-alive branch {rec.id} (state={rec.state.value})")
+
     def merge_branches(
         self,
         branch_a_id: str,
@@ -115,12 +120,22 @@ class MergeSynthesizer:
         5. Register the child in `BranchState.POSSIBLE` (never Pass), carrying full provenance and
            incremented `merges_attracted`.
         """
+        # Fail closed before the Super call: a refused merge must spend nothing and absorb nothing
+        if branch_a_id == branch_b_id:
+            # Absorbed -> Absorbed is a silent no-op, so a self-merge would double-count one budget
+            raise ValueError(f"Cannot merge branch {branch_a_id} with itself")
+        if child_branch_id in (branch_a_id, branch_b_id) or self.tracker.has(child_branch_id):
+            # Registering the child last would raise after both parents were absorbed and zeroed
+            raise ValueError(f"Merge child id '{child_branch_id}' is already registered")
+        if alignment is not None and {alignment.branch_a_id, alignment.branch_b_id} != {branch_a_id, branch_b_id}:
+            raise ValueError(
+                f"Alignment verdict for ({alignment.branch_a_id}, {alignment.branch_b_id}) "
+                f"does not cover merge pair ({branch_a_id}, {branch_b_id})"
+            )
         parent_a = self.tracker.get(branch_a_id)
         parent_b = self.tracker.get(branch_b_id)
-        if not parent_a.is_alive:
-            raise ValueError(f"Cannot merge non-alive branch {branch_a_id} (state={parent_a.state.value})")
-        if not parent_b.is_alive:
-            raise ValueError(f"Cannot merge non-alive branch {branch_b_id} (state={parent_b.state.value})")
+        self._require_alive(parent_a)
+        self._require_alive(parent_b)
 
         pos_a = fence_untrusted(branch_position_text(parent_a))
         pos_b = fence_untrusted(branch_position_text(parent_b))
@@ -151,6 +166,13 @@ class MergeSynthesizer:
             max_tokens=260,
         )
         synth_cost = float(resp.usage.cost_usd)
+        # The Super call is the only window another worker could absorb or kill a parent
+        parent_a = self.tracker.get(branch_a_id)
+        parent_b = self.tracker.get(branch_b_id)
+        if self.budget_ledger is not None and not (parent_a.is_alive and parent_b.is_alive):
+            self.budget_ledger.record_spend(max(0.0, synth_cost), covered_usd=0.0)
+        self._require_alive(parent_a)
+        self._require_alive(parent_b)
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
 
         data = parse_json_object(raw)
