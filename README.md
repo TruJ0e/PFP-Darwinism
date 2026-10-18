@@ -174,6 +174,11 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   finite numbers (never booleans); retry counts and concurrency limits must be real
   integers in range. Inner-client cost multipliers and billable-attempt counts are
   validated before the meter starts, so malformed adapters cannot weaken reservations.
+- **Token counts fail closed.** Negative or fractional request limits reserve the full
+  context window instead of being clamped or truncated into a cheap call, and malformed
+  sample counts are rejected before dispatch. Negative or fractional provider usage is
+  treated as missing and charged at the conservative bound, so malformed accounting cannot
+  turn a billed response into a free one.
 - **One cap for the whole command.** The post-run self-improvement loop
   (assessment, anti-model, proposition, sandbox run) is metered against what the
   arena left under `--hard-cap`; the summary reports `total_api_spend_usd` =

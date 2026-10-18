@@ -31,6 +31,7 @@ from pfp import (
     OpenAICompatibleClient,
     SelfImprovementLoop,
 )
+from pfp.backend import prompt_token_upper_bound
 
 
 def test_arena_feed_payloads_are_deeply_detached_and_hash_chained(tmp_path):
@@ -123,9 +124,11 @@ class TestHonestUsage(unittest.TestCase):
                 messages=[{"role": "user", "content": "x"}], max_tokens=64
             )
         self.assertTrue(resp.usage.estimated)
-        self.assertEqual(resp.usage.prompt_tokens, 0)  # clamped, not negative
+        # Negative counts are unreadable, not zero: treating them as zero would
+        # erase billed input and weaken the hard-cap ledger.
+        self.assertEqual(resp.usage.prompt_tokens, prompt_token_upper_bound([{"role": "user", "content": "x"}]))
         self.assertEqual(resp.usage.completion_tokens, 64)  # unreadable -> max_tokens bound
-        self.assertEqual(resp.usage.total_tokens, 64)
+        self.assertEqual(resp.usage.total_tokens, resp.usage.prompt_tokens + 64)
 
     def test_reported_usage_is_not_marked_estimated(self) -> None:
         with _FakeServer([(200, {}, _OK_BODY)]) as srv:

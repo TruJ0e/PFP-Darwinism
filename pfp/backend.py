@@ -99,21 +99,21 @@ def completion_token_bound(max_tokens: Any = 256, n: Any = 1, max_completion_tok
         parsed = _non_negative_int(raw)
         limits.append(UNBOUNDED_COMPLETION_TOKENS if parsed is None else min(parsed, UNBOUNDED_COMPLETION_TOKENS))
     limit = max(limits) if limits else UNBOUNDED_COMPLETION_TOKENS
-    samples = _non_negative_int(n)
-    return limit * max(1, samples if samples is not None else 1)
+    samples = _configuration_int(n, "n", minimum=1)
+    return limit * samples
 
 
 def _non_negative_int(value: Any) -> Optional[int]:
-    """Parse a provider token count; None when absent or unreadable (never negative)."""
+    """Parse an exact non-negative integer; reject lossy or negative accounting data."""
     if value is None or isinstance(value, bool):
         return None
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(number):
+    if not math.isfinite(number) or number < 0 or not number.is_integer():
         return None
-    return max(0, int(number))
+    return int(number)
 
 
 def _finite_float(value: Any, default: float) -> float:
@@ -414,6 +414,10 @@ class _LiveChatCompletions:
         n: int = 1,
         **kwargs: Any,
     ) -> ChatCompletionResponse:
+        # ``n`` multiplies billable output. Refuse lossy/coercible values before the
+        # request body is built so a direct (unmetered) client cannot dispatch more
+        # samples than its accounting bound understood.
+        n = _configuration_int(n, "n", minimum=1)
         target_model = model or self.default_model
         payload: Dict[str, Any] = {
             "model": target_model,
