@@ -340,7 +340,8 @@ class VersionRegistry:
         pkg_dir = Path(__file__).resolve().parent
         hashes: Dict[str, str] = {}
         for py_file in sorted(pkg_dir.glob("*.py")):
-            hashes[py_file.name] = hashlib.sha256(py_file.read_bytes()).hexdigest()[:16]
+            # This is a custody record, not a display label: retain the complete digest.
+            hashes[py_file.name] = hashlib.sha256(py_file.read_bytes()).hexdigest()
         return hashes
 
     @staticmethod
@@ -842,13 +843,44 @@ class SelfImprovementLoop:
         cleaned = [case for case in (self.sanitize_case(c) for c in self.case_bank) if case is not None]
         self.case_bank = cleaned
         self._trim_case_bank()
-        return atomic_write_text(Path(path), json.dumps(self.case_bank, indent=2, allow_nan=False))
+        payload: Dict[str, Any] = {
+            "format": "pfp-case-bank/2",
+            "case_count": len(self.case_bank),
+            "cases": copy.deepcopy(self.case_bank),
+        }
+        payload["integrity_sha256"] = self._case_bank_digest(payload)
+        return atomic_write_text(Path(path), json.dumps(payload, indent=2, allow_nan=False))
+
+    @staticmethod
+    def _case_bank_digest(payload: Dict[str, Any]) -> str:
+        """Digest the complete recall control plane, excluding the digest itself."""
+        unsigned = {k: v for k, v in payload.items() if k != "integrity_sha256"}
+        canonical = json.dumps(
+            unsigned, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def load_case_bank(self, path: str | Path) -> int:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            raise ValueError("Case bank file must contain a JSON list.")
-        cleaned = (self.sanitize_case(c) for c in raw)
+        # v1 was a bare list. It remains readable for migration; the next save upgrades it.
+        if isinstance(raw, list):
+            cases = raw
+        elif isinstance(raw, dict):
+            if raw.get("format") != "pfp-case-bank/2":
+                raise ValueError(f"Unsupported case bank format: {raw.get('format')!r}")
+            recorded = raw.get("integrity_sha256")
+            if not isinstance(recorded, str) or recorded != self._case_bank_digest(raw):
+                raise ValueError("Case bank integrity check failed; refusing to load.")
+            cases = raw.get("cases")
+            if not isinstance(cases, list):
+                raise ValueError("Case bank 'cases' must be a JSON list.")
+            count = raw.get("case_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count != len(cases):
+                raise ValueError("Case bank case_count does not match its cases.")
+        else:
+            raise ValueError("Case bank file must contain a v2 object or legacy JSON list.")
+        cleaned = (self.sanitize_case(c) for c in cases)
         self.case_bank = [c for c in cleaned if c is not None]
         self._trim_case_bank()
         return len(self.case_bank)

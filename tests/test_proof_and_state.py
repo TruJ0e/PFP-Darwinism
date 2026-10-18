@@ -271,7 +271,10 @@ def test_state_dir_round_trip_seeds_next_run(tmp_path):
     state = tmp_path / "state"
     assert _quiet_main(["--mock", "--quiet", "--state-dir", str(state)])[0] == 0
     bank = json.loads((state / "case_bank.json").read_text(encoding="utf-8"))
-    assert bank and all(SelfImprovementLoop.sanitize_case(c) == c for c in bank)
+    assert bank["format"] == "pfp-case-bank/2"
+    assert len(bank["integrity_sha256"]) == 64
+    assert bank["case_count"] == len(bank["cases"])
+    assert bank["cases"] and all(SelfImprovementLoop.sanitize_case(c) == c for c in bank["cases"])
     out = tmp_path / "s2.json"
     code, _ = _quiet_main(["--mock", "--quiet", "--no-improve", "--state-dir", str(state), "--summary-out", str(out)])
     assert code == 0

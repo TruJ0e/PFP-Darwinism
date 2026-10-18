@@ -39,7 +39,10 @@ python run_arena.py --hard-cap 2.00 --state-dir .pfp_state --html-out arena_out/
 
 `--state-dir` persists the version registry and the case bank, so each run starts
 seeded with past wins on similar problems, on whichever config version is active
-or pinned. Real scale is `--starters 9` (odd: no arbitration ties).
+or pinned. Both files are atomically written and integrity-enveloped; a changed or
+truncated recall bank is rejected before a model client is created. Legacy bare-list
+case banks load once and upgrade on the next save. Real scale is `--starters 9`
+(odd: no arbitration ties).
 
 | Flag | Default | Meaning |
 |---|---|---|

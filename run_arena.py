@@ -192,14 +192,15 @@ def _replay_improve(
     except (OSError, ValueError) as exc:
         print(f"[pfp] refusing to run: cannot load registry {registry_path}: {exc}", file=sys.stderr)
         return 1, {}, 0.0
-    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
-    loop = SelfImprovementLoop(client=client, registry=registry)
+    loop = SelfImprovementLoop(client=None, registry=registry)
     if cases_path.exists():
         try:
             loop.load_case_bank(cases_path)
         except (OSError, ValueError) as exc:
             print(f"[pfp] refusing to run: cannot load case bank {cases_path}: {exc}", file=sys.stderr)
             return 1, {}, 0.0
+    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
+    loop.client = client
     meter = MeteredClient(client, hard_cap_usd=args.hard_cap, max_concurrent_calls=args.max_concurrent)
     loop.client = meter
     loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, args.hard_cap / (2 if loop.paired_sandbox else 1))
@@ -386,14 +387,18 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
     if action_rc is not None:
         return action_rc
 
-    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
-    loop = SelfImprovementLoop(client=client, registry=registry)
+    # Recall text becomes prompt material. Validate it before constructing a provider
+    # client, just like the registry above, so corrupt state cannot reach the network.
+    loop = SelfImprovementLoop(client=None, registry=registry)
     if cases_path is not None and cases_path.exists():
         try:
             loop.load_case_bank(cases_path)
         except (OSError, ValueError) as exc:
             print(f"[pfp] refusing to run: cannot load case bank {cases_path}: {exc}", file=sys.stderr)
             return 1
+
+    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
+    loop.client = client
 
     harness = MainHarness(
         client=client,
