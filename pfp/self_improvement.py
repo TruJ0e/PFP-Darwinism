@@ -236,10 +236,12 @@ class SandboxResult:
     passed_branches: int
     total_spent_usd: float
     details: str = ""
+    halted_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "coherent": self.coherent,
+            "halted_reason": self.halted_reason,
             "test_problem": self.test_problem,
             "score": round(self.score, 4),
             "baseline_score": round(self.baseline_score, 4),
@@ -719,6 +721,7 @@ class SelfImprovementLoop:
         super_model: str = SUPER_MODEL,
         sandbox_hard_cap_usd: float = 1.00,
         max_cases: int = 500,
+        paired_sandbox: bool = True,
     ) -> None:
         if max_cases < 1:
             raise ValueError("max_cases must be >= 1")
@@ -731,6 +734,9 @@ class SelfImprovementLoop:
         self.super_model = super_model
         self.case_bank: List[Dict[str, Any]] = []
         self.max_cases = int(max_cases)
+        # A/B the candidate against the current version on the SAME sandbox problem, so
+        # auto-revert compares like with like (not sandbox certainty vs. live-run certainty)
+        self.paired_sandbox = bool(paired_sandbox)
 
     def record_wins_for_recall(self, metrics: MinedArenaMetrics, problem: str) -> List[Dict[str, Any]]:
         """
@@ -1013,6 +1019,7 @@ class SelfImprovementLoop:
             baseline_score=baseline_score,
             passed_branches=passed_count,
             total_spent_usd=float(summary["budget"]["api_spend_usd"]),
+            halted_reason=halted,
             details=(
                 f"Sandbox halted ({halted}) before it could validate the candidate"
                 if halted
@@ -1048,10 +1055,36 @@ class SelfImprovementLoop:
         new_prompts.update(proposition.prompt_changes)
 
         baseline_score = metrics.spend_efficiency.get("max_winner_certainty", 5.0)
+        baseline_source = "run_metrics"
+        baseline_sandbox: Optional[SandboxResult] = None
         if run_sandbox:
             sb_res = self.run_sandbox_test(
                 new_dials, baseline_score=baseline_score, candidate_prompts=new_prompts
             )
+            if self.paired_sandbox:
+                unchanged = (
+                    resolve_dials(new_dials) == resolve_dials(cur_ver.config_dials)
+                    and new_prompts == cur_ver.prompts
+                )
+                if unchanged:
+                    # The candidate IS the current version: its own sandbox score is the baseline
+                    baseline_source = "identical_candidate"
+                    baseline_score = sb_res.score
+                else:
+                    baseline_sandbox = self.run_sandbox_test(
+                        copy.deepcopy(cur_ver.config_dials),
+                        test_problem=sb_res.test_problem,
+                        baseline_score=baseline_score,
+                        candidate_prompts=copy.deepcopy(cur_ver.prompts),
+                    )
+                    if baseline_sandbox.halted_reason is None:
+                        baseline_source = "paired_sandbox"
+                        baseline_score = baseline_sandbox.score
+                    else:
+                        # A baseline cut short (cap, backend) measured nothing: a 0 score would
+                        # wave any candidate through, so fall back to the live run's certainty
+                        baseline_source = "run_metrics_fallback"
+                sb_res.baseline_score = baseline_score
         else:
             sb_res = SandboxResult(
                 coherent=True,
@@ -1063,11 +1096,15 @@ class SelfImprovementLoop:
                 details="Sandbox skipped",
             )
 
+        sandbox_record = sb_res.to_dict()
+        sandbox_record["baseline_source"] = baseline_source
+        if baseline_sandbox is not None:
+            sandbox_record["baseline_sandbox"] = baseline_sandbox.to_dict()
         snap = self.registry.register_rewrite(
             config_dials=new_dials,
             prompts=new_prompts,
             proposition=proposition.to_dict(),
-            sandbox_result=sb_res.to_dict(),
+            sandbox_result=sandbox_record,
             adopt=sb_res.coherent,
         )
 
@@ -1082,7 +1119,7 @@ class SelfImprovementLoop:
             "mined_metrics": metrics.to_dict(),
             "recall_cases_added": len(recalled),
             "proposition": proposition.to_dict(),
-            "sandbox_result": sb_res.to_dict(),
+            "sandbox_result": sandbox_record,
             "registered_version": snap.to_dict(),
             "auto_revert_check": revert_check,
             "active_version_id": self.registry.get_version().version_id,

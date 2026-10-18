@@ -179,6 +179,14 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   `default` instead of `True`.
 - **Falsification fails closed.** A judge reply with no readable verdict is
   *inconclusive*: no survival credit, no kill, no appeal consumed, and no Pass.
+- **Branches can't rule on themselves.** The judge prompt quotes model-written text
+  inside `<branch_text>` / `<context>` fences, tells the judge that instructions in
+  there are evidence against the branch, and defangs any fence tag a reply writes
+  (`fail_judge.fence_untrusted`), so a branch can't close its own quote.
+- **The winner's box is re-checked after the whole pre-exit sweep.** A later
+  candidate's kill re-verifies its dependents; a winner demoted that way no longer
+  exits. A contradiction tie on certainty spares the branch with more survived
+  falsifications, then fewer open objections.
 - HTTP: exponential backoff with jitter on 408/409/425/429/5xx, network errors
   and connections dropped mid-body, `Retry-After` honored (seconds or HTTP-date), non-retryable errors raised immediately with
   status and body; reasoning-model `reasoning_content` fallback.
@@ -210,6 +218,18 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   run, and an interrupted sandbox is never recorded as a failed experiment.
 
 ## Self-improvement guardrails
+
+- **Auto-revert compares like with like.** The sandbox is a paired A/B: the candidate
+  and the current version run on the *same* sandbox problem, and degradation is the
+  candidate's score against that paired baseline (`sandbox_result.baseline_source =
+  "paired_sandbox"`, the baseline run kept under `baseline_sandbox`). Before v0.11 the
+  candidate's sandbox certainty was measured against the live run's winner certainty —
+  a different problem at a different scale — so a zero-winner live run disabled
+  auto-revert entirely. An unchanged candidate reuses its own score
+  (`identical_candidate`, no second run); a baseline cut short by the cap falls back to
+  the live-run figure (`run_metrics_fallback`) instead of a 0 that would wave anything
+  through. The CLI splits the remaining sandbox budget across the pair;
+  `SelfImprovementLoop(paired_sandbox=False)` restores the single-run behaviour.
 
 - Proposed dial changes are untrusted input: `pfp/dials.py` rejects unknown
   keys, non-numeric values, NaN/inf, and anything outside the safe envelope

@@ -202,7 +202,7 @@ def _replay_improve(
             return 1, {}, 0.0
     meter = MeteredClient(client, hard_cap_usd=args.hard_cap, max_concurrent_calls=args.max_concurrent)
     loop.client = meter
-    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, args.hard_cap)
+    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, args.hard_cap / (2 if loop.paired_sandbox else 1))
     try:
         res = loop.run_post_run_improvement(
             feed.events,
@@ -238,7 +238,8 @@ def _run_improvement(
         return
     meter = MeteredClient(client, hard_cap_usd=remaining, max_concurrent_calls=args.max_concurrent)
     loop.client = meter
-    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, remaining)
+    # A paired A/B runs two sandboxes (candidate + current version): split what's left
+    loop.sandbox_hard_cap_usd = min(loop.sandbox_hard_cap_usd, remaining / (2 if loop.paired_sandbox else 1))
     try:
         summary["self_improvement"] = loop.run_post_run_improvement(
             harness.arena_feed.events,
