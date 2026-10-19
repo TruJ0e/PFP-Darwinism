@@ -121,19 +121,44 @@ def _evidence_count(value: Any) -> int:
 
 
 _GAUNTLET_ROUND = re.compile(r"pass_gauntlet_round_(\d+)(?::|$)")
+_SURVIVAL_SCHEDULES = frozenset(
+    {"post_merge", "contradiction", "background_sample", "pre_exit", "dependent_reverify"}
+)
 
 
-def _surplus_gauntlet_survivals(provenance: Any) -> int:
-    """Survivals from gauntlet rounds past the reference `gauntlet_rounds` (they add no yardstick)."""
+def _corroborated_survivals(record: Mapping[str, Any]) -> int:
+    """Return a fail-closed, schedule-normalized survival count.
+
+    Modern branch records carry a provenance entry for every survival. The raw counter is a
+    cache and must not be stronger evidence than that audit trail. Each fixed schedule earns at
+    most one unit and each reference gauntlet round earns at most one unit, so a configuration
+    cannot improve its A/B score merely by arranging repeated calls from the same schedule.
+
+    Records without the key are legacy inputs from before provenance existed; retain their old
+    counter semantics for replay compatibility. A present but malformed provenance field is
+    modern corrupt data and therefore scores zero rather than falling back to the counter.
+    """
+    claimed = _evidence_count(record.get("survived_falsifications"))
+    if "pass_provenance" not in record:
+        return claimed
+    provenance = record.get("pass_provenance")
     if not isinstance(provenance, list):
         return 0
-    surplus = 0
+    credited: set[str] = set()
+    reference_rounds = int(DEFAULT_DIALS["gauntlet_rounds"])
     for entry in provenance:
         what = entry.get("survived_what") if isinstance(entry, Mapping) else None
-        m = _GAUNTLET_ROUND.match(what) if isinstance(what, str) else None
-        if m and int(m.group(1)) > int(DEFAULT_DIALS["gauntlet_rounds"]):
-            surplus += 1
-    return surplus
+        if not isinstance(what, str):
+            continue
+        trigger = what.split(":", 1)[0]
+        gauntlet = _GAUNTLET_ROUND.fullmatch(trigger)
+        if gauntlet:
+            round_number = int(gauntlet.group(1))
+            if 1 <= round_number <= reference_rounds:
+                credited.add(f"pass_gauntlet_round_{round_number}")
+        elif trigger in _SURVIVAL_SCHEDULES:
+            credited.add(trigger)
+    return min(claimed, len(credited))
 
 
 def evidence_score(record: Mapping[str, Any]) -> float:
@@ -159,11 +184,7 @@ def evidence_score(record: Mapping[str, Any]) -> float:
     if not isinstance(record, Mapping):
         return 0.0
     w = REFERENCE_WEIGHTS
-    survived = max(
-        0,
-        _evidence_count(record.get("survived_falsifications"))
-        - _surplus_gauntlet_survivals(record.get("pass_provenance")),
-    )
+    survived = _corroborated_survivals(record)
     score = (
         survived * w.survived_falsifications
         + _evidence_count(record.get("open_critic_objections")) * w.open_critic_objections

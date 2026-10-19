@@ -86,14 +86,14 @@ def test_gauntlet_rounds_past_the_reference_count_earn_nothing():
     assert evidence_score(rec) == 4 * REFERENCE_WEIGHTS.survived_falsifications
 
 
-def test_malformed_provenance_is_ignored_not_trusted():
+def test_malformed_modern_provenance_fails_closed():
     rec = {
         "survived_falsifications": 3,
         "pass_provenance": ["pass_gauntlet_round_7:logic", {"survived_what": 7},
                             {"survived_what": "pass_gauntlet_round_12x"}, None],
     }
-    assert evidence_score(rec) == 9.0
-    assert evidence_score({"survived_falsifications": 3, "pass_provenance": "junk"}) == 9.0
+    assert evidence_score(rec) == 0.0
+    assert evidence_score({"survived_falsifications": 3, "pass_provenance": "junk"}) == 0.0
 
 
 # ---- the sandbox A/B on the real mock ---------------------------------------------------------

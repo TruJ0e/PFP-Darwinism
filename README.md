@@ -352,9 +352,13 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   into the winner instead, and the candidate out-scored the incumbent 22.5 to 19.5 on equal
   survivals (5 each) and more merges (5 vs 3). The reverse rewrite, restoring the clash check, read
   as a 13% degradation, two points short of being auto-reverted. Since v0.34 `dials.evidence_score`
-  counts survived falsifications and open objections only (`score_yardstick:
-  "reference_evidence_v2"`; v1 scores are not comparable). Merges still raise a winner's certainty
+  counts survived falsifications and open objections only. Merges still raise a winner's certainty
   and ranking in the arena; they just can't move the A/B.
+- **Sandbox evidence has custody too.** Since v0.35 the yardstick corroborates the cached survival
+  count against each winner's provenance and normalizes repeated calls from the same schedule
+  (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
+  names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
+  Legacy records with no provenance key retain their historical score for replay compatibility.
 - **Auto-revert judges the version that was measured; a pin is never collateral.** Under a manual
   pin the post-run candidate is registered but held (status `held_by_pin`, not `adopted`), and
   before v0.32 the degradation check then ran on the *current* version, which is the pinned one:

@@ -28,7 +28,7 @@ def test_merges_attracted_do_not_move_the_yardstick(merges):
 
 
 def test_yardstick_id_marks_the_incomparable_v1_scores():
-    assert SCORE_YARDSTICK == "reference_evidence_v2"
+    assert SCORE_YARDSTICK == "reference_evidence_v3"
 
 
 @pytest.fixture(scope="module")
