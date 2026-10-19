@@ -149,9 +149,12 @@ def test_inflating_weights_is_not_adopted_as_an_improvement():
 def test_lowering_a_weight_is_not_auto_reverted_for_doing_nothing():
     # Before v0.31: 10.5 vs 22.5 = a 53% "degradation" from a pure unit change
     loop, registry = _scripted_loop({"survived_falsifications_weight": 1.0})
+    initial = registry.active_version_id
     res = loop.run_post_run_improvement(_events(), problem=PROBLEM, run_sandbox=True)
     assert res["auto_revert_check"]["reverted"] is False
-    assert registry.active_version_id == res["registered_version"]["version_id"]
+    # v0.36: a pure unit change measures a tie, so it is not adopted either
+    assert res["registered_version"]["status"] == "unproven"
+    assert registry.active_version_id == initial
 
 
 def test_dropping_the_gauntlet_is_still_caught_as_degradation():

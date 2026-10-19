@@ -205,6 +205,9 @@ post-run replay — same data.
 - Version registry: every rewrite snapshots code/config/prompts, hashed,
   with proposition + sandbox result attached.
 - Auto-revert on degradation past threshold (no human needed).
+  Against a paired baseline (same sandbox problem), a changed candidate is adopted only
+  if it measures strictly better; a tie or a sub-threshold loss is registered as
+  `unproven` and the incumbent stays, so small losses cannot compound across cycles.
   Degradation is measured on a fixed yardstick (factory certainty weights, reference
   gauntlet length), never on the dials under test: a rewrite that only changes how
   certainty is counted must not look like better or worse reasoning.

@@ -53,7 +53,13 @@ class TestPiece8SelfImprovementAndRegistry(unittest.TestCase):
         self.assertTrue(res["sandbox_result"]["coherent"])
         self.assertNotEqual(res["registered_version"]["version_id"], baseline_vid)
         self.assertEqual(len(res["registered_version"]["sha256_hash"]), 64)
-        self.assertEqual(loop.registry.active_version_id, res["registered_version"]["version_id"])
+        # v0.36: a changed candidate replaces the incumbent only if it beat the paired baseline
+        sb = res["sandbox_result"]
+        if sb["score"] > sb["baseline_score"]:
+            self.assertEqual(loop.registry.active_version_id, res["registered_version"]["version_id"])
+        else:
+            self.assertEqual(res["registered_version"]["status"], "unproven")
+            self.assertEqual(loop.registry.active_version_id, baseline_vid)
 
     def test_version_registry_auto_revert_pin_restore_and_run_boundary(self) -> None:
         reg = VersionRegistry(degradation_threshold=0.15)

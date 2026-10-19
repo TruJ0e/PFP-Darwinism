@@ -71,11 +71,14 @@ def test_degraded_candidate_is_reverted_against_its_paired_baseline():
 def test_candidate_matching_its_baseline_survives_even_below_live_run_certainty():
     # Old behaviour compared sandbox certainty with the live run's (different problem, scale):
     # a candidate that ties the current version on the same sandbox must not be reverted.
+    # v0.36: nor adopted; a tie is no evidence the rewrite helps, so it stays "unproven".
     loop, registry, _ = _loop_with({"gauntlet_rounds": 2}, {"2": 0.5, "3": 0.5})
+    initial = registry.active_version_id
     res = loop.run_post_run_improvement(_events(), problem=PROBLEM, run_sandbox=True)
     assert res["mined_metrics"]["spend_efficiency"]["max_winner_certainty"] > 0.5
     assert res["auto_revert_check"]["reverted"] is False
-    assert registry.active_version_id == res["registered_version"]["version_id"]
+    assert res["registered_version"]["status"] == "unproven"
+    assert registry.active_version_id == initial
 
 
 def test_unchanged_candidate_skips_the_second_sandbox_run():

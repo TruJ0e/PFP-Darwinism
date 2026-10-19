@@ -60,8 +60,9 @@ from .jsonutil import as_str_list, parse_json_object
 SCORE_YARDSTICK = "reference_evidence_v3"
 
 # "held_by_pin": the sandbox passed but a manual pin kept it from becoming active (v0.32)
+# "unproven": coherent, but it did not beat the paired baseline it was measured against (v0.36)
 _SNAPSHOT_STATUSES = frozenset(
-    {"baseline", "adopted", "held_by_pin", "reverted", "rejected_sandbox"}
+    {"baseline", "adopted", "held_by_pin", "unproven", "reverted", "rejected_sandbox"}
 )
 
 
@@ -352,7 +353,7 @@ class VersionSnapshot:
     code_snapshot_hashes: Dict[str, str]
     proposition: Dict[str, Any]
     sandbox_result: Dict[str, Any]
-    status: str = "adopted"  # "baseline", "adopted", "reverted", "rejected_sandbox"
+    status: str = "adopted"  # "baseline", "adopted", "held_by_pin", "unproven", "reverted", "rejected_sandbox"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -751,8 +752,8 @@ class VersionRegistry:
         return self._versions[version_id]
 
     def _release_held(self, version_id: str) -> None:
-        """An operator chose a candidate a pin had held: from now on it is simply adopted."""
-        if self._versions[version_id].status == "held_by_pin":
+        """An operator chose a candidate the registry held back: from now on it is simply adopted."""
+        if self._versions[version_id].status in ("held_by_pin", "unproven"):
             self._versions[version_id].status = "adopted"
 
     def unpin(self) -> None:
@@ -1407,12 +1408,29 @@ class SelfImprovementLoop:
         sandbox_record["baseline_source"] = baseline_source
         if baseline_sandbox is not None:
             sandbox_record["baseline_sandbox"] = baseline_sandbox.to_dict()
+        # The burden of proof is on the rewrite (v0.36). Against a paired baseline (same problem,
+        # same yardstick) a changed candidate must measure strictly better to replace the version
+        # that produced the baseline. The degradation threshold alone let ties and losses of up
+        # to 15% through, and each adopted loss became the next cycle's baseline: 0.85^n with no
+        # floor. `prefilter_threshold: 0.95`, the clash-hiding dial v0.34 cites, ties the mock
+        # incumbent 15.0 to 15.0 and was adopted. Unpaired baselines (a live run on another
+        # problem) are not like with like, so only the threshold applies to them.
+        adopt = sb_res.coherent
+        status = "adopted"
+        gain_required = baseline_source == "paired_sandbox"
+        if adopt and gain_required and not sb_res.score > baseline_score:
+            adopt = False
+            status = "unproven"
+        sandbox_record["adoption_rule"] = (
+            "strict_gain_over_paired_baseline" if gain_required else "degradation_threshold"
+        )
         snap = self.registry.register_rewrite(
             config_dials=new_dials,
             prompts=new_prompts,
             proposition=proposition.to_dict(),
             sandbox_result=sandbox_record,
-            adopt=sb_res.coherent,
+            adopt=adopt,
+            status=status,
         )
 
         revert_check = {"reverted": False, "active_version_id": self.registry.active_version_id}
@@ -1423,6 +1441,19 @@ class SelfImprovementLoop:
                 baseline_score=baseline_score,
                 version_id=snap.version_id,
             )
+            if snap.status == "unproven":
+                # Not degraded enough to revert, not good enough to adopt: still a failed
+                # experiment, so the anti-model sees the rewrite that bought nothing
+                self.registry.failed_experiments.append(
+                    {
+                        "version_id": snap.version_id,
+                        "sha256_hash": snap.sha256_hash,
+                        "reason": "unproven_no_gain_over_paired_baseline",
+                        "measured_score": round(sb_res.score, 4),
+                        "baseline_score": round(baseline_score, 4),
+                        "proposition": copy.deepcopy(snap.proposition),
+                    }
+                )
 
         return {
             "mined_metrics": metrics.to_dict(),

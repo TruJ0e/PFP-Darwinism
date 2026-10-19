@@ -359,6 +359,18 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **The burden of proof is on the rewrite.** Before v0.36 a coherent candidate became active
+  unless it measured more than `degradation_threshold` (15%) below its paired baseline, so ties
+  and losses of up to 15% were adopted, and each adopted loser produced the next cycle's baseline:
+  drift compounded (0.85^n) with no floor. On the mock, `prefilter_threshold: 0.95`, the
+  clash-hiding dial above, ties the incumbent 15.0 to 15.0 and was adopted. Against a paired
+  baseline a changed candidate now has to score strictly higher
+  (`sandbox_result.adoption_rule = "strict_gain_over_paired_baseline"`); otherwise it is
+  registered with status `unproven`, logged in `failed_experiments`
+  (`unproven_no_gain_over_paired_baseline`) for the anti-model, and the incumbent stays active.
+  A loss past the threshold is still `reverted`. An unchanged candidate (`identical_candidate`)
+  and unpaired baselines (`run_metrics`, `run_metrics_fallback`: a different problem, not like
+  with like) keep the threshold rule. Pinning or restoring an `unproven` version adopts it.
 - **Auto-revert judges the version that was measured; a pin is never collateral.** Under a manual
   pin the post-run candidate is registered but held (status `held_by_pin`, not `adopted`), and
   before v0.32 the degradation check then ran on the *current* version, which is the pinned one:

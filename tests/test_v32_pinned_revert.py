@@ -73,6 +73,16 @@ def test_degraded_candidate_under_a_pin_reverts_itself_not_the_pin(events):
 
 def test_passing_candidate_under_a_pin_is_held_not_adopted(events):
     loop, registry, pinned = _pinned_loop({"survived_falsifications_weight": 1.0})
+    real_sandbox = loop.run_sandbox_test
+
+    def candidate_wins(candidate_dials, *args, **kwargs):
+        # v0.36: only a measured gain is adoptable, so script the candidate one point ahead
+        res = real_sandbox(candidate_dials, *args, **kwargs)
+        if candidate_dials.get("survived_falsifications_weight") == 1.0:
+            res.score += 1.0
+        return res
+
+    loop.run_sandbox_test = candidate_wins  # type: ignore[assignment]
     res = loop.run_post_run_improvement(events, problem=PROBLEM, run_sandbox=True)
     cand = res["registered_version"]["version_id"]
     assert res["auto_revert_check"]["reverted"] is False
