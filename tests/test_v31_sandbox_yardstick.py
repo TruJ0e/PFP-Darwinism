@@ -57,8 +57,8 @@ def test_reference_weights_are_the_factory_dials():
 
 def test_evidence_score_ignores_the_recorded_certainty():
     rec = {"survived_falsifications": 6, "merges_attracted": 3, "open_critic_objections": 0}
-    assert evidence_score(rec) == 22.5
-    assert evidence_score({**rec, "certainty_score": 999.0}) == 22.5
+    assert evidence_score(rec) == 18.0  # merges don't count since v0.34
+    assert evidence_score({**rec, "certainty_score": 999.0}) == 18.0
 
 
 def test_open_objections_subtract_and_the_score_floors_at_zero():
@@ -68,7 +68,8 @@ def test_open_objections_subtract_and_the_score_floors_at_zero():
 
 @pytest.mark.parametrize("bad", [True, -3, 2.5, float("nan"), float("inf"), "7", None, [4]])
 def test_malformed_counts_count_for_nothing(bad):
-    assert evidence_score({"survived_falsifications": bad, "merges_attracted": 2}) == 3.0
+    assert evidence_score({"survived_falsifications": bad, "open_critic_objections": 0}) == 0.0
+    assert evidence_score({"survived_falsifications": 2, "open_critic_objections": bad}) == 6.0
 
 
 def test_non_mapping_records_score_zero():

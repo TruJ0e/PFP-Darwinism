@@ -342,10 +342,19 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   1.0 read as a 53% degradation and was auto-reverted for doing nothing; `gauntlet_rounds: 9` scored
   40.5 by testing more, not reasoning better. Both sides, and the live-run fallback baseline
   (`spend_efficiency.max_winner_evidence`), are now scored by `dials.evidence_score`: survived
-  falsifications, merges attracted and open objections on the factory weights
+  falsifications and open objections (merges too, before v0.34) on the factory weights
   (`dials.REFERENCE_WEIGHTS`), with survivals from gauntlet rounds past the reference three left
   uncounted (a candidate that runs fewer rounds still loses what it skipped). Every sandbox record
   names its `score_yardstick` and keeps the candidate-weight figure as `certainty_score`.
+- **The yardstick counts survived attacks, not merges.** `prefilter_threshold` gates the alignment
+  judge for both of its verdicts, so it gates the contradiction check too. On the mock sandbox,
+  raising it to 0.95 skipped a 0.71-similarity clash; the branch that clash would have killed merged
+  into the winner instead, and the candidate out-scored the incumbent 22.5 to 19.5 on equal
+  survivals (5 each) and more merges (5 vs 3). The reverse rewrite, restoring the clash check, read
+  as a 13% degradation, two points short of being auto-reverted. Since v0.34 `dials.evidence_score`
+  counts survived falsifications and open objections only (`score_yardstick:
+  "reference_evidence_v2"`; v1 scores are not comparable). Merges still raise a winner's certainty
+  and ranking in the arena; they just can't move the A/B.
 - **Auto-revert judges the version that was measured; a pin is never collateral.** Under a manual
   pin the post-run candidate is registered but held (status `held_by_pin`, not `adopted`), and
   before v0.32 the degradation check then ran on the *current* version, which is the pinned one:

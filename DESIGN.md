@@ -208,6 +208,8 @@ post-run replay — same data.
   Degradation is measured on a fixed yardstick (factory certainty weights, reference
   gauntlet length), never on the dials under test: a rewrite that only changes how
   certainty is counted must not look like better or worse reasoning.
+  It counts survived attacks and open objections only: merges attracted are agreement,
+  and a dial that skips clash checks can manufacture them.
 - Manual pin: any version, anytime; all future runs use it.
   A candidate proposed under a pin is held, and only it can be reverted for its own
   sandbox score: the pinned version is never judged on evidence it didn't produce.

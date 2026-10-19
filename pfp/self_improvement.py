@@ -55,7 +55,8 @@ from .jsonutil import as_str_list, parse_json_object
 
 
 # What `SandboxResult.score` measures (recorded on every sandbox record; see dials.evidence_score)
-SCORE_YARDSTICK = "reference_evidence_v1"
+# v2 (v0.34): merges attracted no longer count; v1 sandbox scores are not comparable
+SCORE_YARDSTICK = "reference_evidence_v2"
 
 # "held_by_pin": the sandbox passed but a manual pin kept it from becoming active (v0.32)
 _SNAPSHOT_STATUSES = frozenset(

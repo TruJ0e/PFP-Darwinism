@@ -99,7 +99,8 @@ def weights_from_dials(dials: Dict[str, Any]) -> CertaintyWeights:
 # with the identical run shape, and the paired A/B adopted it as an improvement (lowering a weight
 # got an unchanged candidate auto-reverted). Both sides of the A/B, and the live-run fallback, are
 # therefore scored on the factory weights, which no proposition can reach. Only falsification
-# evidence counts: untested age and the probe-cluster support bonus are ranking signals, not proof.
+# evidence counts: untested age, merges attracted (v0.34, see `evidence_score`) and the
+# probe-cluster support bonus are ranking signals, not proof.
 REFERENCE_WEIGHTS = CertaintyWeights(
     survived_falsifications=float(DEFAULT_DIALS["survived_falsifications_weight"]),
     merges_attracted=float(DEFAULT_DIALS["merges_attracted_weight"]),
@@ -138,8 +139,17 @@ def _surplus_gauntlet_survivals(provenance: Any) -> int:
 def evidence_score(record: Mapping[str, Any]) -> float:
     """
     Version-invariant score of a branch record (a winners-box entry or a mined winner shape):
-    its survived falsifications, merges attracted and open objections on `REFERENCE_WEIGHTS`,
-    floored at 0. Use it whenever scores from runs on different dials are compared.
+    its survived falsifications and open objections on `REFERENCE_WEIGHTS`, floored at 0. Use it
+    whenever scores from runs on different dials are compared.
+
+    `merges_attracted` is not counted (v0.34). An `overlap` verdict is agreement, not a survived
+    attack, and how many merges a winner accumulates is set by dials: `prefilter_threshold` gates
+    the contradiction check as well as the alignment check, so raising it hides clashes that would
+    have killed a branch, which then merges again instead. On the mock sandbox, threshold 0.95
+    skipped a 0.71-similarity clash, the doomed branch merged into the winner, and the candidate
+    out-scored the incumbent 22.5 to 19.5 (merges 5 vs 3, survivals 5 vs 5); the reverse rewrite,
+    restoring the clash check, read as a 13% degradation. Merges still reach the winner's own
+    certainty and ranking; they just can't move the A/B.
 
     `gauntlet_rounds` is a dial too: a candidate that raises it to 9 buys six more survivals per
     winner and would out-score the incumbent by testing more, not by reasoning better. Survivals
@@ -156,7 +166,6 @@ def evidence_score(record: Mapping[str, Any]) -> float:
     )
     score = (
         survived * w.survived_falsifications
-        + _evidence_count(record.get("merges_attracted")) * w.merges_attracted
         + _evidence_count(record.get("open_critic_objections")) * w.open_critic_objections
     )
     return round(max(0.0, score), 4)
