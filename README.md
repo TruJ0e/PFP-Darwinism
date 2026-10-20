@@ -359,6 +359,13 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **Structural floor under the difficulty estimate (v0.38).** The second live run showed the
+  anchored estimator's remaining failure mode: it priced a call correctly ($0.0018 total vs the
+  unanchored $50) but guessed ~6 calls for the whole arena, so the root budget funded a single
+  starter, which the falsifier killed — no population, no selection. A sizing model cannot know
+  the arena's shape, so the estimate is now floored at `MIN_ARENA_CALLS` (60) typical calls: the
+  smallest arena that can still run 3 starters, probes, selection and a 3-round gauntlet. The
+  model's estimate still rules whenever it is larger. 468 tests + 7 subtests pass.
 - **Calibrated against the first live run (v0.37).** The first arena run on real Nebius models
   (Nemotron-3-Nano fan-out, Nemotron-3-Super judge; 83 calls, $0.0111, journal verified) produced
   an empty winner's box: Nano is a reasoning model and burned the 80–260-token completion budgets

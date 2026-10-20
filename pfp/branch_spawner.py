@@ -38,6 +38,11 @@ from .issue_detector import IssueDetectionResult, IssueDetector, ProbeContinuati
 from .jsonutil import parse_json_object
 from .tracker import BranchRecord, BranchState, PFPTracker, id_free
 
+# Smallest arena that can still do selection: 3 starters, their probe cycles,
+# alignment/merge rounds and a 3-round falsification gauntlet. The difficulty
+# estimate never sizes below this many calls (see BudgetLedger.size_problem_once).
+MIN_ARENA_CALLS = 60
+
 
 def _finite_number(value: Any, name: str) -> float:
     """Coerce a public budget input without admitting bool, NaN, or infinity."""
@@ -191,6 +196,8 @@ class BudgetLedger:
                         "Estimate compute difficulty for this problem as JSON. Price anchor: one model call costs about $0.0003 "
                         "(fan-out model $0.06/M input, $0.24/M output tokens; judge calls cost ~3x that). "
                         "difficulty_estimate_usd MUST be roughly estimated_calls x $0.0003 — do not guess a round dollar figure. "
+                        "Context for estimated_calls: the arena runs several agents in parallel, each making probe, "
+                        "falsification and merge calls — even a small problem takes 60-150 calls in total. "
                         '{"difficulty_estimate_usd": <float>, "estimated_calls": <int>}.'
                     ),
                 },
@@ -213,6 +220,16 @@ class BudgetLedger:
             est = 0.05
         if not math.isfinite(est) or est <= 0:
             est = 0.05
+
+        # Structural floor: the sizing model prices a call well once anchored, but it
+        # cannot know the arena's shape and chronically under-counts calls (the first
+        # calibrated live run estimated ~6 calls and funded a single starter; the arena
+        # actually used 83). The smallest useful arena — 3 starters, their probes,
+        # selection and a 3-round gauntlet — takes ~60 calls, so never size below that.
+        from .backend import estimate_call_cost_usd, get_model_name
+
+        structural_floor = MIN_ARENA_CALLS * estimate_call_cost_usd(1200, 800, get_model_name())
+        est = max(est, structural_floor)
 
         with self._lock:
             self.difficulty_estimate_usd = max(est, probe_cost * 4.0)
