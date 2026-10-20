@@ -272,7 +272,7 @@ class MergeSynthesizer:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=260,
+            max_tokens=1024,
         )
         synth_cost = max(0.0, float(resp.usage.cost_usd))
         raw = (resp.choices[0].message.content if resp.choices else "") or ""

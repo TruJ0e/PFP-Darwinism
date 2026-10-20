@@ -188,7 +188,9 @@ class BudgetLedger:
                 {
                     "role": "system",
                     "content": (
-                        "Estimate compute difficulty for this problem as JSON: "
+                        "Estimate compute difficulty for this problem as JSON. Price anchor: one model call costs about $0.0003 "
+                        "(fan-out model $0.06/M input, $0.24/M output tokens; judge calls cost ~3x that). "
+                        "difficulty_estimate_usd MUST be roughly estimated_calls x $0.0003 — do not guess a round dollar figure. "
                         '{"difficulty_estimate_usd": <float>, "estimated_calls": <int>}.'
                     ),
                 },
@@ -198,7 +200,7 @@ class BudgetLedger:
                 },
             ],
             temperature=0.1,
-            max_tokens=100,
+            max_tokens=320,
         )
         probe_cost = _non_negative_amount(resp.usage.cost_usd, "probe cost_usd")
         raw = resp.choices[0].message.content if resp.choices else "{}"
@@ -465,7 +467,7 @@ def compress_parent_reasoning(client: Any, reasoning_trace: Sequence[str]) -> tu
             }
         ],
         temperature=0.2,
-        max_tokens=80,
+        max_tokens=320,
     )
     cost = float(resp.usage.cost_usd)
     text = resp.choices[0].message.content.strip() if resp.choices else joined[:240]
@@ -817,7 +819,7 @@ class MiniHarness:
                 }
             ],
             temperature=0.3,
-            max_tokens=160,
+            max_tokens=1024,
         )
         self._spend(float(resp.usage.cost_usd), "run_to_conclusion", kind="conclude")
         content = _conclusion_text((resp.choices[0].message.content if resp.choices else "") or "")

@@ -312,7 +312,7 @@ class IssueDetector:
                 },
             ],
             temperature=0.2,
-            max_tokens=150,
+            max_tokens=512,
         )
         cost = float(resp.usage.cost_usd)
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
@@ -410,7 +410,7 @@ class IssueDetector:
             + "Return JSON with fork_id, fork, and reasoning."
         )
         choices, total_cost = self._sample_choices(
-            prompt, n=num_probes, temperature=self.probe_temperature, max_tokens=200
+            prompt, n=num_probes, temperature=self.probe_temperature, max_tokens=768
         )
 
         probes: List[ProbeContinuation] = []
@@ -515,7 +515,7 @@ class IssueDetector:
             f"Current reasoning: {parent_reasoning}\n"
             "Generate an orthogonal, unconsidered angle as JSON."
         )
-        choices, total_cost = self._sample_choices(prompt, n=max_allowed, temperature=1.0, max_tokens=180)
+        choices, total_cost = self._sample_choices(prompt, n=max_allowed, temperature=1.0, max_tokens=768)
 
         probes: List[ProbeContinuation] = []
         for idx, ch in enumerate(choices):

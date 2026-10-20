@@ -281,7 +281,7 @@ class AlignmentDetector:
                 },
             ],
             temperature=0.1,
-            max_tokens=160,
+            max_tokens=512,
         )
         cost = float(resp.usage.cost_usd)
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
@@ -346,7 +346,7 @@ class AlignmentDetector:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=220,
+            max_tokens=512,
         )
         total_cost = cost_a + cost_b + float(resp.usage.cost_usd)
         raw = (resp.choices[0].message.content if resp.choices else "") or ""

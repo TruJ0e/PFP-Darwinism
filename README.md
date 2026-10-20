@@ -359,6 +359,16 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **Calibrated against the first live run (v0.37).** The first arena run on real Nebius models
+  (Nemotron-3-Nano fan-out, Nemotron-3-Super judge; 83 calls, $0.0111, journal verified) produced
+  an empty winner's box: Nano is a reasoning model and burned the 80–260-token completion budgets
+  on reasoning, so branch conclusions landed truncated or empty, claim extraction saw only
+  scaffolding, and the alignment judge marked even 1.0-cosine pairs "unrelated" (0 merges).
+  Completion budgets are now sized for reasoning models (conclusions and merges 1024, probes 768,
+  verdicts 512, self-improvement 640), and the difficulty-sizing prompt carries a real price
+  anchor (the unanchored probe estimated $50 for a problem that actually cost $0.011). Prompt
+  *wording* for branch conclusions is unchanged on purpose: mock responses are digest-coupled to
+  prompt text, so wording is frozen mock surface. 468 tests + 7 subtests pass.
 - **The burden of proof is on the rewrite.** Before v0.36 a coherent candidate became active
   unless it measured more than `degradation_threshold` (15%) below its paired baseline, so ties
   and losses of up to 15% were adopted, and each adopted loser produced the next cycle's baseline:
