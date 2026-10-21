@@ -44,8 +44,11 @@ def test_hiding_clashes_cannot_buy_a_higher_score(prefilter_runs):
     base = prefilter_runs[float(DEFAULT_DIALS["prefilter_threshold"])]
     blind = prefilter_runs[0.95]
     assert base["coherent"] and blind["coherent"]
-    # The run shapes really differ: the blinded candidate's winner absorbed the doomed branch
-    assert blind["certainty_score"] > base["certainty_score"]
+    # The run shapes really differ: the two winners end up with different certainty
+    # profiles. (At v0.34 the blinded winner's was higher — it had absorbed the doomed
+    # branch; v0.46's arena clock changed which branches feed each winner and flipped
+    # the ordering. The difference is the witness; the tie below is the property.)
+    assert blind["certainty_score"] != base["certainty_score"]
     assert blind["score"] == base["score"] > 0
 
 
