@@ -359,6 +359,14 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **Operator budget dials (v0.40).** The allocation percentages Truman's design argues about
+  were constructor-only: `depth_decay` (children inherit 50% of the pool per generation — the
+  reason live trees grew one generation deep and stopped) and `finish_reserve_ratio`, plus the
+  estimator-derived root. They are now CLI/operator dials (`--depth-decay`,
+  `--finish-reserve-ratio`, `--root-budget-usd`) with unchanged defaults, so an "unfiltered
+  profile" run (decay 0.85, reserve at the 0.10 constitutional floor, root override, 9 starters,
+  hard cap as a pure fuse) is an experiment configuration, not a code change. The override can
+  only lower the root below the hard cap. 468 tests + 7 subtests pass.
 - **Judge calls get reasoning headroom (v0.39).** Run 3's falsifier returned "inconclusive" on
   3 of 4 attacks: Super reasons before it answers, and at 512 tokens the JSON verdict often never
   landed (fail-closed parsing quite rightly counts an unreadable verdict as no verdict). Judge

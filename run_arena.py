@@ -273,6 +273,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--problem", type=str, default=None, help="Problem statement (default: the SSH demo)")
     parser.add_argument("--starters", type=_positive_int, default=3, help="Number of starter agents (3 demo, 9 real)")
     parser.add_argument("--hard-cap", type=_positive_float, default=2.00, help="Hard budget cap in USD (default $2.00)")
+    parser.add_argument("--depth-decay", type=_positive_float, default=0.5, help="Child budget inheritance per generation (default 0.5)")
+    parser.add_argument("--finish-reserve-ratio", type=_positive_float, default=0.125, help="Finish reserve share of root (default 0.125)")
+    parser.add_argument("--root-budget-usd", type=_positive_float, default=None, help="Operator root budget override in USD (default: sized from difficulty estimate)")
     parser.add_argument("--depth-dial", type=_positive_int, default=3, help="Depth dial bounding fan-out")
     parser.add_argument("--k-probes", type=_positive_int, default=3, help="Number of blind probe continuations per step")
     parser.add_argument("--gauntlet-rounds", type=_positive_int, default=3, help="Pass-readiness gauntlet rounds (default 3)")
@@ -424,6 +427,9 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         gauntlet_rounds=args.gauntlet_rounds,
         selection_rounds=args.selection_rounds,
         max_concurrent_calls=args.max_concurrent,
+        depth_decay=args.depth_decay,
+        finish_reserve_ratio=args.finish_reserve_ratio,
+        root_budget_override_usd=args.root_budget_usd,
         enable_selection=True,
         version_registry=registry,
         seed_cases=loop.recall(args.problem, k=args.starters),

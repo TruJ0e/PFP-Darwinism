@@ -134,6 +134,7 @@ class BudgetLedger:
         estimated_cost_per_call_usd: float = 0.0005,
         high_certainty_threshold: float = 0.0,
         verification_share: float = 0.3,
+        root_budget_override_usd: Optional[float] = None,
     ) -> None:
         hard_cap_usd = _non_negative_amount(hard_cap_usd, "hard_cap_usd")
         depth_decay = _finite_number(depth_decay, "depth_decay")
@@ -163,6 +164,13 @@ class BudgetLedger:
         self.verification_share = verification_share
         self._cost_ema: Dict[str, float] = {}
         self.hard_cap_usd = hard_cap_usd
+        if root_budget_override_usd is not None:
+            root_budget_override_usd = _finite_number(
+                root_budget_override_usd, "root_budget_override_usd"
+            )
+            if root_budget_override_usd <= 0.0:
+                raise ValueError("root_budget_override_usd must be > 0.")
+        self.root_budget_override_usd = root_budget_override_usd
         self.depth_decay = depth_decay
         self.finish_reserve_ratio = finish_reserve_ratio
         self.min_branch_floor_usd = min_branch_floor_usd
@@ -233,7 +241,13 @@ class BudgetLedger:
 
         with self._lock:
             self.difficulty_estimate_usd = max(est, probe_cost * 4.0)
-            self.root_budget_usd = min(self.hard_cap_usd, 2.0 * self.difficulty_estimate_usd)
+            if self.root_budget_override_usd is not None:
+                # Operator override (e.g. an unfiltered-profile run): size the arena
+                # directly instead of from the model's difficulty guess. The hard
+                # cap still binds — the override can only ever lower the root.
+                self.root_budget_usd = min(self.hard_cap_usd, self.root_budget_override_usd)
+            else:
+                self.root_budget_usd = min(self.hard_cap_usd, 2.0 * self.difficulty_estimate_usd)
             self.initial_finish_reserve_usd = round(self.root_budget_usd * self.finish_reserve_ratio, 6)
             self.finish_reserve_usd = self.initial_finish_reserve_usd
             self.exploration_pool_usd = round(
@@ -977,6 +991,9 @@ class MainHarness:
         selection_rounds: int = 3,
         max_concurrent_calls: int = 32,
         max_winners: int = 3,
+        depth_decay: float = 0.5,
+        finish_reserve_ratio: float = 0.125,
+        root_budget_override_usd: Optional[float] = None,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
@@ -1005,7 +1022,12 @@ class MainHarness:
         self.max_winners = max(1, int(max_winners))
         self.tracker = PFPTracker()
         self.detector = IssueDetector(self.client, k_probes=k_probes, depth_dial=depth_dial)
-        self.budget_ledger = BudgetLedger(hard_cap_usd=hard_cap_usd)
+        self.budget_ledger = BudgetLedger(
+            hard_cap_usd=hard_cap_usd,
+            depth_decay=depth_decay,
+            finish_reserve_ratio=finish_reserve_ratio,
+            root_budget_override_usd=root_budget_override_usd,
+        )
         self.events: List[HarnessEvent] = []
         self.arena_feed = ArenaFeed()
         self.arena_renderer = TronArenaRenderer()
