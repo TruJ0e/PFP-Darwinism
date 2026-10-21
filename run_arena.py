@@ -302,6 +302,20 @@ def main(argv: list[str] | None = None) -> int:
         default=0.25,
         help="Max share of spawned branches that may be NS-born (default 0.25; 1.0 = uncapped)",
     )
+    parser.add_argument(
+        "--ns-clock",
+        type=str,
+        choices=("arena", "wall"),
+        default="arena",
+        help="NS cadence clock: 'arena' (default) fires on the run's own step clock with "
+        "deterministic slot allocation; 'wall' is the pre-v0.46 wall-clock cadence",
+    )
+    parser.add_argument(
+        "--ns-seed",
+        type=int,
+        default=0,
+        help="Seed for the deterministic NS slot allocation (default 0)",
+    )
     parser.add_argument("--depth-dial", type=_positive_int, default=3, help="Depth dial bounding fan-out")
     parser.add_argument("--k-probes", type=_positive_int, default=3, help="Number of blind probe continuations per step")
     parser.add_argument("--gauntlet-rounds", type=_positive_int, default=3, help="Pass-readiness gauntlet rounds (default 3)")
@@ -477,6 +491,8 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         root_budget_override_usd=args.root_budget_usd,
         fast_judge_model=None if args.fast_judge_model.strip().lower() in ("", "none") else args.fast_judge_model.strip(),
         ns_share_cap=args.ns_share_cap,
+        ns_clock=args.ns_clock,
+        ns_seed=args.ns_seed,
         token_certainty_floor=args.token_certainty_floor,
         enable_selection=True,
         version_registry=registry,

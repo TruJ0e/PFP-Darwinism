@@ -40,6 +40,7 @@ from .branch_spawner import (
     HarnessEvent,
     MainHarness,
     MiniHarness,
+    ns_slot_priority,
 )
 from .alignment_detector import (
     AlignmentCandidatePair,
@@ -120,6 +121,7 @@ __all__ = [
     "HarnessEvent",
     "MainHarness",
     "MiniHarness",
+    "ns_slot_priority",
     "AlignmentCandidatePair",
     "AlignmentDetector",
     "AlignmentJudgeResult",

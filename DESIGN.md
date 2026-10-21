@@ -109,7 +109,11 @@ bubble up. The fractal that scales 3 → hundreds with no central bottleneck.
 - **Certainty-weighted split** among siblings, with a floor (enough to prove
   itself or die, never zero). Selection governs resources, not just survival.
 - **NS cadence derived from budget:** `cadence = expected_agent_seconds /
-  budget_calls`. Tight budget → slower cadence.
+  budget_calls`. Tight budget → slower cadence. Since v0.46 the cadence is
+  spent in arena steps, not wall-clock seconds: a branch ticks when its
+  subtree has completed `ceil(cadence / ns_step_seconds)` steps, and the
+  share cap's slots are allocated deterministically from the run seed and
+  each branch's content identity (see README, "NS on the arena clock").
 - **Kill conditions:** budget exhausted, marked Fail, merged. (No max depth —
   vetoed; decay covers it.)
 - **Finish reserve:** 10–15% of root held back; exploration can't touch it,

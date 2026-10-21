@@ -13,7 +13,10 @@ Refinements in Pass 2 (by what was meant):
 - Progressive multi-stage graceful degradation ("NS slows -> stops -> no new
   spawns -> everything runs to conclusion. Nothing dies mid-thought"):
   * Stage 1 (Exploration): Plaus K-probe + NS blind variation on budget-derived
-    cadence (`cadence = max(1.0, expected_agent_seconds / budget_calls)`).
+    cadence (`cadence = max(1.0, expected_agent_seconds / budget_calls)`),
+    fired on the arena clock (v0.46): the cadence is expressed in branch steps,
+    never wall-clock seconds, and the share cap's slots are allocated by a
+    deterministic per-branch priority, so mock and live allocate alike.
   * Stage 2 (NS Stopped): As budget tightens, NS cadence slows and stops
     (`ns_stopped = True`) before Plaus exploration is curtailed.
   * Stage 3 (Exploitation / Conclusion): New spawns stop (`spawns_stopped = True`),
@@ -27,6 +30,7 @@ Refinements in Pass 2 (by what was meant):
 
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 import time
@@ -49,6 +53,19 @@ from .tracker import BranchRecord, BranchState, PFPTracker, id_free
 # alignment/merge rounds and a 3-round falsification gauntlet. The difficulty
 # estimate never sizes below this many calls (see BudgetLedger.size_problem_once).
 MIN_ARENA_CALLS = 60
+
+
+def ns_slot_priority(seed: int, content_key: str) -> float:
+    """
+    Deterministic NS slot draw in [0, 1) for one branch, from the run seed and the
+    branch's content identity (its lineage digest — ID-free, so thread scheduling can't
+    shift it). Same seed + same content -> same draw on every run and every machine.
+    A branch's slot priority stratifies this draw within its spawn cohort (see
+    MiniHarness._slot_priority), which is what makes the share cap's allocation
+    reproducible instead of first-come-first-served by thread timing (v0.46).
+    """
+    digest = hashlib.sha256(f"pfp-ns-slot|{seed}|{content_key}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / float(1 << 64)
 
 
 def _finite_number(value: Any, name: str) -> float:
@@ -126,7 +143,8 @@ class BudgetLedger:
     - Depth decay = 0.5 per level.
     - Certainty-weighted split among siblings with a non-zero floor AND strict
       conservation (`sum(splits) <= pool`).
-    - NS cadence = expected_agent_seconds / budget_calls (clamped to >= 1.0s baseline).
+    - NS cadence = expected_agent_seconds / budget_calls; on the arena clock (v0.46) it is
+      expressed in branch steps via `compute_ns_period_steps` (nominal step = ns_step_seconds).
     """
 
     def __init__(
@@ -138,6 +156,7 @@ class BudgetLedger:
         min_branch_floor_usd: float = 0.002,
         conclusion_reserve_usd: float = 0.001,
         expected_agent_seconds: float = 20.0,
+        ns_step_seconds: float = 5.0,
         estimated_cost_per_call_usd: float = 0.0005,
         high_certainty_threshold: float = 0.0,
         verification_share: float = 0.3,
@@ -149,6 +168,7 @@ class BudgetLedger:
         min_branch_floor_usd = _finite_number(min_branch_floor_usd, "min_branch_floor_usd")
         conclusion_reserve_usd = _non_negative_amount(conclusion_reserve_usd, "conclusion_reserve_usd")
         expected_agent_seconds = _finite_number(expected_agent_seconds, "expected_agent_seconds")
+        ns_step_seconds = _finite_number(ns_step_seconds, "ns_step_seconds")
         estimated_cost_per_call_usd = _finite_number(
             estimated_cost_per_call_usd, "estimated_cost_per_call_usd"
         )
@@ -162,6 +182,8 @@ class BudgetLedger:
             raise ValueError("min_branch_floor_usd must be > 0.")
         if expected_agent_seconds <= 0.0:
             raise ValueError("expected_agent_seconds must be > 0.")
+        if ns_step_seconds <= 0.0:
+            raise ValueError("ns_step_seconds must be > 0.")
         if estimated_cost_per_call_usd <= 0.0:
             raise ValueError("estimated_cost_per_call_usd must be > 0.")
         if not (0.0 <= verification_share < 1.0):
@@ -183,6 +205,11 @@ class BudgetLedger:
         self.min_branch_floor_usd = min_branch_floor_usd
         self.conclusion_reserve_usd = conclusion_reserve_usd
         self.expected_agent_seconds = expected_agent_seconds
+        # Nominal wall duration of one branch step (its probe round — a sampling call plus
+        # a critic call at live latencies), used only to express the NS cadence on the arena
+        # clock (v0.46). A modeling constant like expected_agent_seconds — identical for
+        # mock and live, so both allocate NS alike.
+        self.ns_step_seconds = ns_step_seconds
         self.estimated_cost_per_call_usd = estimated_cost_per_call_usd
         self.high_certainty_threshold = high_certainty_threshold
 
@@ -365,6 +392,19 @@ class BudgetLedger:
         if budget_calls <= 0.0:
             return float("inf")
         return self.expected_agent_seconds / budget_calls
+
+    def compute_ns_period_steps(self, cadence_s: float) -> float:
+        """
+        The NS cadence on the arena clock (v0.46): how many completed branch steps in a
+        branch's subtree (the branch itself included) must pass before its NS tick comes
+        due — the cadence divided by the nominal step duration, rounded up, at least 1.
+        An infinite cadence (no spendable budget) stays infinite: NS never comes due.
+        Counting steps of the run's own work — never seconds — is what lets the mock
+        (instant replies) and live (seconds per call) fire NS in the same regime.
+        """
+        if not math.isfinite(cadence_s):
+            return float("inf")
+        return max(1, math.ceil(cadence_s / self.ns_step_seconds))
 
     def max_fundable_siblings(self, parent_budget: float, apply_depth_decay: bool = True) -> int:
         """
@@ -571,6 +611,9 @@ class MiniHarness:
         stop_reason: Optional[Callable[[], str]] = None,
         ns_admit: Optional[Callable[[], bool]] = None,
         ns_settle: Optional[Callable[[int], None]] = None,
+        ns_clock: str = "arena",
+        ns_seed: int = 0,
+        ns_allocate: Optional[Callable[[float, bool], Optional[float]]] = None,
         token_scale: float = 1.0,
         token_policy: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -582,6 +625,23 @@ class MiniHarness:
         # within its share of the population; a refused tick buys no probe
         self.ns_admit: Callable[[], bool] = ns_admit or (lambda: True)
         self.ns_settle: Callable[[int], None] = ns_settle or (lambda spawned: None)
+        # NS clock (v0.46): "arena" (default) fires ticks on the run's own step clock with
+        # deterministic slot allocation via `ns_allocate`; "wall" is the pre-v0.46
+        # wall-clock cadence check with first-come admission, kept only for comparison.
+        if ns_clock not in ("arena", "wall"):
+            raise ValueError('ns_clock must be "arena" or "wall".')
+        self.ns_clock = ns_clock
+        self.ns_seed = ns_seed
+        self.ns_allocate: Optional[Callable[[float, bool], Optional[float]]] = ns_allocate
+        # Slot-allocation cohort: this branch's rank (by content key) within the sibling
+        # batch it was spawned in, set by the spawner before the batch steps. Roots and
+        # standalone harnesses are cohorts of one.
+        self.cohort_rank: int = 0
+        self.cohort_size: int = 1
+        # Arena clock state: branch steps completed in this branch's subtree, itself
+        # included. Children report theirs as they finish, so by the time this branch
+        # checks its NS cadence its whole subtree below the check is counted.
+        self.subtree_steps: int = 1
         self.origin = origin
         self.should_stop: Callable[[], bool] = should_stop or (lambda: False)
         # Trips the run-wide stop when any branch fails, so its siblings and cousins start
@@ -644,6 +704,57 @@ class MiniHarness:
     @property
     def probe_max_tokens(self) -> int:
         return max(MIN_PROBE_TOKENS, int(round(PROBE_MAX_TOKENS * self.token_scale)))
+
+    @property
+    def ns_period_steps(self) -> float:
+        """This branch's NS cadence on the arena clock, from its current cadence (v0.46)."""
+        return self.budget_ledger.compute_ns_period_steps(self.ns_cadence_s)
+
+    def _ns_content_key(self) -> str:
+        """The branch's content identity for slot allocation: its lineage digest, fixed at
+        registration and ID-free, so the same content draws the same priority every run."""
+        return self.tracker.get(self.branch_id).lineage_digest
+
+    def _slot_priority(self) -> float:
+        """
+        This branch's deterministic share-cap priority in [0, 1). The branch's rank
+        within its spawn cohort (by content key) stratifies a seeded draw —
+        base = (rank + draw) / cohort_size — and the whole cohort's strata are then
+        rotated by a second seeded draw keyed on the parent's content identity.
+
+        Stratification alone would structurally exclude most of a small cohort at a
+        0.25 cap (only the lowest stratum can fall under it), leaving a cohort's slots
+        unused whenever its lowest-ranked members never come due; independent draws
+        alone are a per-seed lottery. The rotation keeps the spread (each cohort's
+        priorities tile [0, 1) evenly) while giving every member, whatever its rank, a
+        cap-proportional chance that depends on the seed and content only — never on
+        thread timing.
+        """
+        key = self._ns_content_key()
+        draw = ns_slot_priority(self.ns_seed, key)
+        base = (self.cohort_rank + draw) / self.cohort_size
+        if self.parent_id is None:
+            shift_key = "root"
+        else:
+            shift_key = self.tracker.get(self.parent_id).lineage_digest
+        shift = ns_slot_priority(self.ns_seed, f"cohort-shift|{shift_key}")
+        return (base + shift) % 1.0
+
+    def _allocate_ns_tick(self, forced: bool = False) -> Optional[float]:
+        """
+        Ask the arena for this tick's share-cap slot. Returns the slot priority when the
+        tick is admitted, None when refused (a refused tick buys no probe). A forced tick
+        (force_ns_on_starters) bypasses the slot draw — the force is the operator's
+        override — but never the population cap itself. Without an allocator (standalone
+        harness), falls back to the plain admission callback.
+        """
+        if self.ns_allocate is not None:
+            return self.ns_allocate(self._slot_priority(), forced=forced)
+        return 0.0 if self.ns_admit() else None
+
+    def _absorb_children(self, children: Sequence["MiniHarness"]) -> None:
+        """Count completed child subtrees into this branch's arena clock."""
+        self.subtree_steps += sum(c.subtree_steps for c in children)
 
     def _emit(self, event_type: str, details: Dict[str, Any]) -> None:
         rec = self.tracker.get(self.branch_id)
@@ -835,6 +946,9 @@ class MiniHarness:
                 stop_reason=self.stop_reason,
                 ns_admit=self.ns_admit,
                 ns_settle=self.ns_settle,
+                ns_clock=self.ns_clock,
+                ns_seed=self.ns_seed,
+                ns_allocate=self.ns_allocate,
                 token_scale=t_scale,
                 token_policy=self.token_policy,
             )
@@ -844,6 +958,13 @@ class MiniHarness:
             )
             self.children.append(child)
             spawned.append(child)
+
+        # Slot-allocation cohorts (v0.46): rank this batch by content key before any of
+        # them steps, so each child's share-cap priority is a pure function of the batch.
+        for rank, child in enumerate(sorted(spawned, key=lambda c: c._ns_content_key())):
+            child.cohort_rank = rank
+            child.cohort_size = len(spawned)
+
 
         self._emit(
             "branch",
@@ -970,6 +1091,7 @@ class MiniHarness:
         if plaus_res.should_split and not self.spawns_stopped:
             children = self._spawn_children_from_forks(plaus_res.distinct_forks, trigger="plaus")
             self._run_children_parallel(children)
+            self._absorb_children(children)
         else:
             # Continuations clustered -> no issue, merge/consolidate and flow straight
             if plaus_res.merged_continuation:
@@ -984,19 +1106,31 @@ class MiniHarness:
                     fork_under_exploration=plaus_res.distinct_forks[0].fork_description,
                 )
 
-        # 2. Check NS (natural selection) blind fan-out cadence if still in exploration stage
+        # 2. NS (natural selection) blind fan-out, if still in exploration stage.
+        # v0.46: the cadence runs on the arena clock, not the wall clock. A tick comes due
+        # once the steps completed in this branch's subtree (itself included) reach the
+        # cadence expressed in steps — a pure function of the run's own work, so the mock
+        # (instant replies) and live (seconds per call) allocate the same ticks to the same
+        # branches, and repeated runs allocate identically. `--ns-clock wall` restores the
+        # pre-v0.46 wall-clock check for comparison; that path is not reproducible.
         rec = self.tracker.get(self.branch_id)
-        now = time.time()
-        elapsed_since_ns = now - self.last_ns_tick
+        period_steps = self.ns_period_steps
+        if self.ns_clock == "wall":
+            due = force_ns_check or (time.time() - self.last_ns_tick) >= self.ns_cadence_s
+        else:
+            due = force_ns_check or self.subtree_steps >= period_steps
+        allocation = "forced" if force_ns_check else self.ns_clock
+        tick_priority: Optional[float] = None
         if (
             not self.ns_stopped
             and not self.spawns_stopped
             and not self.should_stop()
             and self._can_afford("ns")
-            and (force_ns_check or elapsed_since_ns >= self.ns_cadence_s)
-            and self.ns_admit()
+            and due
         ):
-            self.last_ns_tick = now
+            tick_priority = self._allocate_ns_tick(forced=force_ns_check)
+        if tick_priority is not None:
+            self.last_ns_tick = time.time()
             ns_children: List[MiniHarness] = []
             try:
                 ns_res = self.detector.trigger_ns(
@@ -1012,6 +1146,11 @@ class MiniHarness:
                     "ns_tick",
                     {
                         "cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
+                        "clock": self.ns_clock,
+                        "allocation": allocation,
+                        "arena_steps": self.subtree_steps,
+                        "period_steps": int(period_steps) if period_steps != float("inf") else None,
+                        "slot_priority": round(tick_priority, 4),
                         "spawned_count": len(ns_res.distinct_forks),
                     },
                 )
@@ -1021,6 +1160,7 @@ class MiniHarness:
                 # Settle the admission before the children run: they compete for NS slots too
                 self.ns_settle(len(ns_children))
             self._run_children_parallel(ns_children)
+            self._absorb_children(ns_children)
 
         # 3. Conclude this branch cleanly so nothing dies mid-thought
         if not self.concluded and not self.should_stop() and self.tracker.get(self.branch_id).is_alive:
@@ -1066,6 +1206,8 @@ class MainHarness:
         root_budget_override_usd: Optional[float] = None,
         fast_judge_model: Optional[str] = FAST_JUDGE_MODEL,
         ns_share_cap: float = 0.25,
+        ns_clock: str = "arena",
+        ns_seed: int = 0,
         token_certainty_floor: float = 0.0,
         probe_token_tiers: Sequence[float] = DEFAULT_PROBE_TOKEN_TIERS,
     ) -> None:
@@ -1118,6 +1260,15 @@ class MainHarness:
         # Run 5 grew 97 NS of 174 (56%): mutations too mutually alien to recombine, while Plaus
         # children — the mergeable stock — were crowded out. 1.0 = uncapped (pre-v0.43).
         self.ns_share_cap = ns_share_cap
+        # NS clock (v0.46): "arena" fires ticks on the run's own step clock and allocates
+        # the cap's slots by deterministic per-branch priority (see _ns_allocate); "wall"
+        # is the pre-v0.46 wall-clock cadence + first-come admission, for comparison only.
+        if ns_clock not in ("arena", "wall"):
+            raise ValueError('ns_clock must be "arena" or "wall".')
+        if isinstance(ns_seed, bool) or not isinstance(ns_seed, int):
+            raise ValueError("ns_seed must be an int.")
+        self.ns_clock = ns_clock
+        self.ns_seed = ns_seed
         tiers = tuple(_finite_number(t, "probe_token_tiers") for t in probe_token_tiers)
         if len(tiers) != 3 or not all(0.0 < t <= 1.0 for t in tiers) or not tiers[0] >= tiers[1] >= tiers[2]:
             raise ValueError("probe_token_tiers must be 3 descending scales in (0, 1] (top, middle, cut).")
@@ -1193,10 +1344,15 @@ class MainHarness:
         return bool(reg is not None and getattr(reg, "emergency_stopped", False))
 
     def _ns_admit(self) -> bool:
+        with self._ns_lock:
+            return self._ns_admit_locked()
+
+    def _ns_admit_locked(self) -> bool:
         """
         Reserve one NS slot if the population can take another blind mutation within the cap:
         (NS registered + in flight + 1) <= cap x (branches registered + in flight + 1). The tick
         fans out one fork, so a slot is one child. Refused ticks are counted, never paid for.
+        Caller must hold `_ns_lock`.
 
         Both counts come from one tracker snapshot taken under the admission lock. A child that
         has registered but whose slot is not yet settled is then counted twice on *both* sides,
@@ -1204,16 +1360,40 @@ class MainHarness:
         against the live record count double-counted such a child in the denominator alone:
         CI saw 19 NS of 73 under a 0.25 cap.)
         """
+        records = self.tracker.all_records()
+        total = len(records)
+        ns_registered = sum(1 for r in records if r.origin == "ns")
+        in_flight = self._ns_reserved
+        if ns_registered + in_flight + 1 > self.ns_share_cap * (total + in_flight + 1):
+            self._ns_capped_ticks += 1
+            return False
+        self._ns_reserved += 1
+        return True
+
+    def _ns_allocate(self, priority: float, forced: bool = False) -> Optional[float]:
+        """
+        Hand out one share-cap slot for a due NS tick (v0.46). Returns the branch's slot
+        priority when admitted, None when refused; refusals from either gate are counted
+        in `ns.capped_ticks` and buy no probe.
+
+        Arena clock: admission is by the branch's deterministic slot priority (its
+        cohort-stratified, rotated draw — see MiniHarness._slot_priority). A due branch is admitted
+        when its priority falls under the cap, so the cap's slots land on the same
+        branches on every run, whatever the thread scheduling; the population count check
+        stays as the hard backstop that keeps the admitted share within the cap for any
+        tree shape. A forced tick (starter force) bypasses the draw — it is the operator's
+        override — but still faces the count check, exactly as before v0.46. Wall clock:
+        legacy first-come admission through the count check alone.
+        """
+        if self.ns_clock == "wall":
+            return 0.0 if self._ns_admit() else None
         with self._ns_lock:
-            records = self.tracker.all_records()
-            total = len(records)
-            ns_registered = sum(1 for r in records if r.origin == "ns")
-            in_flight = self._ns_reserved
-            if ns_registered + in_flight + 1 > self.ns_share_cap * (total + in_flight + 1):
+            if not forced and not priority < self.ns_share_cap:
                 self._ns_capped_ticks += 1
-                return False
-            self._ns_reserved += 1
-            return True
+                return None
+            if not self._ns_admit_locked():
+                return None
+            return priority
 
     def _ns_settle(self, spawned: int) -> None:
         with self._ns_lock:
@@ -1632,9 +1812,18 @@ class MainHarness:
                     stop_reason=self._stop_reason,
                     ns_admit=self._ns_admit,
                     ns_settle=self._ns_settle,
+                    ns_clock=self.ns_clock,
+                    ns_seed=self.ns_seed,
+                    ns_allocate=self._ns_allocate,
                     token_policy=self.token_policy,
                 )
             )
+        # The starters are one spawn cohort for slot allocation (v0.46)
+        for rank, starter in enumerate(
+            sorted(self.starters, key=lambda m: m._ns_content_key())
+        ):
+            starter.cohort_rank = rank
+            starter.cohort_size = len(self.starters)
 
     def run(self, problem: str, force_ns_on_starters: bool = True) -> Dict[str, Any]:
         """
@@ -1752,6 +1941,8 @@ class MainHarness:
                 "total_branches_spawned": len(self.tracker.all_records()),
                 "ns": {
                     "share_cap": self.ns_share_cap,
+                    "clock": self.ns_clock,
+                    "seed": self.ns_seed,
                     "spawned": self._ns_spawned,
                     "capped_ticks": self._ns_capped_ticks,
                 },

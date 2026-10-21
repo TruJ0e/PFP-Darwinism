@@ -295,6 +295,24 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - HTTP: exponential backoff with jitter on 408/409/425/429/5xx, network errors
   and connections dropped mid-body, `Retry-After` honored (seconds or HTTP-date), non-retryable errors raised immediately with
   status and body; reasoning-model `reasoning_content` fallback.
+- **NS on the arena clock (v0.46).** The NS cadence used to be wall-clock seconds: live
+  calls take seconds, so NS fired on nearly every eligible branch, while the mock answers
+  instantly and almost never fired (3 ticks of 37, all forced starters) — the mock
+  under-represented NS badly, and the share cap's slots went to whichever branch's thread
+  arrived first. A tick is now DUE on the arena's own clock: the branch's subtree must
+  complete a cadence-worth of arena steps (`period = ceil(cadence / ns_step_seconds)`,
+  one step nominally 5 s), so mock and live exercise NS alike. Due ticks draw slots
+  deterministically: each branch's slot priority stratifies a hash draw (run seed
+  `--ns-seed` + the branch's content identity, its lineage digest) by the branch's rank
+  within its spawn cohort, rotated by a second draw keyed on the parent — and a due
+  tick is admitted when its priority falls under `--ns-share-cap`; the v0.43 population
+  count stays as the hard backstop, and forced starter ticks bypass the draw but never
+  the count. Same seed + settings -> the same branches tick on every run and machine.
+  On the finding's 3-starter mock, NS attempts rose from 3 (forced only) to 16 with the
+  cap binding (12 refused ticks counted) and NS-born share from ~8% to ~18% of spawned
+  branches; uncapped, the 9-starter mock fires on 40% of spawned branches. Tick events
+  journal the basis (clock, allocation, arena steps, period, slot priority).
+  `--ns-clock wall` keeps the pre-v0.46 wall-clock cadence for comparison.
 - **Request pacing (v0.45).** Live run 6 halted at 131 s on HTTP 429: 82 of 88 spawns landed
   in the first minute and burst through Token Factory's 100 requests/min. Every live HTTP
   attempt, retries included, now takes a slot from one thread-safe limiter shared by starters,
@@ -386,7 +404,7 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   merges rose from 12 to 23. Where the cap binds, *which* branches get the slots follows
   thread timing, exactly like the wall-clock NS cadence it gates; moving NS onto the arena's
   logical clock (so live and mock fire alike, reproducibly) needs a deterministic slot
-  allocation and is left as the next step.
+  allocation — done in v0.46 (see NS on the arena clock, above).
 - **Selection that scales (v0.42).** Selection judged at most 8 alignment pairs per round,
   hard-coded, at any population, and ended the moment one round found nothing: run 5 put 174
   branches through selection, judged 8 alignments, merged nothing and quit after round 1.
