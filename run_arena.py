@@ -24,8 +24,10 @@ from pathlib import Path
 from pfp import (
     AppendOnlyViolationError,
     ArenaFeed,
+    FAST_JUDGE_MODEL,
     BackendError,
     HardCapExceededError,
+    JudgeLadder,
     MainHarness,
     MeteredClient,
     SelfImprovementLoop,
@@ -279,6 +281,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--depth-dial", type=_positive_int, default=3, help="Depth dial bounding fan-out")
     parser.add_argument("--k-probes", type=_positive_int, default=3, help="Number of blind probe continuations per step")
     parser.add_argument("--gauntlet-rounds", type=_positive_int, default=3, help="Pass-readiness gauntlet rounds (default 3)")
+    parser.add_argument(
+        "--judge-ladder",
+        choices=("tiered", "super"),
+        default="tiered",
+        help="tiered (default): fast first-pass judge, Super for appeals / final gauntlet round / pre-exit; "
+        "super: every verdict on Super (pre-v0.41 routing)",
+    )
+    parser.add_argument(
+        "--first-pass-judge",
+        type=str,
+        default=FAST_JUDGE_MODEL,
+        help=f"First-pass judge model for --judge-ladder tiered (default {FAST_JUDGE_MODEL})",
+    )
     parser.add_argument("--selection-rounds", type=_positive_int, default=3, help="Max align/merge/contradiction rounds")
     parser.add_argument("--stream-out", type=str, default="", help="Optional JSONL path to save append-only ArenaFeed")
     parser.add_argument("--html-out", type=str, default="", help="Optional HTML path to export Tron Arena player")
@@ -430,6 +445,9 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         depth_decay=args.depth_decay,
         finish_reserve_ratio=args.finish_reserve_ratio,
         root_budget_override_usd=args.root_budget_usd,
+        judge_ladder=(
+            JudgeLadder.super_only() if args.judge_ladder == "super" else JudgeLadder(first_pass_model=args.first_pass_judge)
+        ),
         enable_selection=True,
         version_registry=registry,
         seed_cases=loop.recall(args.problem, k=args.starters),

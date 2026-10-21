@@ -994,11 +994,13 @@ class MainHarness:
         depth_decay: float = 0.5,
         finish_reserve_ratio: float = 0.125,
         root_budget_override_usd: Optional[float] = None,
+        judge_ladder: Optional[Any] = None,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
         from .backend import MeteredClient
         from .fail_judge import FailJudge
+        from .judges import JudgeLadder
         from .merge_synthesizer import MergeSynthesizer
 
         if starter_agents < 1:
@@ -1038,7 +1040,10 @@ class MainHarness:
         self._stop_event = threading.Event()
         self._abort_reason: Optional[str] = None
 
-        self.alignment_detector = AlignmentDetector(self.client)
+        # v0.41 judge ladder: first-pass judging on the fast tier, appeals / final gauntlet
+        # round / pre-exit on Super. Merge synthesis stays on Super (generation, not judging).
+        self.judge_ladder = judge_ladder if judge_ladder is not None else JudgeLadder()
+        self.alignment_detector = AlignmentDetector(self.client, judge_model=self.judge_ladder.first_pass_model)
         self.merge_synthesizer = MergeSynthesizer(
             client=self.client,
             tracker=self.tracker,
@@ -1052,6 +1057,7 @@ class MainHarness:
             budget_ledger=self.budget_ledger,
             gauntlet_rounds=gauntlet_rounds,
             event_sink=self._on_event,
+            ladder=self.judge_ladder,
         )
         self.winners_box: List[Dict[str, Any]] = []
 
@@ -1501,6 +1507,7 @@ class MainHarness:
                 "model": getattr(self.client, "model", ""),
                 "base_url": getattr(self.client, "base_url", ""),
                 "is_mock": getattr(self.client, "is_mock", False),
+                "judge_ladder": self.judge_ladder.to_dict(),
                 "active_version_id": active_version_id,
                 "seeded_starters_count": min(self.starter_agents, len(self.seed_cases)),
                 "halted_reason": self.halted_reason,

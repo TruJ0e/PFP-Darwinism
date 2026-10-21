@@ -9,6 +9,7 @@ Tagline: "Nebius — survival of the fittest."
 from .backend import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
+    FAST_JUDGE_MODEL,
     SUPER_MODEL,
     BackendError,
     HardCapExceededError,
@@ -79,6 +80,7 @@ from .self_improvement import (
     VersionRegistry,
     VersionSnapshot,
 )
+from .judges import JudgeLadder
 from .fsutil import StateLockError, atomic_write_text, exclusive_lock
 from .proof_report import build_proof_report, render_proof_markdown, write_proof_report
 from .arena_html import build_arena_html
@@ -87,6 +89,8 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
     "SUPER_MODEL",
+    "FAST_JUDGE_MODEL",
+    "JudgeLadder",
     "BackendError",
     "HardCapExceededError",
     "MeteredClient",

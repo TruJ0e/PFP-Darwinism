@@ -33,6 +33,7 @@ from .alignment_detector import fence_untrusted
 from .backend import SUPER_MODEL
 from .branch_spawner import BudgetLedger, HarnessEvent
 from .issue_detector import IssueDetector
+from .judges import JudgeLadder
 from .jsonutil import coerce_bool, parse_json_object
 from .tracker import (
     BranchRecord,
@@ -73,6 +74,8 @@ class FalsificationOutcome:
     transitioned_to: Optional[str] = None
     # Judge reply had no usable verdict: no survival credit, no kill, no appeal consumed
     inconclusive: bool = False
+    # Model that gave the primary verdict (judge ladder tier, v0.41)
+    judge_model: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,6 +85,7 @@ class FalsificationOutcome:
             "inconclusive": self.inconclusive,
             "angle": self.angle,
             "judge_id": self.judge_id,
+            "judge_model": self.judge_model,
             "appeal_attempted": self.appeal_attempted,
             "appeal_overturned": self.appeal_overturned,
             "appeal_judge_id": self.appeal_judge_id,
@@ -119,6 +123,7 @@ class FailJudge:
         background_interval_s: float = 2.0,
         super_model: str = SUPER_MODEL,
         event_sink: Optional[Callable[[HarnessEvent], None]] = None,
+        ladder: Optional[JudgeLadder] = None,
     ) -> None:
         self.client = client
         self.tracker = tracker
@@ -127,7 +132,10 @@ class FailJudge:
         self.gauntlet_rounds = max(1, gauntlet_rounds)
         self.pass_certainty_threshold = pass_certainty_threshold
         self.background_interval_s = background_interval_s
-        self.super_model = super_model
+        # v0.41 judge ladder: first-pass verdicts on the fast tier, appeals / final gauntlet round /
+        # pre-exit on Super (see judges.py). `super_model` names the final tier.
+        self.ladder = ladder if ladder is not None else JudgeLadder(final_model=super_model)
+        self.super_model = self.ladder.final_model
         self.event_sink = event_sink
 
         self._angle_cursor: int = 0
@@ -237,8 +245,10 @@ class FailJudge:
         judge_id: str = "super_judge_primary",
         is_appeal: bool = False,
         extra_context: str = "",
+        model: Optional[str] = None,
     ) -> tuple[Optional[bool], str, str, float]:
         """Returns (survived, objection, rationale, cost); survived is None when the reply had no verdict."""
+        model = model or self.super_model
         pos = fence_untrusted(branch_position_text(branch))
         main_line_str = " | ".join(self.verified_main_line) if self.verified_main_line else "None yet"
         appeal_flag = "appeal_review=true appeal_judge" if is_appeal else "appeal_review=false"
@@ -256,12 +266,12 @@ class FailJudge:
             'Return JSON: {"survived": bool, "objection": "...", "rationale": "..."}.'
         )
         resp = self.client.chat.completions.create(
-            model=self.super_model,
+            model=model,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        f"You are {judge_id} ({self.super_model}) running falsification angle '{angle.value}'. "
+                        f"You are {judge_id} ({model}) running falsification angle '{angle.value}'. "
                         "Try to break the branch's reasoning via logic, counterexample, or assumption audit."
                     ),
                 },
@@ -301,7 +311,8 @@ class FailJudge:
         """
         rec = self.tracker.get(branch_id)
         chosen_angle = angle or self.next_angle_for_branch(branch_id)
-        primary_judge = "super_judge_primary"
+        primary_model = self.ladder.falsifier_model(schedule_trigger, self.gauntlet_rounds)
+        primary_judge = self.ladder.judge_id(primary_model)
 
         if not rec.is_alive:
             return FalsificationOutcome(
@@ -320,12 +331,16 @@ class FailJudge:
             judge_id=primary_judge,
             is_appeal=False,
             extra_context=extra_context,
+            model=primary_model,
         )
         total_cost = cost
         self._record_cost(branch_id, cost, f"falsify_{schedule_trigger}_{chosen_angle.value}")
 
         if survived is None:
-            return self._inconclusive(branch_id, schedule_trigger, chosen_angle, primary_judge, rationale, total_cost)
+            return self._inconclusive(
+                branch_id, schedule_trigger, chosen_angle, primary_judge, rationale, total_cost,
+                judge_model=primary_model,
+            )
 
         appeal_attempted = False
         appeal_overturned = False
@@ -343,7 +358,8 @@ class FailJudge:
                     claimed_appeal = True
         if claimed_appeal:
             appeal_attempted = True
-            appeal_judge = "super_judge_appeal_secondary"
+            appeal_model = self.ladder.falsifier_model(schedule_trigger, self.gauntlet_rounds, is_appeal=True)
+            appeal_judge = self.ladder.judge_id(appeal_model, is_appeal=True)
             app_survived, app_obj, app_rat, app_cost = self._run_single_attack(
                 self.tracker.get(branch_id),
                 chosen_angle,
@@ -351,6 +367,7 @@ class FailJudge:
                 judge_id=appeal_judge,
                 is_appeal=True,
                 extra_context=f"Primary judge objection: {objection} | {extra_context}",
+                model=appeal_model,
             )
             total_cost += app_cost
             self._record_cost(branch_id, app_cost, f"appeal_{schedule_trigger}")
@@ -368,6 +385,7 @@ class FailJudge:
                     total_cost,
                     objection=objection,
                     appeal_judge=appeal_judge,
+                    judge_model=primary_model,
                 )
             if app_survived is True:
                 survived = True
@@ -409,6 +427,7 @@ class FailJudge:
                 survived=credited,
                 angle=chosen_angle.value,
                 judge_id=primary_judge,
+                judge_model=primary_model,
                 appeal_attempted=appeal_attempted,
                 appeal_overturned=appeal_overturned,
                 appeal_judge_id=appeal_judge,
@@ -451,6 +470,7 @@ class FailJudge:
             survived=False,
             angle=chosen_angle.value,
             judge_id=primary_judge,
+            judge_model=primary_model,
             appeal_attempted=appeal_attempted,
             appeal_overturned=False,
             appeal_judge_id=appeal_judge,
@@ -482,6 +502,7 @@ class FailJudge:
         *,
         objection: str = "",
         appeal_judge: str = "",
+        judge_model: str = "",
     ) -> FalsificationOutcome:
         """No usable verdict: no survival credit, no kill, no appeal consumed."""
         outcome = FalsificationOutcome(
@@ -490,6 +511,7 @@ class FailJudge:
             survived=False,
             angle=angle.value,
             judge_id=judge_id,
+            judge_model=judge_model,
             appeal_attempted=bool(appeal_judge),
             appeal_judge_id=appeal_judge,
             objection=objection,

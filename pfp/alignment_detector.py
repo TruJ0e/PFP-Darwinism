@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
-from .backend import SUPER_MODEL
+from .backend import FAST_JUDGE_MODEL
 from .jsonutil import as_str_list, parse_json_object
 from .tracker import BranchRecord, branch_position_text, content_order_key, id_free
 
@@ -204,12 +204,16 @@ class AlignmentDetector:
         *,
         prefilter_threshold: float = 0.20,
         embedding_dim: int = 128,
-        super_model: str = SUPER_MODEL,
+        judge_model: str = FAST_JUDGE_MODEL,
+        super_model: Optional[str] = None,
     ) -> None:
         self.client = client
         self.prefilter_threshold = prefilter_threshold
         self.embedding_dim = embedding_dim
-        self.super_model = super_model
+        # v0.41 judge ladder: claim extraction and alignment verdicts are first-pass judging.
+        # `super_model` is the pre-ladder keyword, still honored when a caller pins it.
+        self.judge_model = super_model or judge_model
+        self.super_model = self.judge_model
         self._claims_cache: Dict[Tuple[str, int], List[str]] = {}
         # Pairs already judged at their current trace versions — never pay Super twice for the same verdict
         self._judged_pairs: set = set()
@@ -263,12 +267,12 @@ class AlignmentDetector:
 
         pos_text = branch_position_text(branch)
         resp = self.client.chat.completions.create(
-            model=self.super_model,
+            model=self.judge_model,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are the PFP Super judge. Extract the branch's core claims as JSON: "
+                        "You are the PFP judge. Extract the branch's core claims as JSON: "
                         '{"core_claims": ["claim 1", "claim 2"]}. ' + _UNTRUSTED_NOTICE
                     ),
                 },
@@ -333,12 +337,12 @@ class AlignmentDetector:
             "overlapping_claims, contradictory_claims, disjoint_claims, and rationale."
         )
         resp = self.client.chat.completions.create(
-            model=self.super_model,
+            model=self.judge_model,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are the PFP Super alignment judge. Compare claims from Branch A and Branch B "
+                        "You are the PFP alignment judge. Compare claims from Branch A and Branch B "
                         "claim-by-claim and classify as 'overlap', 'contradictory', or 'unrelated'. "
                         + _UNTRUSTED_NOTICE
                     ),

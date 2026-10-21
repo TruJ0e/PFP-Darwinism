@@ -135,14 +135,17 @@ the live run hashed it, so only an unedited copy matches the anchor.
 | 1. Issue detector | `pfp/issue_detector.py` | K blind high-temperature probes; a split *is* the issue. Plaus (divergence + logprob entropy + critic leaps) and NS (blind variation on a budget-derived cadence). Novelty exhaustion across the whole lineage. |
 | 2. Branch spawner | `pfp/branch_spawner.py` | Directives, recursive mini-harnesses running in parallel, single-round budget: root = 2 × difficulty (capped), ×0.5 depth decay, certainty-weighted sibling split with a floor, 10–15% finish reserve, graceful degradation (NS slows → stops → no spawns → conclude). |
 | 3. PFP tracker | `pfp/tracker.py` | Thread-safe ledger; one-way transitions, no resurrection, transition history, lineage/DAG queries. |
-| 4. Alignment detector | `pfp/alignment_detector.py` | Cheap embedding pre-filter (recall) → Super claim-by-claim judge: overlap / contradictory / unrelated. |
+| 4. Alignment detector | `pfp/alignment_detector.py` | Cheap embedding pre-filter (recall) → first-pass claim-by-claim judge: overlap / contradictory / unrelated. |
 | 5. Merge synthesizer | `pfp/merge_synthesizer.py` | Super unifies aligned branches with per-parent provenance; parents are absorbed and their budgets transfer to the child, which starts Possible. |
 | 6. Fail judge | `pfp/fail_judge.py` | Falsification on a schedule (post-merge, Pass gauntlet, contradiction, background, pre-exit), rotated angles, one appeal per kill with a different judge, revokable Pass that rewrites the main line and re-verifies dependents. |
 | 7. Arena feed | `pfp/arena.py`, `pfp/arena_html.py` | Append-only event stream (JSONL in/out). ASCII renderer and a self-contained HTML/Canvas Tron player are pure functions of the stream. |
 | 8. Self-improvement | `pfp/self_improvement.py`, `pfp/dials.py` | Mine the log → recall past wins → self-assessment → evidence-grounded anti-model → proposition → sandbox → hashed version registry with auto-revert, pin, run-boundary switching, emergency stop. |
 
-Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
-(`nvidia/nemotron-3-super-120b-a12b`) for alignment, merge and falsification.
+Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out and critics; a fast
+first-pass judge (`Qwen/Qwen3-235B-A22B-Instruct-2507`) for alignment verdicts and first-pass
+falsification; Super (`nvidia/nemotron-3-super-120b-a12b`) for merge synthesis, every appeal,
+the final gauntlet round and the pre-exit check (the v0.41 judge ladder, `pfp/judges.py`;
+`--judge-ladder super` restores all-Super judging).
 
 ## Safety rails and honest accounting
 
@@ -359,6 +362,18 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **Judge ladder (v0.41).** Every verdict was Super's. Live, a Super verdict took ~10-50 s
+  (it reasons before it answers), judging was 55-68% of spend, and run 3 lost 3 of 4 attacks
+  to a verdict buried under reasoning. First-pass judging (claim extraction, alignment verdicts,
+  background samples, the NS sweep, post-merge, contradiction and dependent re-verification
+  attacks, and every gauntlet round before the last) now runs on a fast instruct model
+  (`Qwen/Qwen3-235B-A22B-Instruct-2507`, $0.20/$0.60 per 1M). Super keeps every appeal, the
+  final gauntlet round and the pre-exit check: a first-pass kill is still appealed to Super, and
+  nothing is crowned Pass or enters the winner's box without surviving Super. The gauntlet is a
+  climb (fast, fast with a Super appeal, Super); three survivals stay the bar. Each verdict and
+  provenance entry names its tier (`judge_model`, `fast_judge_primary` / `super_judge_primary`).
+  Critics were already on Nano and stay there. `--judge-ladder super` restores v0.40 routing;
+  `--first-pass-judge` swaps the fast tier.
 - **Operator budget dials (v0.40).** The allocation percentages Truman's design argues about
   were constructor-only: `depth_decay` (children inherit 50% of the pool per generation — the
   reason live trees grew one generation deep and stopped) and `finish_reserve_ratio`, plus the
