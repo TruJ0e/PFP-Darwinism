@@ -359,6 +359,7 @@ class FailJudge:
         # The appeal is claimed under the ledger lock (two workers can't both spend the one appeal)
         # and only for a branch still alive after the primary call (never pay to appeal the dead).
         claimed_appeal = False
+        primary_objection_exposed = objection
         if not survived:
             with self.tracker.atomic():
                 rec = self.tracker.get(branch_id)
@@ -397,7 +398,7 @@ class FailJudge:
             if app_survived is True:
                 survived = True
                 appeal_overturned = True
-                objection = ""
+                objection = primary_objection_exposed
                 rationale = f"Overturned on appeal by {appeal_judge}: {app_rat}"
             else:
                 objection = app_obj or objection
@@ -457,6 +458,7 @@ class FailJudge:
                         survived_falsifications=rec.survived_falsifications + 1,
                         open_critic_objections=0,
                         tested=True,
+                        last_objection=objection if objection else None,
                     )
             if credited:
                 self._refresh_branch_certainty(branch_id)

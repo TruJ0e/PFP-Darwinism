@@ -42,6 +42,13 @@ from .branch_spawner import (
     MiniHarness,
     ns_slot_priority,
 )
+from .briefs import (
+    ExplorationBrief,
+    compute_brief_id,
+    generate_starter_briefs,
+    mutate_brief_for_fork,
+    revise_brief_for_objection,
+)
 from .alignment_detector import (
     AlignmentCandidatePair,
     AlignmentDetector,
@@ -122,6 +129,11 @@ __all__ = [
     "MainHarness",
     "MiniHarness",
     "ns_slot_priority",
+    "ExplorationBrief",
+    "compute_brief_id",
+    "generate_starter_briefs",
+    "mutate_brief_for_fork",
+    "revise_brief_for_objection",
     "AlignmentCandidatePair",
     "AlignmentDetector",
     "AlignmentJudgeResult",

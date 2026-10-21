@@ -91,25 +91,37 @@ def _non_negative_amount(value: Any, name: str) -> float:
 @dataclass
 class Directive:
     """
-    Compact packet per branch (Piece 2):
+    Compact packet per branch (Piece 2 / v0.47):
     - parent_reasoning_compressed: parent's reasoning so far (compressed)
     - fork_exploring: the fork it's exploring
     - state: Possible
     - budget: allocated budget for this branch
+    - brief: exploration brief (v0.47)
+    - brief_id: id of the brief (v0.47)
+    - parent_brief_id: id of the parent brief (v0.47)
     """
 
     parent_reasoning_compressed: str
     fork_exploring: str
     state: BranchState = BranchState.POSSIBLE
     budget: float = 0.0
+    brief: str = ""
+    brief_id: str = ""
+    parent_brief_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "parent_reasoning_compressed": self.parent_reasoning_compressed,
             "fork_exploring": self.fork_exploring,
             "state": self.state.value,
             "budget": round(self.budget, 6),
         }
+        if self.brief:
+            d["brief"] = self.brief
+            d["brief_id"] = self.brief_id
+            if self.parent_brief_id is not None:
+                d["parent_brief_id"] = self.parent_brief_id
+        return d
 
 
 @dataclass
@@ -616,7 +628,9 @@ class MiniHarness:
         ns_allocate: Optional[Callable[[float, bool], Optional[float]]] = None,
         token_scale: float = 1.0,
         token_policy: Optional[Dict[str, Any]] = None,
+        enable_briefs: bool = False,
     ) -> None:
+        self.enable_briefs = bool(enable_briefs)
         self.branch_id = branch_id
         # Share of the full probe / NS completion budget this branch's calls may use (v0.44)
         self.token_scale = max(0.0, min(1.0, float(token_scale)))
@@ -681,6 +695,9 @@ class MiniHarness:
             certainty_score=initial_certainty,
             depth=self.depth,
             origin=origin,
+            brief=self.directive.brief,
+            brief_id=self.directive.brief_id,
+            parent_brief_id=self.directive.parent_brief_id,
         )
         if self.directive.parent_reasoning_compressed:
             self.tracker.update_branch(
@@ -694,6 +711,11 @@ class MiniHarness:
             "directive": self.directive.to_dict(),
             "ns_cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
         }
+        if self.directive.brief:
+            spawn_details["brief"] = self.directive.brief
+            spawn_details["brief_id"] = self.directive.brief_id
+            if self.directive.parent_brief_id is not None:
+                spawn_details["parent_brief_id"] = self.directive.parent_brief_id
         if self.parent_id is None and origin == "starter":
             from .arena import MAX_STREAM_PROBLEM_CHARS
 
@@ -918,14 +940,45 @@ class MiniHarness:
         )
         self._evaluate_graceful_degradation(new_parent_budget)
 
+        child_briefs: List[Any] = []
+        if self.enable_briefs and self.directive.brief:
+            from .briefs import ExplorationBrief, mutate_brief_for_fork
+            parent_brief_obj = ExplorationBrief(
+                brief_id=self.directive.brief_id,
+                brief=self.directive.brief,
+                parent_brief_id=self.directive.parent_brief_id,
+                depth=self.depth,
+            )
+            survived_obj = rec.last_objection or ""
+            for f_idx, fork in enumerate(ordered_forks):
+                is_final_child = (f_idx == len(ordered_forks) - 1 and len(ordered_forks) > 1)
+                c_brief, b_cost = mutate_brief_for_fork(
+                    client=self.client,
+                    problem=self.problem,
+                    parent_brief=parent_brief_obj,
+                    fork_description=fork.fork_description,
+                    fork_reasoning=fork.reasoning,
+                    prior_sibling_briefs=child_briefs,
+                    survived_objection=survived_obj,
+                    is_final=is_final_child,
+                    depth=self.depth + 1,
+                )
+                if b_cost > 0:
+                    self._spend(b_cost, f"{trigger}_child_brief_mutation", kind="brief")
+                child_briefs.append(c_brief)
+
         spawned: List[MiniHarness] = []
-        for fork, c_budget, t_scale in zip(ordered_forks, child_budgets, token_scales):
+        for idx, (fork, c_budget, t_scale) in enumerate(zip(ordered_forks, child_budgets, token_scales)):
             child_id = self.branch_counter()
+            c_brief = child_briefs[idx] if idx < len(child_briefs) else None
             directive = Directive(
                 parent_reasoning_compressed=compressed,
                 fork_exploring=fork.fork_description,
                 state=BranchState.POSSIBLE,
                 budget=c_budget,
+                brief=c_brief.brief if c_brief else "",
+                brief_id=c_brief.brief_id if c_brief else "",
+                parent_brief_id=c_brief.parent_brief_id if c_brief else None,
             )
             child = MiniHarness(
                 branch_id=child_id,
@@ -951,6 +1004,7 @@ class MiniHarness:
                 ns_allocate=self.ns_allocate,
                 token_scale=t_scale,
                 token_policy=self.token_policy,
+                enable_briefs=self.enable_briefs,
             )
             child.tracker.update_branch(
                 child_id,
@@ -1020,16 +1074,17 @@ class MiniHarness:
                     },
                 )
 
+        conclude_lines = [f"Conclude branch reasoning for problem: {self.problem}"]
+        if self.enable_briefs and self.directive.brief:
+            conclude_lines.append(f"Brief: {self.directive.brief}")
+        conclude_lines.append(f"Fork: {self.directive.fork_exploring}")
+        conclude_lines.append(f"Trace: {' | '.join(rec.reasoning_trace)}")
+        conclude_lines.append("State this branch's concrete conclusion (the solution it proposes) in 1-3 sentences.")
         resp = self.client.chat.completions.create(
             messages=[
                 {
                     "role": "user",
-                    "content": (
-                        f"Conclude branch reasoning for problem: {self.problem}\n"
-                        f"Fork: {self.directive.fork_exploring}\n"
-                        f"Trace: {' | '.join(rec.reasoning_trace)}\n"
-                        "State this branch's concrete conclusion (the solution it proposes) in 1-3 sentences."
-                    ),
+                    "content": "\n".join(conclude_lines),
                 }
             ],
             temperature=0.3,
@@ -1070,12 +1125,14 @@ class MiniHarness:
         # 1. Plaus issue detection: fire K blind continuations & read issue off divergence
         parent_context = " | ".join(rec.reasoning_trace) or self.directive.parent_reasoning_compressed
         known_forks = self.tracker.known_forks_in_lineage(self.branch_id)
+        brief_text = self.directive.brief if self.enable_briefs else ""
         plaus_res: IssueDetectionResult = self.detector.detect_plaus(
             problem=self.problem,
             parent_reasoning=parent_context,
             depth=self.depth,
             known_forks=known_forks,
             max_tokens=self.probe_max_tokens,
+            brief=brief_text,
         )
         self._spend(plaus_res.cost_usd, "plaus_issue_detection", kind="plaus")
         cluster_bonus = plaus_res.distinct_forks[0].support_score if plaus_res.distinct_forks else 0.0
@@ -1140,6 +1197,7 @@ class MiniHarness:
                     fanout_count=1,
                     known_forks=self.tracker.known_forks_in_lineage(self.branch_id),
                     max_tokens=self.probe_max_tokens,
+                    brief=brief_text,
                 )
                 self._spend(ns_res.cost_usd, "ns_blind_variation", kind="ns")
                 self._emit(
@@ -1210,6 +1268,7 @@ class MainHarness:
         ns_seed: int = 0,
         token_certainty_floor: float = 0.0,
         probe_token_tiers: Sequence[float] = DEFAULT_PROBE_TOKEN_TIERS,
+        enable_briefs: bool = False,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
@@ -1235,6 +1294,7 @@ class MainHarness:
         )
         self.starter_agents = starter_agents
         self.enable_selection = enable_selection
+        self.enable_briefs = bool(enable_briefs)
         self.version_registry = version_registry
         self.seed_cases: List[Dict[str, Any]] = list(seed_cases or [])
         self.selection_rounds = max(1, int(selection_rounds))
@@ -1779,6 +1839,16 @@ class MainHarness:
             certainty_scores=starter_scores,
             apply_depth_decay=False,
         )
+        starter_briefs = []
+        starter_costs = []
+        if self.enable_briefs:
+            from .briefs import generate_starter_briefs
+            starter_briefs, starter_costs = generate_starter_briefs(
+                client=self.client,
+                problem=problem,
+                count=len(starter_budgets),
+            )
+
         for idx, s_budget in enumerate(starter_budgets):
             b_id = self._next_branch_id()
             if idx < len(self.seed_cases):
@@ -1787,37 +1857,43 @@ class MainHarness:
             else:
                 seed_fork = f"starter_agent_{idx + 1}"
                 seed_prefix = "Root arena entry — starter agent."
+            b_obj = starter_briefs[idx] if idx < len(starter_briefs) else None
             directive = Directive(
                 parent_reasoning_compressed=seed_prefix,
                 fork_exploring=seed_fork,
                 state=BranchState.POSSIBLE,
                 budget=s_budget,
+                brief=b_obj.brief if b_obj else "",
+                brief_id=b_obj.brief_id if b_obj else "",
+                parent_brief_id=b_obj.parent_brief_id if b_obj else None,
             )
-            self.starters.append(
-                MiniHarness(
-                    branch_id=b_id,
-                    parent_id=None,
-                    problem=problem,
-                    directive=directive,
-                    depth=0,
-                    client=self.client,
-                    tracker=self.tracker,
-                    detector=self.detector,
-                    budget_ledger=self.budget_ledger,
-                    event_sink=self._on_event,
-                    branch_counter=self._next_branch_id,
-                    origin="starter",
-                    should_stop=self._should_stop,
-                    abort_run=self._abort_run,
-                    stop_reason=self._stop_reason,
-                    ns_admit=self._ns_admit,
-                    ns_settle=self._ns_settle,
-                    ns_clock=self.ns_clock,
-                    ns_seed=self.ns_seed,
-                    ns_allocate=self._ns_allocate,
-                    token_policy=self.token_policy,
-                )
+            starter = MiniHarness(
+                branch_id=b_id,
+                parent_id=None,
+                problem=problem,
+                directive=directive,
+                depth=0,
+                client=self.client,
+                tracker=self.tracker,
+                detector=self.detector,
+                budget_ledger=self.budget_ledger,
+                event_sink=self._on_event,
+                branch_counter=self._next_branch_id,
+                origin="starter",
+                should_stop=self._should_stop,
+                abort_run=self._abort_run,
+                stop_reason=self._stop_reason,
+                ns_admit=self._ns_admit,
+                ns_settle=self._ns_settle,
+                ns_clock=self.ns_clock,
+                ns_seed=self.ns_seed,
+                ns_allocate=self._ns_allocate,
+                token_policy=self.token_policy,
+                enable_briefs=self.enable_briefs,
             )
+            self.starters.append(starter)
+            if self.enable_briefs and idx < len(starter_costs) and starter_costs[idx] > 0:
+                starter._spend(starter_costs[idx], "starter_brief_generation", kind="brief")
         # The starters are one spawn cohort for slot allocation (v0.46)
         for rank, starter in enumerate(
             sorted(self.starters, key=lambda m: m._ns_content_key())

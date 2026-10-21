@@ -399,6 +399,7 @@ class IssueDetector:
         known_forks: Sequence[str] = (),
         k_override: Optional[int] = None,
         max_tokens: int = PROBE_MAX_TOKENS,
+        brief: str = "",
     ) -> IssueDetectionResult:
         """
         Fire K diverse continuations blind (high temperature, cheap).
@@ -411,7 +412,8 @@ class IssueDetector:
         prompt = (
             f"probe_continuation depth={depth}\n"
             f"Fire K diverse continuations for problem: {problem}\n"
-            f"Parent reasoning so far: {parent_reasoning}\n"
+            + (f"Exploration brief: {brief}\n" if brief else "")
+            + f"Parent reasoning so far: {parent_reasoning}\n"
             # One line only: a hint carrying newlines could forge the prompt's own structure
             + (f"Guidance: {' '.join(str(self.probe_hint).split())}\n" if self.probe_hint else "")
             + "Return JSON with fork_id, fork, and reasoning."
@@ -511,6 +513,7 @@ class IssueDetector:
         fanout_count: int = 2,
         known_forks: Sequence[str] = (),
         max_tokens: int = PROBE_MAX_TOKENS,
+        brief: str = "",
     ) -> IssueDetectionResult:
         """
         NS (natural selection): blind fan-out on cadence with no trigger.
@@ -520,7 +523,8 @@ class IssueDetector:
         prompt = (
             f"ns_fanout natural selection blind variation depth={depth}\n"
             f"Problem: {problem}\n"
-            f"Current reasoning: {parent_reasoning}\n"
+            + (f"Exploration brief: {brief}\n" if brief else "")
+            + f"Current reasoning: {parent_reasoning}\n"
             "Generate an orthogonal, unconsidered angle as JSON."
         )
         choices, total_cost = self._sample_choices(prompt, n=max_allowed, temperature=1.0, max_tokens=max_tokens)

@@ -1024,6 +1024,71 @@ class _MockChatCompletions:
         if marker:
             choice_idx += max(0, int(marker.group(1)) - 1)
 
+        # 0a. v0.47: Evolving Exploration Briefs (generation & mutation)
+        if "generate_exploration_brief" in lower or "mutate_exploration_brief" in lower:
+            _UNIVERSAL_BRIEFS = [
+                (
+                    "service_process_lifecycle",
+                    "Investigate runtime process lifecycle, active daemon execution state, execution environment constraints, and process-level health.",
+                ),
+                (
+                    "boundary_transport_filtering",
+                    "Investigate boundary filtering, transport connectivity, firewall rules, port binding, and interface routing paths.",
+                ),
+                (
+                    "credentials_authentication_access",
+                    "Investigate access control policies, credential validity, privilege escalation, authentication handshakes, and cryptographic key alignment.",
+                ),
+                (
+                    "configuration_syntax_precedence",
+                    "Investigate configuration directives, syntax errors, parameter precedence, environment variable overrides, and schema compliance.",
+                ),
+                (
+                    "resource_limits_capacity",
+                    "Investigate resource exhaustion, memory/file descriptor limits, thread contention, and operating system capacity constraints.",
+                ),
+                (
+                    "protocol_negotiation_drift",
+                    "Investigate protocol dialect negotiation, binary version drift, interface contract mismatches, and backward compatibility regressions.",
+                ),
+                (
+                    "filesystem_permissions_integrity",
+                    "Investigate filesystem mount state, directory permissions, file locks, disk capacity, and path resolution integrity.",
+                ),
+                (
+                    "name_resolution_addressing",
+                    "Investigate DNS/hostname resolution, addressing mismatches, reverse lookups, and discovery service state.",
+                ),
+            ]
+            _FINAL_ORTHOGONAL_BRIEF = (
+                "unconventional_orthogonal_anomalies",
+                "Investigate unconventional cross-layer anomalies: transient kernel drops, asymmetric state tracking, out-of-band interference, or intermediary proxy interception that nobody else is examining.",
+            )
+
+            is_final = any(k in lower for k in ("final brief", "final sibling", "what nobody", "unconventional"))
+            is_objection = "falsification_objection" in lower or "objection" in lower
+            is_starter = "starter" in lower
+
+            if is_final:
+                focus_area, brief_text = _FINAL_ORTHOGONAL_BRIEF
+            elif is_objection:
+                focus_area = "falsification_objection_resolution"
+                brief_text = "Investigate edge conditions and failure modes exposed by falsification objection, validating whether assumptions hold under strict boundary constraints."
+            elif is_starter:
+                idx_match = re.search(r"index=(\d+)", lower)
+                if idx_match:
+                    slot = (int(idx_match.group(1)) - 1) % len(_UNIVERSAL_BRIEFS)
+                else:
+                    slot = digest % len(_UNIVERSAL_BRIEFS)
+                focus_area, brief_text = _UNIVERSAL_BRIEFS[slot]
+            else:
+                slot = (digest + choice_idx) % len(_UNIVERSAL_BRIEFS)
+                base_focus, base_text = _UNIVERSAL_BRIEFS[slot]
+                focus_area = f"specialized_{base_focus}"
+                brief_text = f"Specialized branch exploration: investigate mechanistic hypotheses and concrete operational pathways derived from {base_focus}."
+
+            return json.dumps({"brief": brief_text, "focus_area": focus_area}), False
+
         # 0. Piece 8: Self-improvement loop (self-assessment, anti-model critic, proposition synthesis).
         # These prompts quote whole winner solutions, and a merged trace names other modules
         # (`alignment_judge`, `fail_judge`): route them by the tag their user message leads with,

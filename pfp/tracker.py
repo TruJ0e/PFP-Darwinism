@@ -127,6 +127,10 @@ class BranchRecord:
     appeal_used: bool = False
     # How the branch was born: "starter", "plaus", "ns", "merge" (drives arena colors + NS selection)
     origin: str = "starter"
+    brief: str = ""
+    brief_id: str = ""
+    parent_brief_id: Optional[str] = None
+    last_objection: str = ""
     # Scheduling-free identity of where the branch came from: a digest of its ID-free fork and
     # origin plus its parents' digests (set by `PFPTracker.register_branch`). Two branches with
     # byte-identical text but different ancestry (common for merged children) order apart on
@@ -157,7 +161,7 @@ class BranchRecord:
 
     def to_dict(self) -> Dict[str, Any]:
         self.refresh_time_alive()
-        return {
+        d = {
             "id": self.id,
             "parent": self.parent,
             "merge_parents": list(self.merge_parents),
@@ -177,6 +181,12 @@ class BranchRecord:
             "last_step": self.last_step[:240],
             "solution": self.solution[:600],
         }
+        if self.brief:
+            d["brief"] = self.brief
+            d["brief_id"] = self.brief_id
+            if self.parent_brief_id is not None:
+                d["parent_brief_id"] = self.parent_brief_id
+        return d
 
 
 def branch_position_text(record: BranchRecord) -> str:
@@ -223,6 +233,9 @@ class PFPTracker:
         depth: int = 0,
         origin: str = "starter",
         merge_parents: Sequence[str] = (),
+        brief: str = "",
+        brief_id: str = "",
+        parent_brief_id: Optional[str] = None,
     ) -> BranchRecord:
         with self._lock:
             if branch_id in self._records:
@@ -242,6 +255,9 @@ class PFPTracker:
                 depth=depth,
                 origin=origin,
                 merge_parents=list(merge_parents),
+                brief=brief,
+                brief_id=brief_id,
+                parent_brief_id=parent_brief_id,
                 lineage_digest=self._lineage_digest(branch_id, parent, merge_parents, fork_under_exploration, origin),
                 created_at=now,
                 last_tested_at=now,
@@ -430,6 +446,10 @@ class PFPTracker:
         open_critic_objections: Optional[int] = None,
         tested: bool = False,
         reasoning_step: Optional[str] = None,
+        brief: Optional[str] = None,
+        brief_id: Optional[str] = None,
+        parent_brief_id: Optional[str] = None,
+        last_objection: Optional[str] = None,
     ) -> BranchRecord:
         with self._lock:
             rec = self.get(branch_id)
@@ -452,6 +472,14 @@ class PFPTracker:
                 rec.last_tested_round = self._arena_round
             if reasoning_step is not None:
                 rec.reasoning_trace.append(reasoning_step)
+            if brief is not None:
+                rec.brief = brief
+            if brief_id is not None:
+                rec.brief_id = brief_id
+            if parent_brief_id is not None:
+                rec.parent_brief_id = parent_brief_id
+            if last_objection is not None:
+                rec.last_objection = last_objection
             rec.refresh_time_alive(now)
             return rec
 

@@ -319,6 +319,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--depth-dial", type=_positive_int, default=3, help="Depth dial bounding fan-out")
     parser.add_argument("--k-probes", type=_positive_int, default=3, help="Number of blind probe continuations per step")
     parser.add_argument("--gauntlet-rounds", type=_positive_int, default=3, help="Pass-readiness gauntlet rounds (default 3)")
+    briefs_group = parser.add_mutually_exclusive_group()
+    briefs_group.add_argument(
+        "--briefs",
+        dest="enable_briefs",
+        action="store_true",
+        default=True,
+        help="Enable evolving exploration briefs (default: on)",
+    )
+    briefs_group.add_argument(
+        "--no-briefs",
+        dest="enable_briefs",
+        action="store_false",
+        help="Disable exploration briefs, matching v0.46 behavior",
+    )
     parser.add_argument(
         "--token-certainty-floor",
         type=float,
@@ -494,6 +508,7 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         ns_clock=args.ns_clock,
         ns_seed=args.ns_seed,
         token_certainty_floor=args.token_certainty_floor,
+        enable_briefs=args.enable_briefs,
         enable_selection=True,
         version_registry=registry,
         seed_cases=loop.recall(args.problem, k=args.starters),

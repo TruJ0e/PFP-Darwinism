@@ -1295,6 +1295,7 @@ class SelfImprovementLoop:
             depth_dial=2,
             k_probes=2,
             gauntlet_rounds=int(dials["gauntlet_rounds"]),
+            enable_briefs=False,
             enable_selection=True,
         )
         harness.detector.weights = weights_from_dials(dials)
