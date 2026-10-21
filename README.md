@@ -359,6 +359,12 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **Spend follows the living (v0.44).** Certainty-weighted allocation stopped at dollars:
+  every Plaus probe and NS continuation asked for 768 completion tokens. Siblings are now tiered
+  at spawn on the same score that splits their budgets: the top quartile (at least one) keeps
+  full probe completions, siblings below `--token-certainty-floor` (default 0.0) get half, the
+  rest three quarters, never below 384 tokens. Each branch's `probe_max_tokens` is on its spawn
+  event. Conclusions (1024), critics and judges are untouched, and no prompt wording changed.
 - **NS share cap (v0.43).** Run 5 grew 97 NS-born branches of 174 (56%): blind mutations too
   mutually alien to recombine (0 merges), crowding out the Plaus children that are the
   mergeable stock. `--ns-share-cap` (default 0.25; 1.0 = uncapped) admits an NS tick only while

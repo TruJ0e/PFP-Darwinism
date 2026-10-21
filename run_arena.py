@@ -292,6 +292,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--depth-dial", type=_positive_int, default=3, help="Depth dial bounding fan-out")
     parser.add_argument("--k-probes", type=_positive_int, default=3, help="Number of blind probe continuations per step")
     parser.add_argument("--gauntlet-rounds", type=_positive_int, default=3, help="Pass-readiness gauntlet rounds (default 3)")
+    parser.add_argument(
+        "--token-certainty-floor",
+        type=float,
+        default=0.0,
+        help="Siblings scoring below this get the cut probe-token tier (default 0.0; top quartile always full)",
+    )
     parser.add_argument("--selection-rounds", type=_positive_int, default=3, help="Max align/merge/contradiction rounds")
     parser.add_argument("--stream-out", type=str, default="", help="Optional JSONL path to save append-only ArenaFeed")
     parser.add_argument("--html-out", type=str, default="", help="Optional HTML path to export Tron Arena player")
@@ -445,6 +451,7 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         root_budget_override_usd=args.root_budget_usd,
         fast_judge_model=None if args.fast_judge_model.strip().lower() in ("", "none") else args.fast_judge_model.strip(),
         ns_share_cap=args.ns_share_cap,
+        token_certainty_floor=args.token_certainty_floor,
         enable_selection=True,
         version_registry=registry,
         seed_cases=loop.recall(args.problem, k=args.starters),

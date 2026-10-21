@@ -34,6 +34,12 @@ from .jsonutil import as_str_list, parse_json_object
 AGE_QUANTUM_S = 1.0
 
 
+# Completion budget of a Plaus probe / NS continuation at full allocation (sized for reasoning
+# models in v0.37), and the floor no tiered cut goes below (v0.44, see MiniHarness.token_scale)
+PROBE_MAX_TOKENS = 768
+MIN_PROBE_TOKENS = 384
+
+
 def untested_age_units(seconds_since_last_test: float) -> float:
     """Whole `AGE_QUANTUM_S` units of untested age; negative / non-finite clocks count 0."""
     try:
@@ -392,6 +398,7 @@ class IssueDetector:
         depth: int = 0,
         known_forks: Sequence[str] = (),
         k_override: Optional[int] = None,
+        max_tokens: int = PROBE_MAX_TOKENS,
     ) -> IssueDetectionResult:
         """
         Fire K diverse continuations blind (high temperature, cheap).
@@ -410,7 +417,7 @@ class IssueDetector:
             + "Return JSON with fork_id, fork, and reasoning."
         )
         choices, total_cost = self._sample_choices(
-            prompt, n=num_probes, temperature=self.probe_temperature, max_tokens=768
+            prompt, n=num_probes, temperature=self.probe_temperature, max_tokens=max_tokens
         )
 
         probes: List[ProbeContinuation] = []
@@ -503,6 +510,7 @@ class IssueDetector:
         depth: int = 0,
         fanout_count: int = 2,
         known_forks: Sequence[str] = (),
+        max_tokens: int = PROBE_MAX_TOKENS,
     ) -> IssueDetectionResult:
         """
         NS (natural selection): blind fan-out on cadence with no trigger.
@@ -515,7 +523,7 @@ class IssueDetector:
             f"Current reasoning: {parent_reasoning}\n"
             "Generate an orthogonal, unconsidered angle as JSON."
         )
-        choices, total_cost = self._sample_choices(prompt, n=max_allowed, temperature=1.0, max_tokens=768)
+        choices, total_cost = self._sample_choices(prompt, n=max_allowed, temperature=1.0, max_tokens=max_tokens)
 
         probes: List[ProbeContinuation] = []
         for idx, ch in enumerate(choices):
