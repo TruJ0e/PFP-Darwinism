@@ -533,8 +533,14 @@ class MiniHarness:
         should_stop: Optional[Callable[[], bool]] = None,
         abort_run: Optional[Callable[[], None]] = None,
         stop_reason: Optional[Callable[[], str]] = None,
+        ns_admit: Optional[Callable[[], bool]] = None,
+        ns_settle: Optional[Callable[[int], None]] = None,
     ) -> None:
         self.branch_id = branch_id
+        # NS share cap (v0.43): the arena admits an NS tick only while blind variation stays
+        # within its share of the population; a refused tick buys no probe
+        self.ns_admit: Callable[[], bool] = ns_admit or (lambda: True)
+        self.ns_settle: Callable[[int], None] = ns_settle or (lambda spawned: None)
         self.origin = origin
         self.should_stop: Callable[[], bool] = should_stop or (lambda: False)
         # Trips the run-wide stop when any branch fails, so its siblings and cousins start
@@ -776,6 +782,8 @@ class MiniHarness:
                 should_stop=self.should_stop,
                 abort_run=self.abort_run,
                 stop_reason=self.stop_reason,
+                ns_admit=self.ns_admit,
+                ns_settle=self.ns_settle,
             )
             child.tracker.update_branch(
                 child_id,
@@ -932,26 +940,32 @@ class MiniHarness:
             and not self.should_stop()
             and self._can_afford("ns")
             and (force_ns_check or elapsed_since_ns >= self.ns_cadence_s)
+            and self.ns_admit()
         ):
             self.last_ns_tick = now
-            ns_res = self.detector.trigger_ns(
-                problem=self.problem,
-                parent_reasoning=" | ".join(rec.reasoning_trace),
-                depth=self.depth,
-                fanout_count=1,
-                known_forks=self.tracker.known_forks_in_lineage(self.branch_id),
-            )
-            self._spend(ns_res.cost_usd, "ns_blind_variation", kind="ns")
-            self._emit(
-                "ns_tick",
-                {
-                    "cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
-                    "spawned_count": len(ns_res.distinct_forks),
-                },
-            )
-            if ns_res.should_split and not self.spawns_stopped:
-                ns_children = self._spawn_children_from_forks(ns_res.distinct_forks, trigger="ns")
-                self._run_children_parallel(ns_children)
+            ns_children: List[MiniHarness] = []
+            try:
+                ns_res = self.detector.trigger_ns(
+                    problem=self.problem,
+                    parent_reasoning=" | ".join(rec.reasoning_trace),
+                    depth=self.depth,
+                    fanout_count=1,
+                    known_forks=self.tracker.known_forks_in_lineage(self.branch_id),
+                )
+                self._spend(ns_res.cost_usd, "ns_blind_variation", kind="ns")
+                self._emit(
+                    "ns_tick",
+                    {
+                        "cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
+                        "spawned_count": len(ns_res.distinct_forks),
+                    },
+                )
+                if ns_res.should_split and not self.spawns_stopped:
+                    ns_children = self._spawn_children_from_forks(ns_res.distinct_forks, trigger="ns")
+            finally:
+                # Settle the admission before the children run: they compete for NS slots too
+                self.ns_settle(len(ns_children))
+            self._run_children_parallel(ns_children)
 
         # 3. Conclude this branch cleanly so nothing dies mid-thought
         if not self.concluded and not self.should_stop() and self.tracker.get(self.branch_id).is_alive:
@@ -996,6 +1010,7 @@ class MainHarness:
         finish_reserve_ratio: float = 0.125,
         root_budget_override_usd: Optional[float] = None,
         fast_judge_model: Optional[str] = FAST_JUDGE_MODEL,
+        ns_share_cap: float = 0.25,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
@@ -1005,6 +1020,9 @@ class MainHarness:
 
         if starter_agents < 1:
             raise ValueError("starter_agents must be >= 1")
+        ns_share_cap = _finite_number(ns_share_cap, "ns_share_cap")
+        if not (0.0 <= ns_share_cap <= 1.0):
+            raise ValueError("ns_share_cap must be in [0, 1].")
         if not isinstance(hard_cap_usd, (int, float)) or not math.isfinite(hard_cap_usd) or hard_cap_usd <= 0:
             # NaN compares False against every spend, inf never binds: either would silently
             # turn the hard cap off, so both are refused before a client is wrapped.
@@ -1039,6 +1057,14 @@ class MainHarness:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._abort_reason: Optional[str] = None
+        # NS share cap (v0.43): blind variation may be at most this share of all spawned branches.
+        # Run 5 grew 97 NS of 174 (56%): mutations too mutually alien to recombine, while Plaus
+        # children — the mergeable stock — were crowded out. 1.0 = uncapped (pre-v0.43).
+        self.ns_share_cap = ns_share_cap
+        self._ns_lock = threading.Lock()
+        self._ns_spawned = 0
+        self._ns_reserved = 0
+        self._ns_capped_ticks = 0
 
         # Judge ladder (v0.41): first-pass judging on a fast instruct model, Super for appeals,
         # escalations, the final gauntlet round, the pre-exit check and merge synthesis.
@@ -1101,6 +1127,26 @@ class MainHarness:
             return True
         reg = self.version_registry
         return bool(reg is not None and getattr(reg, "emergency_stopped", False))
+
+    def _ns_admit(self) -> bool:
+        """
+        Reserve one NS slot if the population can take another blind mutation within the cap:
+        (NS spawned + in flight + 1) <= cap x (branches registered + in flight + 1). The tick
+        fans out one fork, so a slot is one child. Refused ticks are counted, never paid for.
+        """
+        total = len(self.tracker.all_records())
+        with self._ns_lock:
+            in_flight = self._ns_reserved
+            if self._ns_spawned + in_flight + 1 > self.ns_share_cap * (total + in_flight + 1):
+                self._ns_capped_ticks += 1
+                return False
+            self._ns_reserved += 1
+            return True
+
+    def _ns_settle(self, spawned: int) -> None:
+        with self._ns_lock:
+            self._ns_reserved = max(0, self._ns_reserved - 1)
+            self._ns_spawned += max(0, int(spawned))
 
     def _next_branch_id(self) -> str:
         with self._lock:
@@ -1512,6 +1558,8 @@ class MainHarness:
                     should_stop=self._should_stop,
                     abort_run=self._abort_run,
                     stop_reason=self._stop_reason,
+                    ns_admit=self._ns_admit,
+                    ns_settle=self._ns_settle,
                 )
             )
 
@@ -1629,6 +1677,11 @@ class MainHarness:
                     "api_n_topup_calls": self.detector.n_topup_calls,
                 },
                 "total_branches_spawned": len(self.tracker.all_records()),
+                "ns": {
+                    "share_cap": self.ns_share_cap,
+                    "spawned": self._ns_spawned,
+                    "capped_ticks": self._ns_capped_ticks,
+                },
                 "selection": selection_summary,
                 "verified_main_line": list(self.fail_judge.verified_main_line),
                 "winners_box": self.winners_box,

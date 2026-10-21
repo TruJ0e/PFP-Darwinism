@@ -359,6 +359,15 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **NS share cap (v0.43).** Run 5 grew 97 NS-born branches of 174 (56%): blind mutations too
+  mutually alien to recombine (0 merges), crowding out the Plaus children that are the
+  mergeable stock. `--ns-share-cap` (default 0.25; 1.0 = uncapped) admits an NS tick only while
+  (NS spawned + in flight + 1) <= cap x (branches + in flight + 1); a refused tick buys no
+  probe and is counted in the summary (`ns.capped_ticks`). The mock answers instantly, so its
+  wall-clock NS cadence rarely elapses and the cap never binds there (3 NS of 37); with the
+  cadence forced to live rates on the 9-starter unfiltered mock, NS fell from 36% to 25% and
+  merges rose from 12 to 23. Where the cap binds, *which* branches get the slots follows
+  thread timing, like the wall-clock cadence it gates (see the v0.43 note in the run report).
 - **Selection that scales (v0.42).** Selection judged at most 8 alignment pairs per round,
   hard-coded, at any population, and ended the moment one round found nothing: run 5 put 174
   branches through selection, judged 8 alignments, merged nothing and quit after round 1.
