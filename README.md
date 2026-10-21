@@ -359,6 +359,23 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **Selection that scales (v0.42).** Selection judged at most 8 alignment pairs per round,
+  hard-coded, at any population, and ended the moment one round found nothing: run 5 put 174
+  branches through selection, judged 8 alignments, merged nothing and quit after round 1.
+  `AlignmentDetector.plan_pairs` now clusters branches (connected components at
+  `cluster_threshold`, 0.5 cosine), takes a maximum-similarity matching *within* clusters
+  (every branch in at most one pair a round, so a round covers about half the population) and
+  matches cluster champions *across* clusters, where clashes between schools of thought
+  surface. Plan size is bounded by the population and by the money: the root headroom left
+  after setting aside a full gauntlet plus pre-exit for every winner's-box slot, at the per-pair
+  cost learned this run (the first round keeps the old guarantee of up to 8). A quiet round no
+  longer ends selection while unjudged candidate pairs remain. Judge calls run concurrently
+  (`judge_parallelism`, 8): claims are extracted once per branch before the verdicts, merges
+  after the first run as a batch the learned costs can fund with child IDs drawn in plan order,
+  and the NS sweep attacks its branches side by side. Every result is consumed in plan order,
+  so outcomes and spend stay a pure function of the run's content (the v0.17 shuffle test
+  still holds). On the 9-starter unfiltered mock: 24 -> 42 verdicts, 24 -> 36 merges, no
+  overdraft. Summary reports `selection.unjudged_pairs_remaining`.
 - **The judge ladder (v0.41).** Every judge used to be Super: in run 5 it was 55% of spend
   (68% in run 1), each verdict took ~10-50 s because Super reasons before it answers, and at
   512 tokens run 3 lost three of four verdicts under that reasoning. First-pass judging —

@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
@@ -203,12 +204,17 @@ class AlignmentDetector:
         client: Any,
         *,
         prefilter_threshold: float = 0.20,
+        cluster_threshold: float = 0.50,
         embedding_dim: int = 128,
         super_model: str = SUPER_MODEL,
         judge_model: Optional[str] = None,
     ) -> None:
         self.client = client
         self.prefilter_threshold = prefilter_threshold
+        # Similarity at which two branches share a cluster (`plan_pairs`); never below the prefilter
+        self.cluster_threshold = cluster_threshold
+        # Unjudged prefilter-passing pairs the last `plan_pairs` left for a later round
+        self.last_unjudged_remaining: int = 0
         self.embedding_dim = embedding_dim
         self.super_model = super_model
         # Judge ladder (v0.41): claim extraction and pair verdicts are first-pass judging, so the
@@ -439,4 +445,156 @@ class AlignmentDetector:
             results.append(res)
             if res.verdict == AlignmentVerdict.OVERLAP:
                 claimed.update((ba.id, bb.id))
+        return results
+
+    # ------------------------------------------------------------------
+    # Selection that scales (v0.42)
+    # ------------------------------------------------------------------
+    def plan_pairs(
+        self,
+        branches: Sequence[BranchRecord],
+        *,
+        max_pairs: Optional[int] = None,
+        roots_of: Optional[Callable[[str], FrozenSet[str]]] = None,
+    ) -> List[AlignmentCandidatePair]:
+        """
+        Pick one round's pairs so coverage scales with the population (`detect_alignments`
+        judged at most a constant 8 pairs per round at any size: run 5 judged 8 of 174 branches).
+
+        1. Cluster: prefilter-passing pairs at `cluster_threshold` or above join their branches
+           (connected components). Compatibility lives inside a cluster.
+        2. Within clusters: a greedy maximum-similarity matching — every branch in at most one
+           within-cluster pair per round, so the round covers ~half the population and every
+           verdict is about two branches no other verdict this round can absorb.
+        3. Across clusters: each cluster's champion (highest certainty, content tie-break) is
+           matched with the most similar other champion, at most one cross pair per champion.
+           That is where clashes between schools of thought surface.
+
+        Already-judged pairs (at their current trace versions) are never planned again. Order is
+        content-derived (similarity, then cross-subtree preference, then `content_order_key`),
+        never registration order. `last_unjudged_remaining` reports what is left for later rounds.
+        """
+        by_id = {b.id: b for b in branches if b.is_alive}
+        keys = {bid: content_order_key(b) for bid, b in by_id.items()}
+        candidates = [
+            c
+            for c in self.embedding_prefilter(list(by_id.values()))
+            if c.passed_prefilter and self._pair_key(by_id[c.branch_a_id], by_id[c.branch_b_id]) not in self._judged_pairs
+        ]
+        if roots_of is not None:
+            roots: Dict[str, FrozenSet[str]] = {bid: frozenset(roots_of(bid)) for bid in by_id}
+            candidates.sort(
+                key=lambda c: (-c.cosine_similarity, 1 if roots[c.branch_a_id] & roots[c.branch_b_id] else 0)
+            )
+
+        parent: Dict[str, str] = {bid: bid for bid in by_id}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        threshold = max(self.cluster_threshold, self.prefilter_threshold)
+        for c in candidates:
+            if c.cosine_similarity >= threshold:
+                ra, rb = find(c.branch_a_id), find(c.branch_b_id)
+                if ra != rb:
+                    # Root on the content-smaller member, so the partition never follows pair order
+                    lo, hi = sorted((ra, rb), key=lambda r: keys[r])
+                    parent[hi] = lo
+
+        limit = len(by_id) if max_pairs is None else max(0, int(max_pairs))
+        selected: List[AlignmentCandidatePair] = []
+        matched: set = set()
+        for c in candidates:
+            if len(selected) >= limit:
+                break
+            if find(c.branch_a_id) != find(c.branch_b_id):
+                continue
+            if c.branch_a_id in matched or c.branch_b_id in matched:
+                continue
+            matched.update((c.branch_a_id, c.branch_b_id))
+            selected.append(c)
+
+        members: Dict[str, List[BranchRecord]] = {}
+        for bid, rec in by_id.items():
+            members.setdefault(find(bid), []).append(rec)
+        champions = {
+            min(group, key=lambda r: (-r.certainty_score, keys[r.id])).id for group in members.values()
+        }
+        cross_matched: set = set()
+        for c in candidates:
+            if len(selected) >= limit:
+                break
+            a, b = c.branch_a_id, c.branch_b_id
+            if find(a) == find(b) or a not in champions or b not in champions:
+                continue
+            if a in cross_matched or b in cross_matched:
+                continue
+            cross_matched.update((a, b))
+            selected.append(c)
+
+        self.last_unjudged_remaining = len(candidates) - len(selected)
+        return selected
+
+    @staticmethod
+    def _pair_key(ba: BranchRecord, bb: BranchRecord) -> tuple:
+        return tuple(sorted([(ba.id, len(ba.reasoning_trace)), (bb.id, len(bb.reasoning_trace))]))
+
+    def judge_planned_pairs(
+        self,
+        branches: Sequence[BranchRecord],
+        pairs: Sequence[AlignmentCandidatePair],
+        *,
+        max_workers: int = 8,
+    ) -> List[AlignmentJudgeResult]:
+        """
+        Judge `pairs` concurrently; results come back in `pairs` order.
+
+        Claims are extracted first, once per branch (in parallel), so two pairs sharing a branch
+        never race to pay for the same extraction. Each extraction's cost rides on the first
+        planned pair that uses the branch, exactly as `judge_pair` folds it into a lone verdict.
+        """
+        by_id = {b.id: b for b in branches}
+        live_pairs = [p for p in pairs if p.branch_a_id in by_id and p.branch_b_id in by_id]
+        for p in live_pairs:
+            self._judged_pairs.add(self._pair_key(by_id[p.branch_a_id], by_id[p.branch_b_id]))
+
+        need: List[str] = []
+        for p in live_pairs:
+            for bid in (p.branch_a_id, p.branch_b_id):
+                if bid not in need:
+                    need.append(bid)
+        workers = max(1, min(int(max_workers), len(need) or 1))
+        extraction_cost: Dict[str, float] = {}
+
+        def _extract(bid: str) -> float:
+            return self.extract_claims(by_id[bid])[1]
+
+        if workers == 1:
+            costs = [_extract(bid) for bid in need]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                costs = list(pool.map(_extract, need))
+        extraction_cost = dict(zip(need, costs))
+
+        def _judge(p: AlignmentCandidatePair) -> AlignmentJudgeResult:
+            return self.judge_pair(by_id[p.branch_a_id], by_id[p.branch_b_id], cosine_sim=p.cosine_similarity)
+
+        workers = max(1, min(int(max_workers), len(live_pairs) or 1))
+        if workers == 1:
+            results = [_judge(p) for p in live_pairs]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_judge, live_pairs))
+
+        billed: set = set()
+        for res in results:
+            extra = 0.0
+            for bid in (res.branch_a_id, res.branch_b_id):
+                if bid not in billed:
+                    billed.add(bid)
+                    extra += extraction_cost.get(bid, 0.0)
+            res.cost_usd = round(res.cost_usd + extra, 6)
         return results

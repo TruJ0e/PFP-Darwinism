@@ -1061,6 +1061,9 @@ class MainHarness:
             event_sink=self._on_event,
         )
         self.winners_box: List[Dict[str, Any]] = []
+        # Concurrent judge calls during selection (alignment verdicts, merges, the NS sweep).
+        # Judge latency, not money, set run 5's 28 minutes: ~100 verdicts one after another.
+        self.judge_parallelism: int = 8
 
     # ------------------------------------------------------------------
     # Run-boundary configuration + safety rails
@@ -1146,6 +1149,63 @@ class MainHarness:
             "merge_falsification"
         )
         return headroom >= need
+
+    def _affordable_merges(self) -> int:
+        """How many merge round trips (plus each child's finish) the root headroom still covers."""
+        ledger = self.budget_ledger
+        headroom = ledger.root_budget_usd - ledger.total_spent_usd
+        if headroom <= 0.0:
+            return 0
+        finish_calls = self.fail_judge.gauntlet_rounds + 1
+        need = ledger.estimate_call_cost("merge_round_trip") + finish_calls * ledger.estimate_call_cost(
+            "merge_falsification"
+        )
+        if need <= 0.0:
+            return 0
+        return int(headroom // need)
+
+    def _affordable_alignment_pairs(self) -> int:
+        """
+        Alignment verdicts the root headroom covers once the finish is set aside (a full gauntlet
+        plus pre-exit for every winner's-box slot). Coverage scales with the population only as
+        far as the money does: on the 9-starter unfiltered mock an ungated plan overdrew the root
+        by 6%. Per-pair cost is learned from verdicts already paid for this run.
+        """
+        ledger = self.budget_ledger
+        headroom = ledger.root_budget_usd - ledger.total_spent_usd
+        finish = self.max_winners * (self.fail_judge.gauntlet_rounds + 1) * ledger.estimate_call_cost(
+            "merge_falsification"
+        )
+        per_pair = ledger.estimate_call_cost("alignment_pair")
+        spare = headroom - finish
+        if spare <= 0.0 or per_pair <= 0.0:
+            return 0
+        return int(spare // per_pair)
+
+    def _parallel_map(self, fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
+        """`fn` over `items` on up to `judge_parallelism` threads; results in `items` order."""
+        items = list(items)
+        workers = max(1, min(int(self.judge_parallelism), len(items)))
+        if workers == 1:
+            return [fn(item) for item in items]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(fn, item) for item in items]
+            try:
+                return [f.result() for f in futs]
+            except BaseException:
+                # A failed judge call (hard cap, backend error) stops the rest starting paid calls
+                self._abort_run()
+                for f in futs:
+                    f.cancel()
+                raise
+
+    def _merge_and_verify(self, job: tuple) -> tuple:
+        """One merge round trip: Super synthesis, then the child's post-merge falsification."""
+        al, child_id = job
+        merge_res = self.merge_synthesizer.merge_branches(al.branch_a_id, al.branch_b_id, child_id, alignment=al)
+        # Schedule Trigger 1: after every merge (new claims -> verify before going anywhere)
+        post_merge_out = self.fail_judge.verify_after_merge(child_id)
+        return merge_res, post_merge_out
 
     def _charge_alignment(self, al: Any) -> None:
         """Split a judge call's real cost across the two branches it compared (verification work)."""
@@ -1268,11 +1328,25 @@ class MainHarness:
             if round_idx > 0 and self.budget_ledger.total_spent_usd >= self.budget_ledger.root_budget_usd:
                 break
             rounds_run += 1
-            alignments = self.alignment_detector.detect_alignments(
-                self.tracker.active_branches(), max_pairs_to_judge=8, roots_of=self.tracker.starter_roots
+            # Coverage scales with the population (v0.42): cluster, match within clusters,
+            # pit cluster champions against each other, judge the whole plan concurrently
+            # The first round keeps the pre-v0.42 guarantee of up to 8 verdicts; beyond that (and
+            # in every later round) the plan is as large as the population and the money allow
+            max_pairs = self._affordable_alignment_pairs()
+            if round_idx == 0:
+                max_pairs = max(8, max_pairs)
+            if max_pairs <= 0:
+                break
+            active = self.tracker.active_branches()
+            plan = self.alignment_detector.plan_pairs(
+                active, max_pairs=max_pairs, roots_of=self.tracker.starter_roots
+            )
+            alignments = self.alignment_detector.judge_planned_pairs(
+                active, plan, max_workers=self.judge_parallelism
             )
             for al in alignments:
                 self._charge_alignment(al)
+                self.budget_ledger.observe_call_cost("alignment_pair", al.cost_usd)
                 alignments_evaluated.append(al.to_dict())
 
             changed = False
@@ -1299,44 +1373,67 @@ class MainHarness:
                 falsifications_run.extend([out_a.to_dict(), out_b.to_dict()])
                 changed = True
 
+            # Overlap verdicts on disjoint live pairs, in plan order (a branch in two overlap
+            # verdicts merges once this round; its child is compared afresh next round)
+            pending: List[Any] = []
+            merging: set = set()
             for al in alignments:
                 if al.verdict != AlignmentVerdict.OVERLAP:
                     continue
-                ba = self.tracker.get(al.branch_a_id)
-                bb = self.tracker.get(al.branch_b_id)
-                if not (ba.is_alive and bb.is_alive):
+                if al.branch_a_id in merging or al.branch_b_id in merging:
                     continue
+                if not (self.tracker.get(al.branch_a_id).is_alive and self.tracker.get(al.branch_b_id).is_alive):
+                    continue
+                merging.update((al.branch_a_id, al.branch_b_id))
+                pending.append(al)
+
+            while pending and not self._should_stop():
                 # A merge buys a synthesis call plus its post-merge falsification. Once the root
                 # budget can't cover another one (learned from the merges already paid for), stop
-                # cooperating and keep what's left for the pre-exit finish
-                if self._should_stop() or not self._can_afford_merge():
+                # cooperating and keep what's left for the pre-exit finish. Before the first merge
+                # nothing is known: it runs alone, gated by headroom; later merges run as a batch
+                # the learned costs can fund.
+                if not self._can_afford_merge():
                     break
-                child_id = self._next_branch_id()
-                merge_res = self.merge_synthesizer.merge_branches(ba.id, bb.id, child_id, alignment=al)
-                merges_performed.append(merge_res.to_dict())
-                changed = True
-                # Schedule Trigger 1: after every merge (new claims -> verify before going anywhere)
-                post_merge_out = self.fail_judge.verify_after_merge(child_id)
-                falsifications_run.append(post_merge_out.to_dict())
-                self.budget_ledger.observe_call_cost(
-                    "merge_round_trip", merge_res.synthesis_cost_usd + post_merge_out.cost_usd
-                )
-                self.budget_ledger.observe_call_cost("merge_falsification", post_merge_out.cost_usd)
-                if self.tracker.get(child_id).is_alive:
-                    self.tracker.update_branch(
-                        child_id,
-                        reasoning_step=f"[Conclusion] {merge_res.unified_reasoning}",
+                if self.budget_ledger.observed_cost("merge_round_trip") is None:
+                    batch = pending[:1]
+                else:
+                    batch = pending[: max(1, self._affordable_merges())]
+                pending = pending[len(batch):]
+                # Child IDs are drawn here, in plan order, never by whichever worker finishes first
+                jobs = [(al, self._next_branch_id()) for al in batch]
+                for (al, child_id), (merge_res, post_merge_out) in zip(jobs, self._parallel_map(self._merge_and_verify, jobs)):
+                    merges_performed.append(merge_res.to_dict())
+                    changed = True
+                    falsifications_run.append(post_merge_out.to_dict())
+                    self.budget_ledger.observe_call_cost(
+                        "merge_round_trip", merge_res.synthesis_cost_usd + post_merge_out.cost_usd
                     )
+                    self.budget_ledger.observe_call_cost("merge_falsification", post_merge_out.cost_usd)
+                    if self.tracker.get(child_id).is_alive:
+                        self.tracker.update_branch(
+                            child_id,
+                            reasoning_step=f"[Conclusion] {merge_res.unified_reasoning}",
+                        )
             self._age_untested_branches()
-            if not changed:
+            # A quiet round ends selection only once coverage is exhausted: unjudged candidate
+            # pairs left over (the plan matches each branch once per round) get the next round
+            if not changed and self.alignment_detector.last_unjudged_remaining <= 0:
                 break
 
         # Blind variation must face selection: NS-born branches never exit untested
         if not self._should_stop():
-            for b in sorted(self.tracker.active_branches(), key=content_order_key):
-                if b.origin == "ns" and b.state == BranchState.POSSIBLE and b.survived_falsifications == 0:
-                    out = self.fail_judge.falsify_branch(b.id, schedule_trigger="background_sample")
-                    falsifications_run.append(out.to_dict())
+            ns_untested = [
+                b.id
+                for b in sorted(self.tracker.active_branches(), key=content_order_key)
+                if b.origin == "ns" and b.state == BranchState.POSSIBLE and b.survived_falsifications == 0
+            ]
+            # Independent attacks on distinct branches: run them side by side (run 5 queued 97)
+            for out in self._parallel_map(
+                lambda bid: self.fail_judge.falsify_branch(bid, schedule_trigger="background_sample"),
+                ns_untested,
+            ):
+                falsifications_run.append(out.to_dict())
 
         # Pre-exit: frontier branches only (a branch that split handed its flow to its
         # children — the river splits around the rock), distinct solutions, highest certainty first
@@ -1364,6 +1461,7 @@ class MainHarness:
             "rounds_run": rounds_run,
             "reclaimed_to_finish_reserve_usd": reclaimed_usd,
             "alignments_evaluated": alignments_evaluated,
+            "unjudged_pairs_remaining": self.alignment_detector.last_unjudged_remaining,
             "merges_performed": merges_performed,
             "contradictions_resolved": contradictions_resolved,
             "falsifications_count": len(falsifications_run),
