@@ -33,7 +33,7 @@ from pfp import (
     VersionRegistry,
     create_client,
 )
-from pfp.backend import FAST_JUDGE_MODEL
+from pfp.backend import DEFAULT_REQUESTS_PER_MINUTE, FAST_JUDGE_MODEL, REQUESTS_PER_MINUTE_ENV, parse_requests_per_minute
 from pfp.arena import is_journal_digest, stream_problem
 from pfp.fsutil import StateLockError, atomic_write_text, exclusive_lock
 from pfp.proof_report import write_proof_report
@@ -64,6 +64,15 @@ def _positive_float(text: str) -> float:
     if not math.isfinite(val) or val <= 0:
         raise argparse.ArgumentTypeError("must be a finite number > 0")
     return val
+
+
+def _requests_per_minute(text: str) -> str:
+    """Validate the pacing dial up front; the raw text is resolved by create_client."""
+    try:
+        parse_requests_per_minute(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"must be a number >= 0 or 'off' ({exc})") from None
+    return text
 
 
 def _expected_head(value: str) -> str:
@@ -206,7 +215,11 @@ def _replay_improve(
         except (OSError, ValueError) as exc:
             print(f"[pfp] refusing to run: cannot load case bank {cases_path}: {exc}", file=sys.stderr)
             return 1, {}, 0.0
-    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
+    client = create_client(
+        use_mock=True if args.mock else None,
+        max_retries=args.max_retries,
+        requests_per_minute=args.requests_per_minute,
+    )
     loop.client = client
     budget = _improvement_budget(args, args.hard_cap)
     meter = MeteredClient(client, hard_cap_usd=budget, max_concurrent_calls=args.max_concurrent)
@@ -317,6 +330,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quiet", action="store_true", help="Do not print the ASCII arena")
     parser.add_argument("--mock", action="store_true", help="Force mock backend even if NEBIUS_API_KEY is set")
     parser.add_argument("--max-retries", type=_non_negative_int, default=3, help="Live backend retries on 429/5xx/network errors")
+    parser.add_argument(
+        "--requests-per-minute",
+        type=_requests_per_minute,
+        default=None,
+        help=(
+            f"Live request pacing ceiling (default ${REQUESTS_PER_MINUTE_ENV} or "
+            f"{DEFAULT_REQUESTS_PER_MINUTE:g}/min); 0 or 'off' disables. The mock is never paced"
+        ),
+    )
     parser.add_argument("--max-concurrent", type=_positive_int, default=32, help="Max in-flight model calls")
     parser.add_argument("--summary-out", type=str, default="", help="Optional path to write the run summary JSON")
     parser.add_argument(
@@ -434,7 +456,11 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
             print(f"[pfp] refusing to run: cannot load case bank {cases_path}: {exc}", file=sys.stderr)
             return 1
 
-    client = create_client(use_mock=True if args.mock else None, max_retries=args.max_retries)
+    client = create_client(
+        use_mock=True if args.mock else None,
+        max_retries=args.max_retries,
+        requests_per_minute=args.requests_per_minute,
+    )
     loop.client = client
 
     harness = MainHarness(
@@ -466,6 +492,9 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
     summary["total_api_spend_usd"] = round(
         summary["budget"]["api_spend_usd"] + summary.get("self_improvement_spend_usd", 0.0), 6
     )
+    limiter = getattr(client, "rate_limiter", None)
+    if limiter is not None:
+        summary["request_pacing"] = limiter.stats()
     # Anchor the journal outside the JSONL so a copy cut short at the tail is detectable
     summary["journal"] = harness.arena_feed.anchor()
 

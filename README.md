@@ -69,6 +69,7 @@ so malformed self-improvement output cannot disable auto-revert or create an uns
 | `--improve-cap` | — | USD ceiling for the Piece 8 loop (default: whatever `--hard-cap` leaves after the arena; the summary records `self_improvement_budget_usd`) |
 | `--max-retries` | 3 | live retries on 429/5xx/network errors |
 | `--max-concurrent` | 32 | max in-flight model calls across all branches |
+| `--requests-per-minute` | 80 | live request pacing ceiling (env `PFP_REQUESTS_PER_MINUTE`; `0` / `off` disables; the mock is never paced) |
 | `--summary-out` | — | write the run summary JSON (spend, winners, self-improvement; also works with `--replay`) |
 | `--report-out` | — | write the proof trail: `.md` Markdown or `.json` structured (also works with `--replay`) |
 | `--replay` | — | re-render a saved `--stream-out` JSONL to ASCII / `--html-out` / `--summary-out`; runs post-replay improvement if `--state-dir` is given without `--no-improve` |
@@ -294,6 +295,16 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
 - HTTP: exponential backoff with jitter on 408/409/425/429/5xx, network errors
   and connections dropped mid-body, `Retry-After` honored (seconds or HTTP-date), non-retryable errors raised immediately with
   status and body; reasoning-model `reasoning_content` fallback.
+- **Request pacing (v0.45).** Live run 6 halted at 131 s on HTTP 429: 82 of 88 spawns landed
+  in the first minute and burst through Token Factory's 100 requests/min. Every live HTTP
+  attempt, retries included, now takes a slot from one thread-safe limiter shared by starters,
+  children, judge batches and Piece 8, spaced 60/rpm seconds apart (`--requests-per-minute`,
+  else `PFP_REQUESTS_PER_MINUTE`, else 80; `0` / `off` disables). A 429 holds the whole run, not
+  just the refused thread: `Retry-After` (or, without one, 2.5-5 s doubling to a 60 s cap) pushes
+  back every unreserved slot and the retry waits its turn behind the pause. Pacing changes when
+  a request goes out, never whether spend is accounted: the meter's hard-cap reservation is
+  taken before the wait, so a refused call never takes a slot. Live summaries carry
+  `request_pacing` (requests, paced requests, total wait, 429 pauses). The mock is never paced.
 - A backend failure after retries (or a rejected key) halts the run as
   `backend_error`; Ctrl-C halts it as `interrupted`. Either way every branch
   stops starting paid calls at once and the partial arena is kept.

@@ -347,6 +347,102 @@ class HardCapExceededError(RuntimeError):
 # HTTP statuses worth retrying: rate limits and transient upstream failures.
 RETRYABLE_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
+# Request pacing (v0.45). Token Factory allows 100 requests/min per model; live run 6 burst 82
+# spawns into its first minute and halted on HTTP 429. Pace below the window with headroom.
+DEFAULT_REQUESTS_PER_MINUTE = 80.0
+REQUESTS_PER_MINUTE_ENV = "PFP_REQUESTS_PER_MINUTE"
+# A 429 without Retry-After means a per-minute window is full: back off in seconds, not the
+# half-second transient-error base, or the retries land in the same window and fail again.
+RATE_LIMIT_BACKOFF_BASE_S = 5.0
+
+
+def parse_requests_per_minute(value: Any) -> Optional[float]:
+    """Operator pacing dial -> requests/min, or None when pacing is off ("0", "off", "none")."""
+    if value is None:
+        return DEFAULT_REQUESTS_PER_MINUTE
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "default"):
+            return DEFAULT_REQUESTS_PER_MINUTE
+        if text in ("0", "off", "none", "false", "no"):
+            return None
+        value = text
+    rate = _configuration_float(value, "requests_per_minute", minimum=0.0)
+    return rate if rate > 0 else None
+
+
+def resolve_requests_per_minute(value: Any = None) -> Optional[float]:
+    """Explicit dial, else the PFP_REQUESTS_PER_MINUTE env var, else the default ceiling."""
+    if value is None:
+        value = os.environ.get(REQUESTS_PER_MINUTE_ENV)
+    return parse_requests_per_minute(value)
+
+
+class RequestRateLimiter:
+    """
+    Thread-safe request pacer (GCRA, the virtual-scheduling form of a token bucket).
+
+    Every outbound HTTP attempt, retries included, reserves the next send slot under a lock;
+    the caller then sleeps until its slot with its own (injectable) sleep. Slots are spaced
+    60/rpm seconds apart, so any 60-second window carries at most rpm + burst requests
+    however many starters, children and judge batches call at once. `penalize` pushes every
+    unreserved slot past a provider-requested pause (a 429's Retry-After): the whole run holds
+    back, not just the thread that was refused. Pacing decides when a request goes out, never
+    whether: it holds no budget state, and the meter's reservation is taken before it waits.
+    """
+
+    def __init__(
+        self,
+        requests_per_minute: float,
+        *,
+        burst: int = 1,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        rate = _configuration_float(requests_per_minute, "requests_per_minute", minimum=0.0, inclusive=False)
+        self.requests_per_minute = rate
+        self.burst = _configuration_int(burst, "burst", minimum=1)
+        self.interval_s = 60.0 / rate
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._next_slot: Optional[float] = None  # theoretical arrival time of the next request
+        self.requests = 0
+        self.paced_requests = 0
+        self.total_wait_s = 0.0
+        self.penalties = 0
+
+    def reserve(self) -> float:
+        """Claim the next send slot; returns the seconds the caller must wait before sending."""
+        with self._lock:
+            now = self._clock()
+            tat = now if self._next_slot is None else max(self._next_slot, now)
+            wait = max(0.0, tat - (self.burst - 1) * self.interval_s - now)
+            self._next_slot = tat + self.interval_s
+            self.requests += 1
+            if wait > 0:
+                self.paced_requests += 1
+                self.total_wait_s += wait
+            return wait
+
+    def penalize(self, delay_s: float) -> None:
+        """Hold every slot not yet reserved until `delay_s` from now (the provider asked us to wait)."""
+        delay = _finite_float(delay_s, 0.0)
+        if delay <= 0:
+            return
+        with self._lock:
+            hold = self._clock() + delay + (self.burst - 1) * self.interval_s
+            self._next_slot = hold if self._next_slot is None else max(self._next_slot, hold)
+            self.penalties += 1
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "requests_per_minute": self.requests_per_minute,
+                "requests": self.requests,
+                "paced_requests": self.paced_requests,
+                "total_wait_s": round(self.total_wait_s, 3),
+                "rate_limit_penalties": self.penalties,
+            }
+
 
 class _LiveChatCompletions:
     """OpenAI-compatible `client.chat.completions` implementation over HTTP."""
@@ -360,6 +456,7 @@ class _LiveChatCompletions:
         max_retries: int = 3,
         backoff_base_s: float = 0.5,
         sleep: Callable[[float], None] = time.sleep,
+        rate_limiter: Optional[RequestRateLimiter] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -368,8 +465,9 @@ class _LiveChatCompletions:
         self.max_retries = max(0, int(max_retries))
         self.backoff_base_s = max(0.0, backoff_base_s)
         self._sleep = sleep
+        self.rate_limiter = rate_limiter
 
-    def _backoff_delay(self, attempt: int, retry_after: Optional[str]) -> float:
+    def _backoff_delay(self, attempt: int, retry_after: Optional[str], status: Optional[int] = None) -> float:
         if retry_after:
             try:
                 return min(60.0, max(0.0, float(retry_after)))
@@ -382,6 +480,10 @@ class _LiveChatCompletions:
                 when = None
             if when is not None and when.tzinfo is not None:
                 return min(60.0, max(0.0, when.timestamp() - time.time()))
+        if status == 429:
+            # Quota window full: exponential with equal jitter (2.5-5s, 5-10s, ... capped at 60s)
+            ceiling = min(60.0, RATE_LIMIT_BACKOFF_BASE_S * (2 ** attempt))
+            return random.uniform(ceiling / 2.0, ceiling)
         # Exponential backoff with full jitter so hundreds of parallel branches don't stampede
         return random.uniform(0.0, self.backoff_base_s * (2 ** attempt))
 
@@ -394,6 +496,11 @@ class _LiveChatCompletions:
         last_error: Optional[BackendError] = None
         unusable_billed = 0
         for attempt in range(self.max_retries + 1):
+            if self.rate_limiter is not None:
+                # Every attempt, retries included, takes a paced slot: no retry storms
+                wait = self.rate_limiter.reserve()
+                if wait > 0:
+                    self._sleep(wait)
             req = urllib.request.Request(
                 f"{self.base_url}/chat/completions",
                 data=body,
@@ -403,6 +510,7 @@ class _LiveChatCompletions:
                 },
             )
             retry_after: Optional[str] = None
+            status: Optional[int] = None
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     try:
@@ -434,11 +542,17 @@ class _LiveChatCompletions:
                 if exc.code not in RETRYABLE_STATUSES:
                     raise last_error from exc
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                status = exc.code
             except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
                 # HTTPException covers IncompleteRead / BadStatusLine from a dropped connection
                 last_error = BackendError(f"Network error calling {self.base_url}: {exc}")
-            if attempt < self.max_retries:
-                self._sleep(self._backoff_delay(attempt, retry_after))
+            if status == 429 and self.rate_limiter is not None:
+                # The provider's window is shared by every thread: hold all of them (even when
+                # this call is out of retries), and let a retry wait for its slot behind the
+                # pause like everyone else instead of firing on its own timer.
+                self.rate_limiter.penalize(self._backoff_delay(attempt, retry_after, status))
+            elif attempt < self.max_retries:
+                self._sleep(self._backoff_delay(attempt, retry_after, status))
         assert last_error is not None
         last_error.billed_usd = unusable_billed * attempt_bound_usd
         raise last_error
@@ -559,6 +673,7 @@ class OpenAICompatibleClient:
         timeout: float = 120.0,
         max_retries: int = 3,
         backoff_base_s: float = 0.5,
+        requests_per_minute: Any = 0,
     ):
         timeout = _configuration_float(timeout, "timeout", minimum=0.0, inclusive=False)
         max_retries = _configuration_int(max_retries, "max_retries", minimum=0)
@@ -571,6 +686,10 @@ class OpenAICompatibleClient:
         # attempt was billed.  Meters use this to reserve the complete
         # worst-case request cost before admitting concurrent work.
         self.max_billable_attempts = max_retries + 1
+        # Request pacing (v0.45); 0 / "off" = unpaced. `create_client` resolves the operator
+        # dial (--requests-per-minute / PFP_REQUESTS_PER_MINUTE, default 80) and passes it here.
+        rate = parse_requests_per_minute(requests_per_minute)
+        self.rate_limiter = RequestRateLimiter(rate) if rate is not None else None
         self.chat = _LiveChatNamespace(
             _LiveChatCompletions(
                 base_url=self.base_url,
@@ -579,6 +698,7 @@ class OpenAICompatibleClient:
                 timeout=timeout,
                 max_retries=max_retries,
                 backoff_base_s=backoff_base_s,
+                rate_limiter=self.rate_limiter,
             )
         )
 
@@ -1357,6 +1477,7 @@ def create_client(
     seed: int = 42,
     force_cost_scale: float = 50.0,
     max_retries: int = 3,
+    requests_per_minute: Any = None,
 ) -> OpenAICompatibleClient | MockOpenAIClient:
     """
     Factory returning an OpenAI-compatible client.
@@ -1364,6 +1485,8 @@ def create_client(
     - If NEBIUS_API_KEY is set (and use_mock is not True), returns OpenAICompatibleClient.
     - Otherwise returns MockOpenAIClient with the exact same interface so the harness
       is testable end-to-end without a key, and plugs into Nebius with zero code changes.
+    - Live clients are paced to `requests_per_minute` (None: PFP_REQUESTS_PER_MINUTE, else
+      80/min; 0 / "off" disables). The mock is never paced: mock runs stay instant and exact.
     """
     resolved_key = api_key if api_key is not None else os.environ.get("NEBIUS_API_KEY", "")
     if use_mock is True or (use_mock is None and not resolved_key):
@@ -1378,4 +1501,5 @@ def create_client(
         api_key=resolved_key,
         model=model,
         max_retries=max_retries,
+        requests_per_minute=resolve_requests_per_minute(requests_per_minute) or 0,
     )

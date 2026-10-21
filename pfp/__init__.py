@@ -16,6 +16,7 @@ from .backend import (
     MeteredClient,
     MockOpenAIClient,
     OpenAICompatibleClient,
+    RequestRateLimiter,
     create_client,
     request_token_upper_bound,
 )
@@ -94,6 +95,7 @@ __all__ = [
     "MeteredClient",
     "MockOpenAIClient",
     "OpenAICompatibleClient",
+    "RequestRateLimiter",
     "create_client",
     "request_token_upper_bound",
     "coerce_bool",
