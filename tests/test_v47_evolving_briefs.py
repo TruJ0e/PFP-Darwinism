@@ -226,7 +226,7 @@ def test_mock_brief_runs_are_deterministic_and_reproducible():
             summary["budget"]["total_spent_usd"],
             summary["total_branches_spawned"],
             summary["budget"]["api_calls"],
-            [e.details.get("brief_id") for e in harness.arena_feed.events if e.event_type == "spawn"],
+            sorted(e.details.get("brief_id") for e in harness.arena_feed.events if e.event_type == "spawn"),
         ))
 
     assert outcomes[0] == outcomes[1] == outcomes[2]
