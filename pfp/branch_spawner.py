@@ -442,6 +442,48 @@ class BudgetLedger:
             return granted
 
 
+class NSShareGate:
+    """
+    Caps NS-born branches at a share of the arena's spawns (v0.43). Run 5 grew 97 NS children out
+    of 174 branches: on live latency the wall-clock cadence elapses during every branch's own probe
+    round, so every exploring branch mutated, and the population came out too mutually alien to
+    recombine (0 merges). Plaus children are the mergeable stock; NS stays the source of unknown
+    unknowns, at most `cap` of the population.
+
+    A forced tick (a starter's blind fan-out, "NS fires regardless") always runs but counts toward
+    the share. An unforced tick reserves a slot only while (NS + 1) <= cap * (spawns + 1), counting
+    every non-merge branch registered so far; the reservation is taken before the paid NS call and
+    handed back if the tick spawns no child.
+    """
+
+    def __init__(self, tracker: PFPTracker, cap: float = 0.25) -> None:
+        cap = _finite_number(cap, "ns_share_cap")
+        if not (0.0 < cap <= 1.0):
+            raise ValueError("ns_share_cap must be in (0, 1].")
+        self.tracker = tracker
+        self.cap = cap
+        self.reserved = 0
+        self.refused = 0
+        self._lock = threading.Lock()
+
+    def try_reserve(self, forced: bool = False) -> bool:
+        with self._lock:
+            spawns = sum(1 for r in self.tracker.all_records() if r.origin != "merge")
+            if not forced and (self.reserved + 1) > self.cap * (spawns + 1):
+                self.refused += 1
+                return False
+            self.reserved += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self.reserved = max(0, self.reserved - 1)
+
+    def to_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"cap": self.cap, "ns_ticks_granted": self.reserved, "ns_ticks_refused": self.refused}
+
+
 def _seed_certainty(case: Dict[str, Any]) -> float:
     """Recalled cases come from disk: a missing, non-numeric or non-finite score seeds nothing."""
     try:
@@ -532,8 +574,10 @@ class MiniHarness:
         should_stop: Optional[Callable[[], bool]] = None,
         abort_run: Optional[Callable[[], None]] = None,
         stop_reason: Optional[Callable[[], str]] = None,
+        ns_gate: Optional[NSShareGate] = None,
     ) -> None:
         self.branch_id = branch_id
+        self.ns_gate = ns_gate
         self.origin = origin
         self.should_stop: Callable[[], bool] = should_stop or (lambda: False)
         # Trips the run-wide stop when any branch fails, so its siblings and cousins start
@@ -775,6 +819,7 @@ class MiniHarness:
                 should_stop=self.should_stop,
                 abort_run=self.abort_run,
                 stop_reason=self.stop_reason,
+                ns_gate=self.ns_gate,
             )
             child.tracker.update_branch(
                 child_id,
@@ -931,6 +976,8 @@ class MiniHarness:
             and not self.should_stop()
             and self._can_afford("ns")
             and (force_ns_check or elapsed_since_ns >= self.ns_cadence_s)
+            # Last, so a slot is only reserved for a tick that will really be paid for
+            and (self.ns_gate is None or self.ns_gate.try_reserve(forced=force_ns_check))
         ):
             self.last_ns_tick = now
             ns_res = self.detector.trigger_ns(
@@ -948,9 +995,12 @@ class MiniHarness:
                     "spawned_count": len(ns_res.distinct_forks),
                 },
             )
+            ns_children = []
             if ns_res.should_split and not self.spawns_stopped:
                 ns_children = self._spawn_children_from_forks(ns_res.distinct_forks, trigger="ns")
-                self._run_children_parallel(ns_children)
+            if not ns_children and self.ns_gate is not None:
+                self.ns_gate.release()
+            self._run_children_parallel(ns_children)
 
         # 3. Conclude this branch cleanly so nothing dies mid-thought
         if not self.concluded and not self.should_stop() and self.tracker.get(self.branch_id).is_alive:
@@ -998,6 +1048,7 @@ class MainHarness:
         cluster_threshold: float = 0.5,
         max_pairs_per_round: Optional[int] = None,
         max_parallel_verdicts: int = 16,
+        ns_share_cap: float = 0.25,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
@@ -1036,6 +1087,7 @@ class MainHarness:
         self.max_parallel_verdicts = max(1, int(max_parallel_verdicts))
         self.max_winners = max(1, int(max_winners))
         self.tracker = PFPTracker()
+        self.ns_gate = NSShareGate(self.tracker, ns_share_cap)
         self.detector = IssueDetector(self.client, k_probes=k_probes, depth_dial=depth_dial)
         self.budget_ledger = BudgetLedger(
             hard_cap_usd=hard_cap_usd,
@@ -1479,6 +1531,7 @@ class MainHarness:
                     should_stop=self._should_stop,
                     abort_run=self._abort_run,
                     stop_reason=self._stop_reason,
+                    ns_gate=self.ns_gate,
                 )
             )
 
@@ -1596,6 +1649,7 @@ class MainHarness:
                     "api_n_topup_calls": self.detector.n_topup_calls,
                 },
                 "total_branches_spawned": len(self.tracker.all_records()),
+                "ns_share": self.ns_gate.to_dict(),
                 "selection": selection_summary,
                 "verified_main_line": list(self.fail_judge.verified_main_line),
                 "winners_box": self.winners_box,

@@ -295,6 +295,12 @@ def main(argv: list[str] | None = None) -> int:
         help=f"First-pass judge model for --judge-ladder tiered (default {FAST_JUDGE_MODEL})",
     )
     parser.add_argument(
+        "--ns-share-cap",
+        type=_positive_float,
+        default=0.25,
+        help="Max share of spawned branches that may be NS-born (default 0.25; starters' forced NS always fires)",
+    )
+    parser.add_argument(
         "--cluster-threshold",
         type=_positive_float,
         default=0.5,
@@ -463,6 +469,7 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         depth_decay=args.depth_decay,
         finish_reserve_ratio=args.finish_reserve_ratio,
         root_budget_override_usd=args.root_budget_usd,
+        ns_share_cap=args.ns_share_cap,
         cluster_threshold=args.cluster_threshold,
         max_pairs_per_round=args.max_pairs_per_round,
         max_parallel_verdicts=args.max_parallel_verdicts,

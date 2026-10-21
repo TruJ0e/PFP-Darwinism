@@ -362,6 +362,14 @@ the final gauntlet round and the pre-exit check (the v0.41 judge ladder, `pfp/ju
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **NS share cap (v0.43).** Run 5 grew 97 NS children out of 174 branches (56%). On live
+  latency the wall-clock NS cadence has always elapsed by the time a branch finishes its own
+  probe round, so every exploring branch mutated (the mock never showed it: its calls are
+  instant, so only the starters' forced ticks fire). NS-born branches are now capped at
+  `--ns-share-cap` (default 0.25) of non-merge spawns: an unforced tick reserves a slot before
+  its paid call only while (NS + 1) <= cap x (spawns + 1), and hands it back if no child is
+  spawned. Starters' forced ticks ("NS fires blind regardless") always run and count toward the
+  share. The run summary reports `ns_share` (granted / refused ticks).
 - **Selection that scales (v0.42).** Run 5 grew 174 branches and judged 8 alignment pairs:
   `max_pairs_to_judge=8` was hard-coded, and a round with no merge and no clash ended selection,
   so round 1 was the only round (0 merges). Each round now clusters the living (leader
