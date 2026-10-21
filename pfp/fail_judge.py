@@ -268,7 +268,7 @@ class FailJudge:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2 if not is_appeal else 0.3,
-            max_tokens=512,
+            max_tokens=1024,
         )
         cost = float(resp.usage.cost_usd)
         raw = (resp.choices[0].message.content if resp.choices else "") or ""

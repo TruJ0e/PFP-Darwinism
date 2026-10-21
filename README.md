@@ -359,6 +359,11 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **Judge calls get reasoning headroom (v0.39).** Run 3's falsifier returned "inconclusive" on
+  3 of 4 attacks: Super reasons before it answers, and at 512 tokens the JSON verdict often never
+  landed (fail-closed parsing quite rightly counts an unreadable verdict as no verdict). Judge
+  budgets (falsifier + alignment) are now 1024, matching the conclusion/merge budget. The kill
+  that did parse in run 3 shows the pipeline works when the verdict arrives. 468 tests pass.
 - **Structural floor under the difficulty estimate (v0.38).** The second live run showed the
   anchored estimator's remaining failure mode: it priced a call correctly ($0.0018 total vs the
   unanchored $50) but guessed ~6 calls for the whole arena, so the root budget funded a single
