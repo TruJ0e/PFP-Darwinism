@@ -43,11 +43,15 @@ from .branch_spawner import (
     ns_slot_priority,
 )
 from .briefs import (
+    BRIEF_FAILURE_EVENT,
+    BRIEF_MAX_TOKENS,
+    BRIEF_RETRY_MAX_TOKENS,
     ExplorationBrief,
     compute_brief_id,
     generate_starter_briefs,
     mutate_brief_for_fork,
     revise_brief_for_objection,
+    validate_brief_text,
 )
 from .alignment_detector import (
     AlignmentCandidatePair,
@@ -134,6 +138,10 @@ __all__ = [
     "generate_starter_briefs",
     "mutate_brief_for_fork",
     "revise_brief_for_objection",
+    "validate_brief_text",
+    "BRIEF_FAILURE_EVENT",
+    "BRIEF_MAX_TOKENS",
+    "BRIEF_RETRY_MAX_TOKENS",
     "AlignmentCandidatePair",
     "AlignmentDetector",
     "AlignmentJudgeResult",

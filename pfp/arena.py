@@ -89,6 +89,7 @@ CANONICAL_EVENT_TYPES: Tuple[str, ...] = (
     "kill",
     "falsification_inconclusive",
     "halt",
+    "brief_generation_failed",
 )
 
 # Events about the arena as a whole (no branch): renderers and miners must not treat them as agents

@@ -942,7 +942,10 @@ class MiniHarness:
 
         child_briefs: List[Any] = []
         if self.enable_briefs and self.directive.brief:
-            from .briefs import ExplorationBrief, mutate_brief_for_fork
+            from .briefs import BRIEF_FAILURE_EVENT, ExplorationBrief, mutate_brief_for_fork
+
+            def _journal_brief_failure(failure: Dict[str, Any]) -> None:
+                self._emit(BRIEF_FAILURE_EVENT, dict(failure, trigger=trigger))
             parent_brief_obj = ExplorationBrief(
                 brief_id=self.directive.brief_id,
                 brief=self.directive.brief,
@@ -962,6 +965,7 @@ class MiniHarness:
                     survived_objection=survived_obj,
                     is_final=is_final_child,
                     depth=self.depth + 1,
+                    on_failure=_journal_brief_failure,
                 )
                 if b_cost > 0:
                     self._spend(b_cost, f"{trigger}_child_brief_mutation", kind="brief")
@@ -1839,14 +1843,17 @@ class MainHarness:
             certainty_scores=starter_scores,
             apply_depth_decay=False,
         )
-        starter_briefs = []
-        starter_costs = []
+        starter_briefs: List[Any] = []
+        starter_costs: List[float] = []
+        # Failed brief calls, by starter index: journaled by that starter once it exists (v0.47.1)
+        starter_brief_failures: Dict[int, List[Dict[str, Any]]] = {}
         if self.enable_briefs:
             from .briefs import generate_starter_briefs
             starter_briefs, starter_costs = generate_starter_briefs(
                 client=self.client,
                 problem=problem,
                 count=len(starter_budgets),
+                on_failure=lambda f: starter_brief_failures.setdefault(int(f["starter_index"]), []).append(f),
             )
 
         for idx, s_budget in enumerate(starter_budgets):
@@ -1894,6 +1901,11 @@ class MainHarness:
             self.starters.append(starter)
             if self.enable_briefs and idx < len(starter_costs) and starter_costs[idx] > 0:
                 starter._spend(starter_costs[idx], "starter_brief_generation", kind="brief")
+            if starter_brief_failures.get(idx):
+                from .briefs import BRIEF_FAILURE_EVENT
+
+                for failure in starter_brief_failures[idx]:
+                    starter._emit(BRIEF_FAILURE_EVENT, failure)
         # The starters are one spawn cohort for slot allocation (v0.46)
         for rank, starter in enumerate(
             sorted(self.starters, key=lambda m: m._ns_content_key())

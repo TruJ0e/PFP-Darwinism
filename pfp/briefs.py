@@ -23,13 +23,23 @@ v0.47: Evolving Exploration Briefs (Truman's Design).
 4. SELECTION ACTS ON FRAMINGS:
    Brief lineage is journaled (spawn events carry brief, brief_id, and parent_brief_id)
    so the proof trail shows which framings produced survivors and which died.
+
+v0.47.1 — briefs FAIL CLOSED:
+   Brief calls go to reasoning models, so they get reasoning-class completion budgets
+   (BRIEF_MAX_TOKENS, retry at BRIEF_RETRY_MAX_TOKENS); a 200-token budget is eaten by
+   reasoning and returns empty content. A brief is only ever the model's parsed JSON
+   `brief` field after validation — never raw output, never synthesized boilerplate.
+   Every failed attempt is reported through `on_failure` (the harness journals it as a
+   `brief_generation_failed` event). After one retry a starter proceeds with NO brief,
+   a fork child inherits its parent's brief verbatim, and an objection revision keeps
+   the current brief.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .jsonutil import parse_json_object
 
@@ -48,7 +58,8 @@ class ExplorationBrief:
     - brief_id: Content-addressed unique identifier for this framing
     - brief: Concise hypothesis space framing (1-2 sentences)
     - parent_brief_id: The brief_id of the ancestor brief this evolved from
-    - trigger: Event that generated this brief ("starter", "fork_variation", "falsification_objection")
+    - trigger: Event that generated this brief ("starter", "fork_variation", "falsification_objection",
+      or "inherited" when a fork mutation failed and the child kept its parent's brief)
     - depth: Generational depth of this brief framing
     """
 
@@ -70,28 +81,125 @@ class ExplorationBrief:
         return d
 
 
+# Reasoning-class completion budgets (v0.47.1): the v0.37+ conclusion/judge class.
+BRIEF_MAX_TOKENS = 768
+BRIEF_RETRY_MAX_TOKENS = 1024
+# A brief is 1-2 sentences; anything longer is clipped at a word boundary.
+MAX_BRIEF_CHARS = 600
+# Journal event type for a failed brief call (one per failed attempt).
+BRIEF_FAILURE_EVENT = "brief_generation_failed"
+# Probe/fork payload keys: a brief carrying any of these is a leaked payload, not a framing.
+_PAYLOAD_MARKERS = ('"fork_id"', '"approach"', '"reasoning"', '"conclusion"', '"support_score"', '"fork_description"')
+
+BriefFailureSink = Callable[[Dict[str, Any]], None]
+
+
+def validate_brief_text(text: Any) -> Tuple[Optional[str], str]:
+    """
+    Validate a candidate brief. Returns (clean_text, "") or (None, reason).
+    Rejects empty text and probe-shaped payloads; clips over-long briefs.
+    """
+    if not isinstance(text, str):
+        return None, "brief_not_string"
+    cleaned = " ".join(text.strip().split())
+    if not cleaned:
+        return None, "empty_brief"
+    if cleaned[0] in "{[" or cleaned.startswith("```"):
+        return None, "payload_shaped_brief"
+    lowered = cleaned.lower()
+    if any(m in lowered for m in _PAYLOAD_MARKERS):
+        return None, "payload_markers_in_brief"
+    if len(cleaned) > MAX_BRIEF_CHARS:
+        clipped = cleaned[:MAX_BRIEF_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:")
+        cleaned = clipped or cleaned[:MAX_BRIEF_CHARS]
+    return cleaned, ""
+
+
+def _parse_brief_reply(raw: str) -> Tuple[Optional[str], str]:
+    """The brief is the parsed JSON `brief` field, validated — nothing else counts."""
+    if not raw.strip():
+        return None, "empty_content"
+    parsed = parse_json_object(raw)
+    if not parsed:
+        return None, "unparseable_json"
+    if "brief" not in parsed:
+        return None, "missing_brief_field"
+    return validate_brief_text(parsed.get("brief"))
+
+
+def _request_brief(
+    client: Any,
+    prompt: str,
+    temperature: float,
+    model: Optional[str],
+    max_tokens: int,
+    retry_max_tokens: int,
+    context: Dict[str, Any],
+    on_failure: Optional[BriefFailureSink],
+) -> Tuple[Optional[str], float]:
+    """
+    One brief call, retried ONCE at the larger budget on empty/unparseable/invalid output.
+    Every failed attempt is reported to `on_failure`. Returns (brief_text or None, total cost).
+    """
+    total_cost = 0.0
+    budgets = [int(max_tokens), int(max(retry_max_tokens, max_tokens))]
+    for attempt, budget in enumerate(budgets, start=1):
+        kwargs: Dict[str, Any] = {"temperature": temperature, "max_tokens": budget}
+        if model:
+            kwargs["model"] = model
+        resp = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            **kwargs,
+        )
+        total_cost += float(getattr(getattr(resp, "usage", None), "cost_usd", 0.0) or 0.0)
+        raw = (resp.choices[0].message.content if resp.choices else "") or ""
+        text, reason = _parse_brief_reply(raw)
+        if text is not None:
+            return text, total_cost
+        if on_failure is not None:
+            failure = dict(context)
+            failure.update(
+                {
+                    "attempt": attempt,
+                    "attempts_allowed": len(budgets),
+                    "max_tokens": budget,
+                    "reason": reason,
+                    "raw_chars": len(raw),
+                    "will_retry": attempt < len(budgets),
+                }
+            )
+            on_failure(failure)
+    return None, total_cost
+
+
 def generate_starter_briefs(
     client: Any,
     problem: str,
     count: int,
     model: Optional[str] = None,
-    max_tokens: int = 200,
-) -> tuple[List[ExplorationBrief], List[float]]:
+    max_tokens: int = BRIEF_MAX_TOKENS,
+    retry_max_tokens: int = BRIEF_RETRY_MAX_TOKENS,
+    on_failure: Optional[BriefFailureSink] = None,
+) -> tuple[List[Optional[ExplorationBrief]], List[float]]:
     """
     Generate starter exploration briefs with Coverage by Construction (v0.47).
     Each brief is generated with all previously generated briefs in view, instructed
     to cover what has not been covered. The final brief is forced toward
     'what is nobody looking at?'
+
+    Fails closed (v0.47.1): a slot whose call stays empty/unparseable/invalid after one
+    retry is None — that starter runs with no brief. Failures go to `on_failure`.
     """
     if count <= 0:
         return [], []
 
-    briefs: List[ExplorationBrief] = []
+    briefs: List[Optional[ExplorationBrief]] = []
     costs: List[float] = []
 
     for idx in range(count):
         is_final = (idx == count - 1 and count > 1)
-        prior_texts = [f"- Brief {i + 1} [{b.brief_id}]: {b.brief}" for i, b in enumerate(briefs)]
+        generated = [b for b in briefs if b is not None]
+        prior_texts = [f"- Brief {i + 1} [{b.brief_id}]: {b.brief}" for i, b in enumerate(generated)]
         priors_block = "\n".join(prior_texts) if prior_texts else "None (initial brief in population)."
 
         if is_final:
@@ -117,22 +225,20 @@ def generate_starter_briefs(
             'Return JSON: {"brief": "...", "focus_area": "..."}'
         )
 
-        kwargs: Dict[str, Any] = {"temperature": 0.7, "max_tokens": max_tokens}
-        if model:
-            kwargs["model"] = model
-        resp = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            **kwargs,
+        brief_text, cost = _request_brief(
+            client,
+            prompt,
+            temperature=0.7,
+            model=model,
+            max_tokens=max_tokens,
+            retry_max_tokens=retry_max_tokens,
+            context={"stage": "starter", "starter_index": idx, "outcome_on_failure": "no_brief"},
+            on_failure=on_failure,
         )
-        cost = float(getattr(resp.usage, "cost_usd", 0.0))
         costs.append(cost)
-
-        raw = (resp.choices[0].message.content if resp.choices else "") or ""
-        parsed = parse_json_object(raw)
-        if parsed and isinstance(parsed.get("brief"), str) and parsed["brief"].strip():
-            brief_text = parsed["brief"].strip()
-        else:
-            brief_text = raw.strip() or f"Explore distinct hypothesis space {idx + 1} for problem."
+        if brief_text is None:
+            briefs.append(None)
+            continue
 
         b_id = compute_brief_id(brief_text)
         briefs.append(
@@ -159,13 +265,19 @@ def mutate_brief_for_fork(
     is_final: bool = False,
     depth: int = 1,
     model: Optional[str] = None,
-    max_tokens: int = 200,
+    max_tokens: int = BRIEF_MAX_TOKENS,
+    retry_max_tokens: int = BRIEF_RETRY_MAX_TOKENS,
+    on_failure: Optional[BriefFailureSink] = None,
 ) -> tuple[ExplorationBrief, float]:
     """
     Mutate an exploration brief for a child branch at a fork (v0.47).
     Children spawned at a fork receive brief variations against the parent's
     brief and their siblings'. If the parent survived a falsification carrying
     an objection, the objection feeds the descendants' briefs.
+
+    The child's brief is the model's parsed, validated JSON `brief` (v0.47.1). If that
+    still fails after one retry, the child inherits the parent's brief verbatim
+    (trigger "inherited") — a real framing, never a synthesized echo.
     """
     prior_texts = [f"- Sibling [{b.brief_id}]: {b.brief}" for b in prior_sibling_briefs]
     priors_block = "\n".join(prior_texts) if prior_texts else "None (first sibling in this cohort)."
@@ -202,21 +314,25 @@ def mutate_brief_for_fork(
         'Return JSON: {"brief": "...", "focus_area": "..."}'
     )
 
-    kwargs: Dict[str, Any] = {"temperature": 0.7, "max_tokens": max_tokens}
-    if model:
-        kwargs["model"] = model
-    resp = client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        **kwargs,
+    brief_text, cost = _request_brief(
+        client,
+        prompt,
+        temperature=0.7,
+        model=model,
+        max_tokens=max_tokens,
+        retry_max_tokens=retry_max_tokens,
+        context={
+            "stage": "fork_mutation",
+            "parent_brief_id": parent_brief.brief_id,
+            "fork": str(fork_description)[:200],
+            "sibling_index": len(prior_sibling_briefs),
+            "outcome_on_failure": "inherited_parent_brief",
+        },
+        on_failure=on_failure,
     )
-    cost = float(getattr(resp.usage, "cost_usd", 0.0))
-
-    raw = (resp.choices[0].message.content if resp.choices else "") or ""
-    parsed = parse_json_object(raw)
-    if parsed and isinstance(parsed.get("brief"), str) and parsed["brief"].strip():
-        brief_text = parsed["brief"].strip()
-    else:
-        brief_text = raw.strip() or f"Specialized exploration of {fork_description} from {parent_brief.brief_id}."
+    if brief_text is None:
+        brief_text = parent_brief.brief
+        trigger = "inherited"
 
     b_id = compute_brief_id(brief_text)
     child_brief = ExplorationBrief(
@@ -236,10 +352,13 @@ def revise_brief_for_objection(
     objection: str,
     depth: int = 0,
     model: Optional[str] = None,
-    max_tokens: int = 200,
+    max_tokens: int = BRIEF_MAX_TOKENS,
+    retry_max_tokens: int = BRIEF_RETRY_MAX_TOKENS,
+    on_failure: Optional[BriefFailureSink] = None,
 ) -> tuple[ExplorationBrief, float]:
     """
     Revise a brief when a branch survives a falsification carrying an objection (v0.47).
+    A revision that still fails after one retry keeps the current brief unchanged (v0.47.1).
     """
     prompt = (
         f"mutate_exploration_brief falsification_objection depth={depth}\n"
@@ -251,21 +370,22 @@ def revise_brief_for_objection(
         'Return JSON: {"brief": "...", "focus_area": "..."}'
     )
 
-    kwargs: Dict[str, Any] = {"temperature": 0.5, "max_tokens": max_tokens}
-    if model:
-        kwargs["model"] = model
-    resp = client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        **kwargs,
+    brief_text, cost = _request_brief(
+        client,
+        prompt,
+        temperature=0.5,
+        model=model,
+        max_tokens=max_tokens,
+        retry_max_tokens=retry_max_tokens,
+        context={
+            "stage": "objection_revision",
+            "parent_brief_id": current_brief.brief_id,
+            "outcome_on_failure": "kept_current_brief",
+        },
+        on_failure=on_failure,
     )
-    cost = float(getattr(resp.usage, "cost_usd", 0.0))
-
-    raw = (resp.choices[0].message.content if resp.choices else "") or ""
-    parsed = parse_json_object(raw)
-    if parsed and isinstance(parsed.get("brief"), str) and parsed["brief"].strip():
-        brief_text = parsed["brief"].strip()
-    else:
-        brief_text = raw.strip() or f"Address objection ({objection[:80]}) from {current_brief.brief_id}."
+    if brief_text is None:
+        return current_brief, cost
 
     b_id = compute_brief_id(brief_text)
     revised = ExplorationBrief(
