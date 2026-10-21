@@ -16,22 +16,14 @@ Tests for:
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List
-
-import pytest
-
 from pfp import (
-    Directive,
     ExplorationBrief,
     MainHarness,
     MockOpenAIClient,
     compute_brief_id,
     generate_starter_briefs,
     mutate_brief_for_fork,
-    revise_brief_for_objection,
 )
-from pfp.tracker import PFPTracker
 
 
 PROBLEM = "A small business's SSH works laptop->desktop but not desktop->laptop. Diagnose the root causes and verify the solution."
@@ -144,7 +136,7 @@ def test_brief_lineage_is_journaled_in_spawn_events():
         enable_briefs=True,
         enable_selection=True,
     )
-    summary = harness.run(PROBLEM)
+    harness.run(PROBLEM)
     events = harness.arena_feed.events
 
     spawn_events = [e for e in events if e.event_type == "spawn"]
