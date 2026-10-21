@@ -301,6 +301,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Max share of spawned branches that may be NS-born (default 0.25; starters' forced NS always fires)",
     )
     parser.add_argument(
+        "--token-certainty-floor",
+        type=float,
+        default=0.0,
+        help="Siblings scoring below this get the cut probe-token tier (default 0.0; top quartile always full)",
+    )
+    parser.add_argument(
         "--cluster-threshold",
         type=_positive_float,
         default=0.5,
@@ -470,6 +476,7 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         finish_reserve_ratio=args.finish_reserve_ratio,
         root_budget_override_usd=args.root_budget_usd,
         ns_share_cap=args.ns_share_cap,
+        token_certainty_floor=args.token_certainty_floor,
         cluster_threshold=args.cluster_threshold,
         max_pairs_per_round=args.max_pairs_per_round,
         max_parallel_verdicts=args.max_parallel_verdicts,

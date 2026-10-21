@@ -34,7 +34,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .issue_detector import IssueDetectionResult, IssueDetector, ProbeContinuation
+from .issue_detector import (
+    MIN_PROBE_TOKENS,
+    PROBE_MAX_TOKENS,
+    IssueDetectionResult,
+    IssueDetector,
+    ProbeContinuation,
+)
 from .jsonutil import parse_json_object
 from .tracker import BranchRecord, BranchState, PFPTracker, id_free
 
@@ -484,6 +490,36 @@ class NSShareGate:
             return {"cap": self.cap, "ns_ticks_granted": self.reserved, "ns_ticks_refused": self.refused}
 
 
+# v0.44 "spend follows the living": per-call probe token caps by sibling standing.
+# (top quartile, the rest, below the certainty floor)
+DEFAULT_PROBE_TOKEN_TIERS = (1.0, 0.75, 0.5)
+
+
+def sibling_token_scales(
+    scores: Sequence[float],
+    *,
+    certainty_floor: float = 0.0,
+    tiers: Sequence[float] = DEFAULT_PROBE_TOKEN_TIERS,
+) -> List[float]:
+    """
+    Probe-budget scale per sibling, for siblings already ordered strongest first: the top quartile
+    (at least one) gets full completions, siblings whose score is below `certainty_floor` get the
+    cut tier, everyone else the middle tier. Scores are the same certainty + cluster support that
+    weight the dollar split, so tokens follow the money.
+    """
+    top, middle, cut = (float(t) for t in tiers)
+    n_top = max(1, math.ceil(len(scores) / 4))
+    out: List[float] = []
+    for idx, score in enumerate(scores):
+        if idx < n_top:
+            out.append(top)
+        elif not (isinstance(score, (int, float)) and math.isfinite(score)) or score < certainty_floor:
+            out.append(cut)
+        else:
+            out.append(middle)
+    return out
+
+
 def _seed_certainty(case: Dict[str, Any]) -> float:
     """Recalled cases come from disk: a missing, non-numeric or non-finite score seeds nothing."""
     try:
@@ -575,9 +611,14 @@ class MiniHarness:
         abort_run: Optional[Callable[[], None]] = None,
         stop_reason: Optional[Callable[[], str]] = None,
         ns_gate: Optional[NSShareGate] = None,
+        token_scale: float = 1.0,
+        token_policy: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.branch_id = branch_id
         self.ns_gate = ns_gate
+        # Share of the full probe / NS completion budget this branch's calls may use (v0.44)
+        self.token_scale = max(0.0, min(1.0, float(token_scale)))
+        self.token_policy: Dict[str, Any] = dict(token_policy or {})
         self.origin = origin
         self.should_stop: Callable[[], bool] = should_stop or (lambda: False)
         # Trips the run-wide stop when any branch fails, so its siblings and cousins start
@@ -626,6 +667,7 @@ class MiniHarness:
 
         spawn_details: Dict[str, Any] = {
             "depth": self.depth,
+            "probe_max_tokens": self.probe_max_tokens,
             "directive": self.directive.to_dict(),
             "ns_cadence_s": round(self.ns_cadence_s, 4) if self.ns_cadence_s != float("inf") else None,
         }
@@ -635,6 +677,10 @@ class MiniHarness:
             # The journal names its own problem: replays and proof reports need no --problem.
             spawn_details["problem"] = str(problem)[:MAX_STREAM_PROBLEM_CHARS]
         self._emit("spawn", spawn_details)
+
+    @property
+    def probe_max_tokens(self) -> int:
+        return max(MIN_PROBE_TOKENS, int(round(PROBE_MAX_TOKENS * self.token_scale)))
 
     def _emit(self, event_type: str, details: Dict[str, Any]) -> None:
         rec = self.tracker.get(self.branch_id)
@@ -776,6 +822,11 @@ class MiniHarness:
             return []
 
         ordered_forks = ordered_forks[: len(child_budgets)]
+        token_scales = sibling_token_scales(
+            sibling_scores[: len(child_budgets)],
+            certainty_floor=float(self.token_policy.get("certainty_floor", 0.0)),
+            tiers=self.token_policy.get("tiers", DEFAULT_PROBE_TOKEN_TIERS),
+        )
         total_child_pool = round(sum(child_budgets), 6)
 
         # Transfer child pool from parent to children (not spent on API yet, just re-allocated)
@@ -794,7 +845,7 @@ class MiniHarness:
         self._evaluate_graceful_degradation(new_parent_budget)
 
         spawned: List[MiniHarness] = []
-        for fork, c_budget in zip(ordered_forks, child_budgets):
+        for fork, c_budget, t_scale in zip(ordered_forks, child_budgets, token_scales):
             child_id = self.branch_counter()
             directive = Directive(
                 parent_reasoning_compressed=compressed,
@@ -820,6 +871,8 @@ class MiniHarness:
                 abort_run=self.abort_run,
                 stop_reason=self.stop_reason,
                 ns_gate=self.ns_gate,
+                token_scale=t_scale,
+                token_policy=self.token_policy,
             )
             child.tracker.update_branch(
                 child_id,
@@ -937,6 +990,7 @@ class MiniHarness:
             parent_reasoning=parent_context,
             depth=self.depth,
             known_forks=known_forks,
+            max_tokens=self.probe_max_tokens,
         )
         self._spend(plaus_res.cost_usd, "plaus_issue_detection", kind="plaus")
         cluster_bonus = plaus_res.distinct_forks[0].support_score if plaus_res.distinct_forks else 0.0
@@ -986,6 +1040,7 @@ class MiniHarness:
                 depth=self.depth,
                 fanout_count=1,
                 known_forks=self.tracker.known_forks_in_lineage(self.branch_id),
+                max_tokens=self.probe_max_tokens,
             )
             self._spend(ns_res.cost_usd, "ns_blind_variation", kind="ns")
             self._emit(
@@ -1049,6 +1104,8 @@ class MainHarness:
         max_pairs_per_round: Optional[int] = None,
         max_parallel_verdicts: int = 16,
         ns_share_cap: float = 0.25,
+        token_certainty_floor: float = 0.0,
+        probe_token_tiers: Sequence[float] = DEFAULT_PROBE_TOKEN_TIERS,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
@@ -1088,6 +1145,13 @@ class MainHarness:
         self.max_winners = max(1, int(max_winners))
         self.tracker = PFPTracker()
         self.ns_gate = NSShareGate(self.tracker, ns_share_cap)
+        tiers = tuple(_finite_number(t, "probe_token_tiers") for t in probe_token_tiers)
+        if len(tiers) != 3 or not all(0.0 < t <= 1.0 for t in tiers) or not tiers[0] >= tiers[1] >= tiers[2]:
+            raise ValueError("probe_token_tiers must be 3 descending scales in (0, 1] (top, middle, cut).")
+        self.token_policy: Dict[str, Any] = {
+            "certainty_floor": _finite_number(token_certainty_floor, "token_certainty_floor"),
+            "tiers": tiers,
+        }
         self.detector = IssueDetector(self.client, k_probes=k_probes, depth_dial=depth_dial)
         self.budget_ledger = BudgetLedger(
             hard_cap_usd=hard_cap_usd,
@@ -1532,6 +1596,7 @@ class MainHarness:
                     abort_run=self._abort_run,
                     stop_reason=self._stop_reason,
                     ns_gate=self.ns_gate,
+                    token_policy=self.token_policy,
                 )
             )
 
