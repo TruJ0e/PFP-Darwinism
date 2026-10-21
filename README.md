@@ -359,6 +359,18 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **The judge ladder (v0.41).** Every judge used to be Super: in run 5 it was 55% of spend
+  (68% in run 1), each verdict took ~10-50 s because Super reasons before it answers, and at
+  512 tokens run 3 lost three of four verdicts under that reasoning. First-pass judging —
+  claim extraction, alignment verdicts, background / NS / post-merge / contradiction attacks
+  and gauntlet rounds before the last — now runs on a fast instruct model
+  (`FAST_JUDGE_MODEL`, Qwen3-235B-A22B-Instruct-2507, $0.20/$0.60 per 1M). Super keeps every
+  appeal, the final gauntlet round, the pre-exit check and merge synthesis, and has the last
+  word on every kill: a fast-rung kill is appealed to Super, and when the branch's one appeal
+  is already spent the kill escalates once to Super before it can stand (a verdictless
+  escalation kills nothing). Provenance records which rung judged each survival
+  (`fast_judge_primary`, `super_judge_primary`, `super_judge_appeal_secondary`,
+  `super_judge_escalation`). `--fast-judge-model none` restores the all-Super arena.
 - **Operator budget dials (v0.40).** The allocation percentages Truman's design argues about
   were constructor-only: `depth_decay` (children inherit 50% of the pool per generation — the
   reason live trees grew one generation deep and stopped) and `finish_reserve_ratio`, plus the

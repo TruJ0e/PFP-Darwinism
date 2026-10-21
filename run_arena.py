@@ -33,6 +33,7 @@ from pfp import (
     VersionRegistry,
     create_client,
 )
+from pfp.backend import FAST_JUDGE_MODEL
 from pfp.arena import is_journal_digest, stream_problem
 from pfp.fsutil import StateLockError, atomic_write_text, exclusive_lock
 from pfp.proof_report import write_proof_report
@@ -276,6 +277,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--depth-decay", type=_positive_float, default=0.5, help="Child budget inheritance per generation (default 0.5)")
     parser.add_argument("--finish-reserve-ratio", type=_positive_float, default=0.125, help="Finish reserve share of root (default 0.125)")
     parser.add_argument("--root-budget-usd", type=_positive_float, default=None, help="Operator root budget override in USD (default: sized from difficulty estimate)")
+    parser.add_argument(
+        "--fast-judge-model",
+        type=str,
+        default=FAST_JUDGE_MODEL,
+        help=f"First rung of the judge ladder (default {FAST_JUDGE_MODEL}); 'none' = every judge on Super",
+    )
     parser.add_argument("--depth-dial", type=_positive_int, default=3, help="Depth dial bounding fan-out")
     parser.add_argument("--k-probes", type=_positive_int, default=3, help="Number of blind probe continuations per step")
     parser.add_argument("--gauntlet-rounds", type=_positive_int, default=3, help="Pass-readiness gauntlet rounds (default 3)")
@@ -430,6 +437,7 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         depth_decay=args.depth_decay,
         finish_reserve_ratio=args.finish_reserve_ratio,
         root_budget_override_usd=args.root_budget_usd,
+        fast_judge_model=None if args.fast_judge_model.strip().lower() in ("", "none") else args.fast_judge_model.strip(),
         enable_selection=True,
         version_registry=registry,
         seed_cases=loop.recall(args.problem, k=args.starters),

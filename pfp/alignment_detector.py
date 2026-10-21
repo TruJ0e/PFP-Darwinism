@@ -205,11 +205,16 @@ class AlignmentDetector:
         prefilter_threshold: float = 0.20,
         embedding_dim: int = 128,
         super_model: str = SUPER_MODEL,
+        judge_model: Optional[str] = None,
     ) -> None:
         self.client = client
         self.prefilter_threshold = prefilter_threshold
         self.embedding_dim = embedding_dim
         self.super_model = super_model
+        # Judge ladder (v0.41): claim extraction and pair verdicts are first-pass judging, so the
+        # arena routes them to the fast judge. A wrong verdict is never final — a bad merge still
+        # faces the falsifier, a false contradiction still needs a Super-appealed kill.
+        self.judge_model = judge_model or super_model
         self._claims_cache: Dict[Tuple[str, int], List[str]] = {}
         # Pairs already judged at their current trace versions — never pay Super twice for the same verdict
         self._judged_pairs: set = set()
@@ -263,7 +268,7 @@ class AlignmentDetector:
 
         pos_text = branch_position_text(branch)
         resp = self.client.chat.completions.create(
-            model=self.super_model,
+            model=self.judge_model,
             messages=[
                 {
                     "role": "system",
@@ -333,7 +338,7 @@ class AlignmentDetector:
             "overlapping_claims, contradictory_claims, disjoint_claims, and rationale."
         )
         resp = self.client.chat.completions.create(
-            model=self.super_model,
+            model=self.judge_model,
             messages=[
                 {
                     "role": "system",

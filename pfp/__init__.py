@@ -9,6 +9,7 @@ Tagline: "Nebius — survival of the fittest."
 from .backend import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
+    FAST_JUDGE_MODEL,
     SUPER_MODEL,
     BackendError,
     HardCapExceededError,
@@ -86,6 +87,7 @@ from .arena_html import build_arena_html
 __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
+    "FAST_JUDGE_MODEL",
     "SUPER_MODEL",
     "BackendError",
     "HardCapExceededError",

@@ -31,11 +31,17 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
 DEFAULT_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
 SUPER_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+# First rung of the judge ladder (v0.41): a non-reasoning instruct model answers with the JSON
+# verdict immediately, where Super spends its completion budget reasoning first (live run 3:
+# three of four verdicts buried under reasoning at 512 tokens). Super keeps appeals, the final
+# gauntlet round, the pre-exit check and merge synthesis.
+FAST_JUDGE_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 # Live catalog pricing from DESIGN.md (USD per 1M tokens in/out)
 MODEL_PRICING_PER_1M: Dict[str, tuple[float, float]] = {
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B": (0.06, 0.24),
     "nvidia/nemotron-3-super-120b-a12b": (0.30, 0.90),
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": (0.20, 0.60),
 }
 # Unknown models must not silently get the cheapest known price: that would make
 # the hard-cap preflight optimistic.  Use the most expensive catalog rates as a

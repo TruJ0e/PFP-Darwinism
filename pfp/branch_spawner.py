@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from .backend import FAST_JUDGE_MODEL
 from .issue_detector import IssueDetectionResult, IssueDetector, ProbeContinuation
 from .jsonutil import parse_json_object
 from .tracker import BranchRecord, BranchState, PFPTracker, id_free
@@ -994,6 +995,7 @@ class MainHarness:
         depth_decay: float = 0.5,
         finish_reserve_ratio: float = 0.125,
         root_budget_override_usd: Optional[float] = None,
+        fast_judge_model: Optional[str] = FAST_JUDGE_MODEL,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
@@ -1038,7 +1040,11 @@ class MainHarness:
         self._stop_event = threading.Event()
         self._abort_reason: Optional[str] = None
 
-        self.alignment_detector = AlignmentDetector(self.client)
+        # Judge ladder (v0.41): first-pass judging on a fast instruct model, Super for appeals,
+        # escalations, the final gauntlet round, the pre-exit check and merge synthesis.
+        # None (or the Super model id) puts every judge back on Super.
+        self.fast_judge_model: Optional[str] = fast_judge_model or None
+        self.alignment_detector = AlignmentDetector(self.client, judge_model=self.fast_judge_model)
         self.merge_synthesizer = MergeSynthesizer(
             client=self.client,
             tracker=self.tracker,
@@ -1051,6 +1057,7 @@ class MainHarness:
             detector=self.detector,
             budget_ledger=self.budget_ledger,
             gauntlet_rounds=gauntlet_rounds,
+            fast_model=self.fast_judge_model,
             event_sink=self._on_event,
         )
         self.winners_box: List[Dict[str, Any]] = []
@@ -1499,6 +1506,7 @@ class MainHarness:
             return {
                 "problem": problem,
                 "model": getattr(self.client, "model", ""),
+                "fast_judge_model": self.fast_judge_model,
                 "base_url": getattr(self.client, "base_url", ""),
                 "is_mock": getattr(self.client, "is_mock", False),
                 "active_version_id": active_version_id,
