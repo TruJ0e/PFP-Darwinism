@@ -367,7 +367,9 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   wall-clock NS cadence rarely elapses and the cap never binds there (3 NS of 37); with the
   cadence forced to live rates on the 9-starter unfiltered mock, NS fell from 36% to 25% and
   merges rose from 12 to 23. Where the cap binds, *which* branches get the slots follows
-  thread timing, like the wall-clock cadence it gates (see the v0.43 note in the run report).
+  thread timing, exactly like the wall-clock NS cadence it gates; moving NS onto the arena's
+  logical clock (so live and mock fire alike, reproducibly) needs a deterministic slot
+  allocation and is left as the next step.
 - **Selection that scales (v0.42).** Selection judged at most 8 alignment pairs per round,
   hard-coded, at any population, and ended the moment one round found nothing: run 5 put 174
   branches through selection, judged 8 alignments, merged nothing and quit after round 1.
