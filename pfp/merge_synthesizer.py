@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .alignment_detector import AlignmentJudgeResult, branch_position_text, fence_untrusted
 from .backend import SUPER_MODEL
@@ -229,6 +230,68 @@ class MergeSynthesizer:
         5. Register the child in `BranchState.POSSIBLE` (never Pass), carrying full provenance and
            incremented `merges_attracted`.
         """
+        self._validate(branch_a_id, branch_b_id, child_branch_id, alignment)
+        raw, synth_cost = self._synthesis_call(branch_a_id, branch_b_id, alignment)
+        return self._land(branch_a_id, branch_b_id, child_branch_id, raw, synth_cost)
+
+    def merge_many(
+        self,
+        merges: Sequence[Tuple[str, str, str, Optional[AlignmentJudgeResult]]],
+        max_parallel: int = 8,
+    ) -> List[MergeSynthesisResult]:
+        """
+        Several merges of pairwise-disjoint parents (v0.42): every request is validated first
+        (a refused merge spends nothing), the synthesis calls run concurrently, and the merges
+        land one by one in request order, so the tracker, ledger and journal read the same on
+        every run. A failed call (e.g. the hard cap) still books its paid siblings, then re-raises.
+        """
+        named: set = set()
+        for branch_a_id, branch_b_id, child_branch_id, alignment in merges:
+            if {branch_a_id, branch_b_id} & named:
+                raise ValueError(f"merge_many parents must be disjoint ({branch_a_id}, {branch_b_id})")
+            named.update((branch_a_id, branch_b_id))
+            self._validate(branch_a_id, branch_b_id, child_branch_id, alignment)
+        calls: List[Any] = []
+        if len(merges) == 1:
+            a, b, _, al = merges[0]
+            try:
+                calls.append(self._synthesis_call(a, b, al))
+            except Exception as exc:
+                calls.append(exc)
+        elif merges:
+            with ThreadPoolExecutor(max_workers=max(1, min(len(merges), int(max_parallel)))) as pool:
+                futures = [pool.submit(self._synthesis_call, a, b, al) for a, b, _, al in merges]
+                for fut in futures:
+                    try:
+                        calls.append(fut.result())
+                    except Exception as exc:
+                        calls.append(exc)
+        failure = next((c for c in calls if isinstance(c, BaseException)), None)
+        if failure is not None:
+            # Paid syntheses that will never land are booked as overdraft, never hidden
+            if self.budget_ledger is not None:
+                for c in calls:
+                    if not isinstance(c, BaseException):
+                        self.budget_ledger.record_spend(c[1], covered_usd=0.0)
+            raise failure
+        results: List[MergeSynthesisResult] = []
+        for idx, ((branch_a_id, branch_b_id, child_branch_id, _), (raw, synth_cost)) in enumerate(zip(merges, calls)):
+            try:
+                results.append(self._land(branch_a_id, branch_b_id, child_branch_id, raw, synth_cost))
+            except Exception:
+                if self.budget_ledger is not None:
+                    for _, unlanded_cost in calls[idx + 1:]:
+                        self.budget_ledger.record_spend(unlanded_cost, covered_usd=0.0)
+                raise
+        return results
+
+    def _validate(
+        self,
+        branch_a_id: str,
+        branch_b_id: str,
+        child_branch_id: str,
+        alignment: Optional[AlignmentJudgeResult],
+    ) -> None:
         # Fail closed before the Super call: a refused merge must spend nothing and absorb nothing
         if branch_a_id == branch_b_id:
             # Absorbed -> Absorbed is a silent no-op, so a self-merge would double-count one budget
@@ -241,11 +304,15 @@ class MergeSynthesizer:
                 f"Alignment verdict for ({alignment.branch_a_id}, {alignment.branch_b_id}) "
                 f"does not cover merge pair ({branch_a_id}, {branch_b_id})"
             )
+        self._require_alive(self.tracker.get(branch_a_id))
+        self._require_alive(self.tracker.get(branch_b_id))
+
+    def _synthesis_call(
+        self, branch_a_id: str, branch_b_id: str, alignment: Optional[AlignmentJudgeResult]
+    ) -> Tuple[str, float]:
+        """The paid Super synthesis call; returns (raw reply, cost). Changes no state."""
         parent_a = self.tracker.get(branch_a_id)
         parent_b = self.tracker.get(branch_b_id)
-        self._require_alive(parent_a)
-        self._require_alive(parent_b)
-
         pos_a = fence_untrusted(branch_position_text(parent_a))
         pos_b = fence_untrusted(branch_position_text(parent_b))
         overlap_hint = alignment.overlapping_claims if alignment else []
@@ -276,7 +343,11 @@ class MergeSynthesizer:
         )
         synth_cost = max(0.0, float(resp.usage.cost_usd))
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
+        return raw, synth_cost
 
+    def _land(
+        self, branch_a_id: str, branch_b_id: str, child_branch_id: str, raw: str, synth_cost: float
+    ) -> MergeSynthesisResult:
         # The Super call is the window in which another worker could kill or absorb a parent, or
         # take the child id. Re-check and write under one tracker lock so the merge lands whole
         # (both parents absorbed, child registered) or not at all — never a parent absorbed and

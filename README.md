@@ -362,6 +362,20 @@ the final gauntlet round and the pre-exit check (the v0.41 judge ladder, `pfp/ju
   (`score_yardstick: "reference_evidence_v3"`; older scores are not comparable). Invented schedule
   names, duplicate rounds, surplus gauntlet rounds, and malformed modern provenance earn no credit.
   Legacy records with no provenance key retain their historical score for replay compatibility.
+- **Selection that scales (v0.42).** Run 5 grew 174 branches and judged 8 alignment pairs:
+  `max_pairs_to_judge=8` was hard-coded, and a round with no merge and no clash ended selection,
+  so round 1 was the only round (0 merges). Each round now clusters the living (leader
+  clustering at `--cluster-threshold`, default 0.5 cosine, champion = highest certainty),
+  plans a matching — merge candidates within clusters first, then champions across clusters,
+  each branch at most once per round, up to alive/2 pairs (`--max-pairs-per-round` caps it only
+  if asked) — and rounds continue while they still buy coverage (pairs are never re-judged at
+  the same trace versions), up to `--selection-rounds`. The round's verdicts, merge syntheses,
+  post-merge checks, contradiction attacks and the NS sweep run as concurrent batches
+  (`--max-parallel-verdicts`, default 16) and commit one by one in a fixed order, so outcomes,
+  journal and spend stay reproducible; a hard-cap hit mid-batch still books every paid sibling
+  call before the run halts. Until a merge's real cost has been observed, the merge batch is a
+  single merge, so the budget gate still learns before committing to the rest. Each round's
+  coverage is reported in `selection.coverage`.
 - **Judge ladder (v0.41).** Every verdict was Super's. Live, a Super verdict took ~10-50 s
   (it reasons before it answers), judging was 55-68% of spend, and run 3 lost 3 of 4 attacks
   to a verdict buried under reasoning. First-pass judging (claim extraction, alignment verdicts,

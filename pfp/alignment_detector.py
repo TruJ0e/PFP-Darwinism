@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
@@ -41,6 +42,28 @@ class AlignmentCandidatePair:
     branch_b_id: str
     cosine_similarity: float
     passed_prefilter: bool
+
+
+@dataclass
+class AlignmentPlan:
+    """One selection round's alignment coverage (v0.42): who clusters with whom, what gets judged."""
+
+    alive: int
+    clusters: Dict[str, List[str]]  # champion id -> member ids (champion first)
+    pairs: List[AlignmentCandidatePair]
+    within_cluster_pairs: int
+    champion_pairs: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        sizes = sorted((len(m) for m in self.clusters.values()), reverse=True)
+        return {
+            "alive": self.alive,
+            "clusters": len(self.clusters),
+            "cluster_sizes": sizes,
+            "pairs_planned": len(self.pairs),
+            "within_cluster_pairs": self.within_cluster_pairs,
+            "champion_pairs": self.champion_pairs,
+        }
 
 
 @dataclass
@@ -386,6 +409,133 @@ class AlignmentDetector:
             rationale=rationale,
             cost_usd=round(total_cost, 6),
         )
+
+    @staticmethod
+    def _pair_key(ba: BranchRecord, bb: BranchRecord) -> tuple:
+        return tuple(sorted([(ba.id, len(ba.reasoning_trace)), (bb.id, len(bb.reasoning_trace))]))
+
+    def plan_pairs(
+        self,
+        branches: Sequence[BranchRecord],
+        *,
+        cluster_threshold: float = 0.5,
+        max_pairs: Optional[int] = None,
+        roots_of: Optional[Callable[[str], FrozenSet[str]]] = None,
+    ) -> AlignmentPlan:
+        """
+        Plan one round of alignment coverage that scales with the population (v0.42).
+
+        1. Cluster: branches in certainty order (content order on ties) each join the most similar
+           existing champion at cosine >= `cluster_threshold`, else found a cluster as its champion.
+           Leader clustering, not single-link: one chain of near neighbours can't swallow the arena.
+        2. Within clusters, where compatibility lives, prefilter-passing pairs are merge candidates.
+        3. Across clusters, champions face each other: the contradictions worth a fight.
+        4. A greedy matching (similarity first, cross-subtree on ties) takes each branch at most
+           once per round, so every verdict can act (no paid verdict on a branch an earlier overlap
+           is about to absorb) and the calls can run concurrently. Pairs already judged at their
+           current trace versions are skipped. Up to alive/2 pairs per round, `max_pairs` if set.
+        """
+        by_id = {b.id: b for b in branches if b.is_alive}
+        all_pairs = self.embedding_prefilter(list(by_id.values()))
+        sim: Dict[FrozenSet[str], float] = {
+            frozenset((c.branch_a_id, c.branch_b_id)): c.cosine_similarity for c in all_pairs
+        }
+
+        champions: List[str] = []
+        cluster_of: Dict[str, str] = {}
+        members: Dict[str, List[str]] = {}
+        for rec in sorted(by_id.values(), key=lambda r: (-r.certainty_score, content_order_key(r))):
+            best, best_sim = None, None
+            for champ in champions:
+                # Parent-child pairs carry no similarity (never compared): no shared cluster
+                value = sim.get(frozenset((rec.id, champ)))
+                if value is None or value < cluster_threshold:
+                    continue
+                if best_sim is None or value > best_sim:
+                    best, best_sim = champ, value
+            if best is None:
+                champions.append(rec.id)
+                best = rec.id
+                members[best] = []
+            cluster_of[rec.id] = best
+            members[best].append(rec.id)
+
+        candidates = [c for c in all_pairs if c.passed_prefilter]
+        if roots_of is not None:
+            roots: Dict[str, FrozenSet[str]] = {bid: frozenset(roots_of(bid)) for bid in by_id}
+
+            def _same_subtree(c: AlignmentCandidatePair) -> int:
+                return 1 if (roots[c.branch_a_id] & roots[c.branch_b_id]) else 0
+
+            candidates.sort(key=lambda c: (-c.cosine_similarity, _same_subtree(c)))
+        champion_set = set(champions)
+        within = [c for c in candidates if cluster_of[c.branch_a_id] == cluster_of[c.branch_b_id]]
+        across = [
+            c for c in candidates
+            if cluster_of[c.branch_a_id] != cluster_of[c.branch_b_id]
+            and c.branch_a_id in champion_set and c.branch_b_id in champion_set
+        ]
+
+        planned: List[AlignmentCandidatePair] = []
+        used: set = set()
+        counts = {"within": 0, "across": 0}
+        for kind, pool in (("within", within), ("across", across)):
+            for cand in pool:
+                if max_pairs is not None and len(planned) >= max_pairs:
+                    break
+                if cand.branch_a_id in used or cand.branch_b_id in used:
+                    continue
+                if self._pair_key(by_id[cand.branch_a_id], by_id[cand.branch_b_id]) in self._judged_pairs:
+                    continue
+                planned.append(cand)
+                used.update((cand.branch_a_id, cand.branch_b_id))
+                counts[kind] += 1
+        return AlignmentPlan(
+            alive=len(by_id),
+            clusters={champ: list(members[champ]) for champ in champions},
+            pairs=planned,
+            within_cluster_pairs=counts["within"],
+            champion_pairs=counts["across"],
+        )
+
+    def judge_planned(
+        self,
+        branches: Sequence[BranchRecord],
+        plan: AlignmentPlan,
+        *,
+        max_parallel: int = 16,
+    ) -> Tuple[List[AlignmentJudgeResult], Optional[BaseException]]:
+        """
+        Judge a round's planned pairs concurrently (each branch is in at most one pair, so no two
+        calls share a claim extraction). Returns the verdicts in plan order plus the first failure,
+        if any: every completed verdict was paid for and must still be booked by the caller.
+        """
+        by_id = {b.id: b for b in branches}
+        work = []
+        for cand in plan.pairs:
+            ba, bb = by_id.get(cand.branch_a_id), by_id.get(cand.branch_b_id)
+            if ba is None or bb is None or not ba.is_alive or not bb.is_alive:
+                continue
+            self._judged_pairs.add(self._pair_key(ba, bb))
+            work.append((ba, bb, cand.cosine_similarity))
+        outcomes: List[Any] = []
+        if len(work) <= 1:
+            for ba, bb, cos in work:
+                try:
+                    outcomes.append(self.judge_pair(ba, bb, cosine_sim=cos))
+                except Exception as exc:
+                    outcomes.append(exc)
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, min(len(work), int(max_parallel)))) as pool:
+                futures = [pool.submit(self.judge_pair, ba, bb, cos) for ba, bb, cos in work]
+                for fut in futures:
+                    try:
+                        outcomes.append(fut.result())
+                    except Exception as exc:
+                        outcomes.append(exc)
+        results = [o for o in outcomes if not isinstance(o, BaseException)]
+        failure = next((o for o in outcomes if isinstance(o, BaseException)), None)
+        return results, failure
 
     def detect_alignments(
         self,

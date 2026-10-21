@@ -294,6 +294,24 @@ def main(argv: list[str] | None = None) -> int:
         default=FAST_JUDGE_MODEL,
         help=f"First-pass judge model for --judge-ladder tiered (default {FAST_JUDGE_MODEL})",
     )
+    parser.add_argument(
+        "--cluster-threshold",
+        type=_positive_float,
+        default=0.5,
+        help="Cosine at which branches share a selection cluster (default 0.5)",
+    )
+    parser.add_argument(
+        "--max-pairs-per-round",
+        type=_positive_int,
+        default=None,
+        help="Cap on alignment pairs judged per selection round (default: population-scaled, up to alive/2)",
+    )
+    parser.add_argument(
+        "--max-parallel-verdicts",
+        type=_positive_int,
+        default=16,
+        help="Concurrent judge / merge calls per selection batch (default 16)",
+    )
     parser.add_argument("--selection-rounds", type=_positive_int, default=3, help="Max align/merge/contradiction rounds")
     parser.add_argument("--stream-out", type=str, default="", help="Optional JSONL path to save append-only ArenaFeed")
     parser.add_argument("--html-out", type=str, default="", help="Optional HTML path to export Tron Arena player")
@@ -445,6 +463,9 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         depth_decay=args.depth_decay,
         finish_reserve_ratio=args.finish_reserve_ratio,
         root_budget_override_usd=args.root_budget_usd,
+        cluster_threshold=args.cluster_threshold,
+        max_pairs_per_round=args.max_pairs_per_round,
+        max_parallel_verdicts=args.max_parallel_verdicts,
         judge_ladder=(
             JudgeLadder.super_only() if args.judge_ladder == "super" else JudgeLadder(first_pass_model=args.first_pass_judge)
         ),

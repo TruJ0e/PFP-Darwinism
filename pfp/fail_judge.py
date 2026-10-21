@@ -25,6 +25,7 @@ exits survived — not that only one can.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -96,6 +97,16 @@ class FalsificationOutcome:
         }
 
 
+@dataclass
+class FalsificationRequest:
+    """One scheduled attack for `FailJudge.falsify_many`."""
+
+    branch_id: str
+    schedule_trigger: str
+    angle: Optional[FalsifierAngle] = None
+    extra_context: str = ""
+
+
 class FailJudge:
     """
     Piece 6: Fail judge — falsification as a heartbeat.
@@ -124,6 +135,7 @@ class FailJudge:
         super_model: str = SUPER_MODEL,
         event_sink: Optional[Callable[[HarnessEvent], None]] = None,
         ladder: Optional[JudgeLadder] = None,
+        max_parallel_verdicts: int = 16,
     ) -> None:
         self.client = client
         self.tracker = tracker
@@ -137,6 +149,8 @@ class FailJudge:
         self.ladder = ladder if ladder is not None else JudgeLadder(final_model=super_model)
         self.super_model = self.ladder.final_model
         self.event_sink = event_sink
+        # Concurrent judge calls per batch (the meter's own semaphore still bounds in-flight calls)
+        self.max_parallel_verdicts = max(1, int(max_parallel_verdicts))
 
         self._angle_cursor: int = 0
         self.last_background_sample_at: float = 0.0
@@ -309,68 +323,180 @@ class FailJudge:
           * If the appeal fails (or appeal already used): branch transitions to `BranchState.FAIL`
             (dead, no resurrection).
         """
-        rec = self.tracker.get(branch_id)
-        chosen_angle = angle or self.next_angle_for_branch(branch_id)
-        primary_model = self.ladder.falsifier_model(schedule_trigger, self.gauntlet_rounds)
-        primary_judge = self.ladder.judge_id(primary_model)
+        request = FalsificationRequest(branch_id, schedule_trigger, angle=angle, extra_context=extra_context)
+        return self.falsify_many([request])[0]
 
-        if not rec.is_alive:
+    def falsify_many(self, requests: Sequence["FalsificationRequest"]) -> List[FalsificationOutcome]:
+        """
+        Falsify several branches at once (v0.42). Judge calls are independent, so the primary
+        attacks run concurrently, then the appeals; every verdict is committed sequentially in
+        request order, so outcomes, events and spend are the same on every run (a branch named
+        twice is falsified in a later wave, after its first verdict lands).
+
+        Callers batch only verdicts that cannot change one another's prompts: a commit that
+        revokes a Pass rewrites the verified main line, which a sequential caller's next prompt
+        would quote. Selection batches the NS sweep and contradiction attacks, which run before
+        any branch is Pass.
+        """
+        outcomes: List[Optional[FalsificationOutcome]] = [None] * len(requests)
+        pending = list(enumerate(requests))
+        while pending:
+            wave: List[tuple] = []
+            later: List[tuple] = []
+            named: set = set()
+            for idx, req in pending:
+                (later if req.branch_id in named else wave).append((idx, req))
+                named.add(req.branch_id)
+            for (idx, _), out in zip(wave, self._falsify_wave([req for _, req in wave])):
+                outcomes[idx] = out
+            pending = later
+        return [o for o in outcomes if o is not None]
+
+    def _parallel_calls(self, thunks: Sequence[Callable[[], Any]]) -> List[Any]:
+        """
+        Run independent judge calls concurrently; results come back in submission order. Every
+        call is waited for, so nothing is left in flight; a failure (e.g. the hard cap) comes
+        back in place as the exception, for the caller to book the paid siblings and re-raise.
+        """
+        if len(thunks) <= 1:
+            out: List[Any] = []
+            for thunk in thunks:
+                try:
+                    out.append(thunk())
+                except Exception as exc:  # settled and re-raised by the caller
+                    out.append(exc)
+            return out
+        workers = max(1, min(len(thunks), self.max_parallel_verdicts))
+        results: List[Any] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(thunk) for thunk in thunks]
+            for fut in futures:
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    results.append(exc)
+        return results
+
+    def _falsify_wave(self, requests: Sequence["FalsificationRequest"]) -> List[FalsificationOutcome]:
+        """One verdict per distinct branch: plan in order, call concurrently, commit in order."""
+        plans: List[Dict[str, Any]] = []
+        for req in requests:
+            rec = self.tracker.get(req.branch_id)
+            chosen_angle = req.angle or self.next_angle_for_branch(req.branch_id)
+            primary_model = self.ladder.falsifier_model(req.schedule_trigger, self.gauntlet_rounds)
+            plans.append(
+                {
+                    "req": req,
+                    "rec": rec,
+                    "alive": rec.is_alive,
+                    "angle": chosen_angle,
+                    "model": primary_model,
+                    "judge": self.ladder.judge_id(primary_model),
+                }
+            )
+
+        # Primary attacks, concurrently. Each real cost is booked (in request order) even when a
+        # sibling call failed, so a halt never leaves a paid verdict off the ledger.
+        live = [p for p in plans if p["alive"]]
+        primaries = self._parallel_calls(
+            [
+                (lambda p=p: self._run_single_attack(
+                    p["rec"],
+                    p["angle"],
+                    schedule_trigger=p["req"].schedule_trigger,
+                    judge_id=p["judge"],
+                    is_appeal=False,
+                    extra_context=p["req"].extra_context,
+                    model=p["model"],
+                ))
+                for p in live
+            ]
+        )
+        failure: Optional[BaseException] = None
+        for p, res in zip(live, primaries):
+            if isinstance(res, BaseException):
+                failure = failure or res
+                continue
+            p["verdict"] = res
+            self._record_cost(
+                p["req"].branch_id, res[3], f"falsify_{p['req'].schedule_trigger}_{p['angle'].value}"
+            )
+        if failure is not None:
+            raise failure
+
+        # One appeal per kill: re-test with a different judge; survive and the verdict's overturned.
+        # The appeal is claimed under the ledger lock (two workers can't both spend the one appeal)
+        # and only for a branch still alive after the primary call (never pay to appeal the dead).
+        appeals: List[Dict[str, Any]] = []
+        for p in live:
+            if p["verdict"][0] is not False:
+                continue
+            with self.tracker.atomic():
+                rec = self.tracker.get(p["req"].branch_id)
+                if rec.is_alive and not rec.appeal_used:
+                    rec.appeal_used = True
+                    appeals.append(p)
+        for p in appeals:
+            p["appeal_model"] = self.ladder.falsifier_model(
+                p["req"].schedule_trigger, self.gauntlet_rounds, is_appeal=True
+            )
+            p["appeal_judge"] = self.ladder.judge_id(p["appeal_model"], is_appeal=True)
+        appeal_results = self._parallel_calls(
+            [
+                (lambda p=p: self._run_single_attack(
+                    self.tracker.get(p["req"].branch_id),
+                    p["angle"],
+                    schedule_trigger=f"{p['req'].schedule_trigger}_appeal",
+                    judge_id=p["appeal_judge"],
+                    is_appeal=True,
+                    extra_context=f"Primary judge objection: {p['verdict'][1]} | {p['req'].extra_context}",
+                    model=p["appeal_model"],
+                ))
+                for p in appeals
+            ]
+        )
+        for p, res in zip(appeals, appeal_results):
+            if isinstance(res, BaseException):
+                failure = failure or res
+                continue
+            p["appeal"] = res
+            self._record_cost(p["req"].branch_id, res[3], f"appeal_{p['req'].schedule_trigger}")
+        if failure is not None:
+            raise failure
+
+        return [self._commit_verdict(p) for p in plans]
+
+    def _commit_verdict(self, plan: Dict[str, Any]) -> FalsificationOutcome:
+        """Land one planned verdict (primary + optional appeal) on the tracker."""
+        req = plan["req"]
+        branch_id, schedule_trigger = req.branch_id, req.schedule_trigger
+        chosen_angle: FalsifierAngle = plan["angle"]
+        primary_model, primary_judge = plan["model"], plan["judge"]
+        if not plan["alive"]:
             return FalsificationOutcome(
                 branch_id=branch_id,
                 schedule_trigger=schedule_trigger,
                 survived=False,
                 angle=chosen_angle.value,
                 judge_id=primary_judge,
-                rationale=f"Branch already terminal ({rec.state.value})",
+                judge_model=primary_model,
+                rationale=f"Branch already terminal ({plan['rec'].state.value})",
             )
 
-        survived, objection, rationale, cost = self._run_single_attack(
-            rec,
-            chosen_angle,
-            schedule_trigger=schedule_trigger,
-            judge_id=primary_judge,
-            is_appeal=False,
-            extra_context=extra_context,
-            model=primary_model,
-        )
+        survived, objection, rationale, cost = plan["verdict"]
         total_cost = cost
-        self._record_cost(branch_id, cost, f"falsify_{schedule_trigger}_{chosen_angle.value}")
-
         if survived is None:
             return self._inconclusive(
                 branch_id, schedule_trigger, chosen_angle, primary_judge, rationale, total_cost,
                 judge_model=primary_model,
             )
 
-        appeal_attempted = False
+        appeal_attempted = "appeal" in plan
         appeal_overturned = False
-        appeal_judge = ""
-
-        # One appeal per kill: re-test with a different judge; survive and the verdict's overturned.
-        # The appeal is claimed under the ledger lock (two workers can't both spend the one appeal)
-        # and only for a branch still alive after the primary call (never pay to appeal the dead).
-        claimed_appeal = False
-        if not survived:
-            with self.tracker.atomic():
-                rec = self.tracker.get(branch_id)
-                if rec.is_alive and not rec.appeal_used:
-                    rec.appeal_used = True
-                    claimed_appeal = True
-        if claimed_appeal:
-            appeal_attempted = True
-            appeal_model = self.ladder.falsifier_model(schedule_trigger, self.gauntlet_rounds, is_appeal=True)
-            appeal_judge = self.ladder.judge_id(appeal_model, is_appeal=True)
-            app_survived, app_obj, app_rat, app_cost = self._run_single_attack(
-                self.tracker.get(branch_id),
-                chosen_angle,
-                schedule_trigger=f"{schedule_trigger}_appeal",
-                judge_id=appeal_judge,
-                is_appeal=True,
-                extra_context=f"Primary judge objection: {objection} | {extra_context}",
-                model=appeal_model,
-            )
+        appeal_judge = plan["appeal_judge"] if appeal_attempted else ""
+        if appeal_attempted:
+            app_survived, app_obj, app_rat, app_cost = plan["appeal"]
             total_cost += app_cost
-            self._record_cost(branch_id, app_cost, f"appeal_{schedule_trigger}")
             if app_survived is None:
                 # Fail closed: an appeal with no verdict upholds nothing. A kill is irreversible, so
                 # it needs a readable verdict from both judges; the unheard appeal is handed back.
@@ -608,17 +734,42 @@ class FailJudge:
         any branch that fails dies (and if both survive raw attack, the lower-certainty
         clashing branch is killed so contradictions cannot coexist).
         """
-        out_a = self.falsify_branch(
-            branch_a_id,
-            schedule_trigger="contradiction",
-            extra_context=f"Clashing with {branch_b_id}: {contradiction_summary}",
-        )
-        out_b = self.falsify_branch(
-            branch_b_id,
-            schedule_trigger="contradiction",
-            extra_context=f"Clashing with {branch_a_id}: {contradiction_summary}",
-        )
+        return self.resolve_contradictions([(branch_a_id, branch_b_id, contradiction_summary)])[0]
 
+    def resolve_contradictions(
+        self,
+        clashes: Sequence[tuple],
+    ) -> List[tuple[FalsificationOutcome, FalsificationOutcome]]:
+        """
+        Several contradiction triggers at once (v0.42): every side of every clash is attacked in
+        one `falsify_many` batch (concurrent calls, in-order commits), then each clash's loser is
+        settled in order. `clashes` holds (branch_a_id, branch_b_id, contradiction_summary).
+        """
+        requests: List[FalsificationRequest] = []
+        for branch_a_id, branch_b_id, summary in clashes:
+            requests.append(
+                FalsificationRequest(
+                    branch_a_id, "contradiction", extra_context=f"Clashing with {branch_b_id}: {summary}"
+                )
+            )
+            requests.append(
+                FalsificationRequest(
+                    branch_b_id, "contradiction", extra_context=f"Clashing with {branch_a_id}: {summary}"
+                )
+            )
+        outcomes = self.falsify_many(requests)
+        return [
+            self._settle_contradiction(branch_a_id, branch_b_id, outcomes[2 * i], outcomes[2 * i + 1])
+            for i, (branch_a_id, branch_b_id, _) in enumerate(clashes)
+        ]
+
+    def _settle_contradiction(
+        self,
+        branch_a_id: str,
+        branch_b_id: str,
+        out_a: FalsificationOutcome,
+        out_b: FalsificationOutcome,
+    ) -> tuple[FalsificationOutcome, FalsificationOutcome]:
         # "contradiction trigger (alignment detector finds clash -> falsify both, loser dies)"
         # Pick and kill the loser under one lock, so neither side can die, be absorbed or change
         # state between the check and the kill (a stale read raised an illegal transition)
