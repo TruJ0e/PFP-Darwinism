@@ -1131,13 +1131,21 @@ class MainHarness:
     def _ns_admit(self) -> bool:
         """
         Reserve one NS slot if the population can take another blind mutation within the cap:
-        (NS spawned + in flight + 1) <= cap x (branches registered + in flight + 1). The tick
+        (NS registered + in flight + 1) <= cap x (branches registered + in flight + 1). The tick
         fans out one fork, so a slot is one child. Refused ticks are counted, never paid for.
+
+        Both counts come from one tracker snapshot taken under the admission lock. A child that
+        has registered but whose slot is not yet settled is then counted twice on *both* sides,
+        which for cap < 1 only ever tightens the check. (Counting NS from the settled counter
+        against the live record count double-counted such a child in the denominator alone:
+        CI saw 19 NS of 73 under a 0.25 cap.)
         """
-        total = len(self.tracker.all_records())
         with self._ns_lock:
+            records = self.tracker.all_records()
+            total = len(records)
+            ns_registered = sum(1 for r in records if r.origin == "ns")
             in_flight = self._ns_reserved
-            if self._ns_spawned + in_flight + 1 > self.ns_share_cap * (total + in_flight + 1):
+            if ns_registered + in_flight + 1 > self.ns_share_cap * (total + in_flight + 1):
                 self._ns_capped_ticks += 1
                 return False
             self._ns_reserved += 1
