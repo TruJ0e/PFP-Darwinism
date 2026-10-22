@@ -113,6 +113,7 @@ class BranchRecord:
     created_at: float = field(default_factory=time.time)
     ended_at: Optional[float] = None
     survived_falsifications: int = 0
+    attacks_faced: int = 0
     merges_attracted: int = 0
     open_critic_objections: int = 0
     last_tested_at: float = field(default_factory=time.time)
@@ -136,6 +137,11 @@ class BranchRecord:
     # byte-identical text but different ancestry (common for merged children) order apart on
     # it, where their IDs would order them by which thread registered first.
     lineage_digest: str = ""
+
+    @property
+    def is_merge_eligible(self) -> bool:
+        """A branch is eligible for absorption/merging only after facing >= 1 falsification attack."""
+        return self.attacks_faced >= 1 or self.survived_falsifications > 0
 
     @property
     def is_alive(self) -> bool:
@@ -172,6 +178,7 @@ class BranchRecord:
             "budget_remaining": round(self.budget_remaining, 6),
             "fork_under_exploration": self.fork_under_exploration,
             "survived_falsifications": self.survived_falsifications,
+            "attacks_faced": self.attacks_faced,
             "merges_attracted": self.merges_attracted,
             "open_critic_objections": self.open_critic_objections,
             "merge_provenance": self.merge_provenance,
@@ -442,6 +449,7 @@ class PFPTracker:
         budget_remaining: Optional[float] = None,
         fork_under_exploration: Optional[str] = None,
         survived_falsifications: Optional[int] = None,
+        attacks_faced: Optional[int] = None,
         merges_attracted: Optional[int] = None,
         open_critic_objections: Optional[int] = None,
         tested: bool = False,
@@ -463,6 +471,8 @@ class PFPTracker:
                 rec.fork_under_exploration = fork_under_exploration
             if survived_falsifications is not None:
                 rec.survived_falsifications = survived_falsifications
+            if attacks_faced is not None:
+                rec.attacks_faced = attacks_faced
             if merges_attracted is not None:
                 rec.merges_attracted = merges_attracted
             if open_critic_objections is not None:

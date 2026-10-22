@@ -344,6 +344,10 @@ class HardCapExceededError(RuntimeError):
     """Raised by `MeteredClient` when a call would start after true spend reached the hard cap."""
 
 
+class CallBudgetExceededError(RuntimeError):
+    """Raised by `MeteredClient` when a call would start after the call budget is exhausted."""
+
+
 # HTTP statuses worth retrying: rate limits and transient upstream failures.
 RETRYABLE_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
@@ -734,6 +738,7 @@ class MeteredClient:
         inner: Any,
         *,
         hard_cap_usd: Optional[float] = None,
+        call_budget: Optional[int] = None,
         max_concurrent_calls: int = 32,
     ) -> None:
         if hard_cap_usd is not None:
@@ -743,6 +748,7 @@ class MeteredClient:
         )
         self.inner = inner
         self.hard_cap_usd = hard_cap_usd
+        self.call_budget = int(call_budget) if call_budget is not None else None
         self.model = getattr(inner, "model", "")
         self.base_url = getattr(inner, "base_url", "")
         self.is_mock = getattr(inner, "is_mock", False)
@@ -809,6 +815,10 @@ class MeteredClient:
         per_attempt = estimate_call_cost_usd(prompt_bound, completion_bound, model) * self.cost_scale
         reservation = per_attempt * self.max_billable_attempts
         with self._lock:
+            if self.call_budget is not None and self.calls >= self.call_budget:
+                raise CallBudgetExceededError(
+                    f"Call budget of {self.call_budget} calls exceeded (calls={self.calls}); refusing new calls."
+                )
             projected = self.total_cost_usd + self._reserved_cost_usd + reservation
             if self.hard_cap_usd is not None and projected > self.hard_cap_usd:
                 raise HardCapExceededError(
@@ -1092,6 +1102,60 @@ class _MockChatCompletions:
                 brief_text = f"{brief_text} Route {digest % 100003:05d}."
 
             return json.dumps({"brief": brief_text, "focus_area": focus_area}), False
+
+        # 0b. v0.48: Piggybacked conclude + child exploration briefs
+        if "assign divergent child exploration briefs" in lower or "child_briefs" in lower:
+            _UNIVERSAL_BRIEFS = [
+                (
+                    "service_process_lifecycle",
+                    "Investigate runtime process lifecycle, active daemon execution state, execution environment constraints, and process-level health.",
+                ),
+                (
+                    "boundary_transport_filtering",
+                    "Investigate boundary filtering, transport connectivity, firewall rules, port binding, and interface routing paths.",
+                ),
+                (
+                    "credentials_authentication_access",
+                    "Investigate access control policies, credential validity, privilege escalation, authentication handshakes, and cryptographic key alignment.",
+                ),
+                (
+                    "configuration_syntax_precedence",
+                    "Investigate configuration directives, syntax errors, parameter precedence, environment variable overrides, and schema compliance.",
+                ),
+                (
+                    "resource_limits_capacity",
+                    "Investigate resource exhaustion, memory/file descriptor limits, thread contention, and operating system capacity constraints.",
+                ),
+                (
+                    "protocol_negotiation_drift",
+                    "Investigate protocol dialect negotiation, binary version drift, interface contract mismatches, and backward compatibility regressions.",
+                ),
+                (
+                    "filesystem_permissions_integrity",
+                    "Investigate filesystem mount state, directory permissions, file locks, disk capacity, and path resolution integrity.",
+                ),
+                (
+                    "name_resolution_addressing",
+                    "Investigate DNS/hostname resolution, addressing mismatches, reverse lookups, and discovery service state.",
+                ),
+            ]
+            fork = _PLAUS_FORK_POOL[(digest + choice_idx) % len(_PLAUS_FORK_POOL)]
+            child_brief_list = []
+            fork_count = len(re.findall(r"fork \d+", lower)) or 2
+            for i in range(fork_count):
+                slot = (digest + choice_idx + i + 1) % len(_UNIVERSAL_BRIEFS)
+                base_focus, base_text = _UNIVERSAL_BRIEFS[slot]
+                b_text = f"Specialized branch exploration: investigate mechanistic hypotheses and concrete operational pathways derived from {base_focus}. Route {(digest + i * 37) % 100003:05d}."
+                child_brief_list.append({"brief": b_text, "focus_area": f"specialized_{base_focus}"})
+            return (
+                json.dumps(
+                    {
+                        "conclusion": fork["conclusion"],
+                        "child_briefs": child_brief_list,
+                    }
+                ),
+                False,
+            )
 
         # 0. Piece 8: Self-improvement loop (self-assessment, anti-model critic, proposition synthesis).
         # These prompts quote whole winner solutions, and a merged trace names other modules

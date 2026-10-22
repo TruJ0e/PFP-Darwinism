@@ -317,6 +317,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Seed for the deterministic NS slot allocation (default 0)",
     )
     parser.add_argument("--depth-dial", type=_positive_int, default=3, help="Depth dial bounding fan-out")
+    parser.add_argument(
+        "--race",
+        action="store_true",
+        help="Enable race mode: one-minute operating point (~90 call cap, depth 2, 1 merge round, piggybacked briefs)",
+    )
+    parser.add_argument(
+        "--time-budget-seconds",
+        type=_positive_float,
+        default=None,
+        help="Time budget in seconds for race mode (default: 60.0 when --race is set)",
+    )
+    parser.add_argument(
+        "--call-budget",
+        type=_positive_int,
+        default=None,
+        help="Hard call budget cap for race mode (default: 90 when --race is set)",
+    )
     parser.add_argument("--k-probes", type=_positive_int, default=3, help="Number of blind probe continuations per step")
     parser.add_argument("--gauntlet-rounds", type=_positive_int, default=3, help="Pass-readiness gauntlet rounds (default 3)")
     briefs_group = parser.add_mutually_exclusive_group()
@@ -484,10 +501,18 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
             print(f"[pfp] refusing to run: cannot load case bank {cases_path}: {exc}", file=sys.stderr)
             return 1
 
+    is_race = bool(args.race or args.time_budget_seconds is not None or args.call_budget is not None)
+    rpm = args.requests_per_minute
+    if is_race and rpm is None:
+        # Pacing: race mode raises requests-per-minute toward provider ceiling (Nebius ~100 rpm).
+        # We choose 90 rpm (1.5 req/sec) to provide maximum throughput within 60s while
+        # maintaining a 10% safety margin against provider 429 burst trips.
+        rpm = "90"
+
     client = create_client(
         use_mock=True if args.mock else None,
         max_retries=args.max_retries,
-        requests_per_minute=args.requests_per_minute,
+        requests_per_minute=rpm,
     )
     loop.client = client
 
@@ -498,7 +523,7 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         depth_dial=args.depth_dial,
         k_probes=args.k_probes,
         gauntlet_rounds=args.gauntlet_rounds,
-        selection_rounds=args.selection_rounds,
+        selection_rounds=1 if is_race and args.selection_rounds == 3 else args.selection_rounds,
         max_concurrent_calls=args.max_concurrent,
         depth_decay=args.depth_decay,
         finish_reserve_ratio=args.finish_reserve_ratio,
@@ -512,6 +537,9 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         enable_selection=True,
         version_registry=registry,
         seed_cases=loop.recall(args.problem, k=args.starters),
+        race_mode=is_race,
+        time_budget_seconds=args.time_budget_seconds,
+        call_budget=args.call_budget,
     )
     summary = harness.run(args.problem)
 
@@ -561,7 +589,8 @@ def _run_live(args: argparse.Namespace, state_dir: Path | None) -> int:
         print("\n--- RUN SUMMARY JSON ---")
         print(json.dumps(summary, indent=2))
     interrupted = bool(summary.get("self_improvement", {}).get("interrupted"))
-    return 0 if summary["halted_reason"] is None and not interrupted else 2
+    clean_halt = summary["halted_reason"] in (None, "race_budget_expired")
+    return 0 if clean_halt and not interrupted else 2
 
 
 if __name__ == "__main__":

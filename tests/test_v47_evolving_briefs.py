@@ -135,6 +135,7 @@ def test_brief_lineage_is_journaled_in_spawn_events():
         hard_cap_usd=2.0,
         enable_briefs=True,
         enable_selection=True,
+        test_before_merge=False,
     )
     harness.run(PROBLEM)
     events = harness.arena_feed.events
@@ -168,6 +169,7 @@ def test_no_briefs_escape_dial_matches_v046():
         hard_cap_usd=2.0,
         enable_briefs=True,
         enable_selection=True,
+        test_before_merge=False,
     )
     harness_nobriefs = MainHarness(
         client=MockOpenAIClient(),
@@ -175,6 +177,7 @@ def test_no_briefs_escape_dial_matches_v046():
         hard_cap_usd=2.0,
         enable_briefs=False,
         enable_selection=True,
+        test_before_merge=False,
     )
     s_briefs = harness_briefs.run(PROBLEM)
     s_nobriefs = harness_nobriefs.run(PROBLEM)
@@ -210,6 +213,7 @@ def test_mock_brief_runs_are_deterministic_and_reproducible():
             hard_cap_usd=2.0,
             enable_briefs=True,
             enable_selection=True,
+        test_before_merge=False,
         )
         summary = harness.run(PROBLEM)
         starter_bids = [s.directive.brief_id for s in harness.starters]

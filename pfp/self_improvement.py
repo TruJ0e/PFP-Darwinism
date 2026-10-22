@@ -1297,6 +1297,7 @@ class SelfImprovementLoop:
             gauntlet_rounds=int(dials["gauntlet_rounds"]),
             enable_briefs=False,
             enable_selection=True,
+            test_before_merge=False,
         )
         harness.detector.weights = weights_from_dials(dials)
         harness.alignment_detector.prefilter_threshold = float(dials["prefilter_threshold"])

@@ -47,7 +47,7 @@ from .issue_detector import (
     ProbeContinuation,
 )
 from .jsonutil import parse_json_object
-from .tracker import BranchRecord, BranchState, PFPTracker, id_free
+from .tracker import BranchRecord, BranchState, PFPTracker, content_order_key, id_free
 
 # Smallest arena that can still do selection: 3 starters, their probe cycles,
 # alignment/merge rounds and a 3-round falsification gauntlet. The difficulty
@@ -639,8 +639,12 @@ class MiniHarness:
         token_scale: float = 1.0,
         token_policy: Optional[Dict[str, Any]] = None,
         enable_briefs: bool = False,
+        depth_cap: Optional[int] = None,
+        piggyback_briefs: bool = False,
     ) -> None:
         self.enable_briefs = bool(enable_briefs)
+        self.depth_cap = int(depth_cap) if depth_cap is not None else None
+        self.piggyback_briefs = bool(piggyback_briefs)
         self.branch_id = branch_id
         # Share of the full probe / NS completion budget this branch's calls may use (v0.44)
         self.token_scale = max(0.0, min(1.0, float(token_scale)))
@@ -960,42 +964,144 @@ class MiniHarness:
         inherited_exclusions = [dict(r) for r in self.directive.excluded_routes] if self.enable_briefs else []
         child_exclusions: List[List[Dict[str, str]]] = [list(inherited_exclusions) for _ in ordered_forks]
         if self.enable_briefs and self.directive.brief:
-            from .briefs import BRIEF_FAILURE_EVENT, ExplorationBrief, mutate_brief_for_fork
+            from .briefs import (
+                BRIEF_FAILURE_EVENT,
+                ExplorationBrief,
+                compute_brief_id,
+                mutate_brief_for_fork,
+                validate_brief_text,
+                _norm_brief,
+            )
 
             def _journal_brief_failure(failure: Dict[str, Any]) -> None:
                 self._emit(BRIEF_FAILURE_EVENT, dict(failure, trigger=trigger))
-            parent_brief_obj = ExplorationBrief(
-                brief_id=self.directive.brief_id,
-                brief=self.directive.brief,
-                parent_brief_id=self.directive.parent_brief_id,
-                depth=self.depth,
-            )
-            survived_obj = rec.last_objection or ""
-            # Divergence inputs (v0.47.1): the parent's brief, its conclusion or surviving claims,
-            # its objections, upstream exclusions, and the sibling briefs generated so far
-            parent_claims = self.conclusion_text or compressed
+
             parent_route = {"brief_id": self.directive.brief_id, "brief": self.directive.brief}
-            for f_idx, fork in enumerate(ordered_forks):
-                is_final_child = (f_idx == len(ordered_forks) - 1 and len(ordered_forks) > 1)
-                c_brief, b_cost = mutate_brief_for_fork(
-                    client=self.client,
-                    problem=self.problem,
-                    parent_brief=parent_brief_obj,
-                    fork_description=fork.fork_description,
-                    fork_reasoning=fork.reasoning,
-                    prior_sibling_briefs=[b for b in child_briefs if b is not None],
-                    survived_objection=survived_obj,
-                    is_final=is_final_child,
-                    depth=self.depth + 1,
-                    on_failure=_journal_brief_failure,
-                    parent_conclusion=parent_claims,
-                    excluded_routes=[r["brief"] for r in inherited_exclusions],
+
+            if self.piggyback_briefs:
+                # 1. PIGGYBACKED BRIEFS: eliminate separate brief-generation calls at forks.
+                # A branch's conclude call additionally emits its children's divergent assignments
+                # in the same completion (the parent holds the map: covered routes, objections, deaths).
+                conclude_lines = [
+                    f"Conclude branch reasoning and assign divergent child exploration briefs for problem: {self.problem}",
+                    f"Brief: {self.directive.brief}",
+                ]
+                for route in self.directive.excluded_route_texts:
+                    conclude_lines.append(f"Covered by parent — do not repeat this route: {route}")
+                if rec.last_objection:
+                    conclude_lines.append(f"Parent survived objection: {rec.last_objection}")
+                conclude_lines.append(f"Fork: {self.directive.fork_exploring}")
+                conclude_lines.append(f"Trace: {' | '.join(rec.reasoning_trace)}")
+                conclude_lines.append("\nCandidate child forks to assign divergent briefs for:")
+                for f_idx, fork in enumerate(ordered_forks):
+                    conclude_lines.append(f"Fork {f_idx + 1} ({fork.fork_id}): {fork.fork_description} | {fork.reasoning}")
+                conclude_lines.append(
+                    "\nOutput JSON format:\n"
+                    "{\n"
+                    '  "conclusion": "1-3 sentences stating this branch\'s concrete conclusion",\n'
+                    '  "child_briefs": [\n'
+                    '    {"brief": "Divergent hypothesis brief exploring an unaddressed region"}\n'
+                    "  ]\n"
+                    "}"
                 )
-                if b_cost > 0:
-                    self._spend(b_cost, f"{trigger}_child_brief_mutation", kind="brief")
-                child_briefs[f_idx] = c_brief
-                if c_brief is None:
-                    child_exclusions[f_idx].append(dict(parent_route))
+                resp = self.client.chat.completions.create(
+                    messages=[{"role": "user", "content": "\n".join(conclude_lines)}],
+                    temperature=0.3,
+                    max_tokens=1024,
+                )
+                self._spend(float(resp.usage.cost_usd), "conclude_with_piggybacked_briefs", kind="conclude")
+                raw = (resp.choices[0].message.content if resp.choices else "") or ""
+                data = parse_json_object(raw)
+                conc_text = ""
+                if data and isinstance(data, dict):
+                    for k in ("conclusion", "solution", "answer"):
+                        if isinstance(data.get(k), str) and data[k].strip():
+                            conc_text = data[k].strip()
+                            break
+                if not conc_text:
+                    conc_text = _conclusion_text(raw)
+                self.conclusion_text = conc_text
+                self.concluded = True
+                self.tracker.update_branch(self.branch_id, reasoning_step=f"[Conclusion] {conc_text}")
+                self._refresh_certainty()
+                self._emit("conclude", {"conclusion": conc_text[:200]})
+
+                raw_list = data.get("child_briefs") if (data and isinstance(data, dict) and isinstance(data.get("child_briefs"), list)) else []
+                sibling_norms = set()
+                excluded_norms = {_norm_brief(r["brief"]) for r in inherited_exclusions}
+                parent_norm = _norm_brief(self.directive.brief)
+
+                for f_idx, fork in enumerate(ordered_forks):
+                    brief_candidate = None
+                    if f_idx < len(raw_list):
+                        item = raw_list[f_idx]
+                        if isinstance(item, dict):
+                            brief_candidate = item.get("brief")
+                        elif isinstance(item, str):
+                            brief_candidate = item
+
+                    cleaned, reason = validate_brief_text(brief_candidate) if brief_candidate is not None else (None, "missing_child_brief")
+                    if cleaned:
+                        c_norm = _norm_brief(cleaned)
+                        if c_norm == parent_norm:
+                            cleaned, reason = None, "duplicates_parent_brief"
+                        elif c_norm in excluded_norms:
+                            cleaned, reason = None, "duplicates_excluded_route"
+                        elif c_norm in sibling_norms:
+                            cleaned, reason = None, "duplicates_sibling_brief"
+
+                    if cleaned is not None:
+                        c_brief = ExplorationBrief(
+                            brief_id=compute_brief_id(cleaned),
+                            brief=cleaned,
+                            parent_brief_id=self.directive.brief_id,
+                            depth=self.depth + 1,
+                        )
+                        child_briefs[f_idx] = c_brief
+                        sibling_norms.add(_norm_brief(cleaned))
+                    else:
+                        child_briefs[f_idx] = None
+                        child_exclusions[f_idx].append(dict(parent_route))
+                        _journal_brief_failure({
+                            "stage": "piggybacked_conclude_brief",
+                            "fork_id": fork.fork_id,
+                            "attempt": 1,
+                            "max_tokens": 1024,
+                            "reason": reason or "unparseable_brief",
+                            "raw_chars": len(raw),
+                            "will_retry": False,
+                            "outcome_on_failure": "briefless_parent_route_excluded",
+                        })
+            else:
+                parent_brief_obj = ExplorationBrief(
+                    brief_id=self.directive.brief_id,
+                    brief=self.directive.brief,
+                    parent_brief_id=self.directive.parent_brief_id,
+                    depth=self.depth,
+                )
+                survived_obj = rec.last_objection or ""
+                parent_claims = self.conclusion_text or compressed
+                for f_idx, fork in enumerate(ordered_forks):
+                    is_final_child = (f_idx == len(ordered_forks) - 1 and len(ordered_forks) > 1)
+                    c_brief, b_cost = mutate_brief_for_fork(
+                        client=self.client,
+                        problem=self.problem,
+                        parent_brief=parent_brief_obj,
+                        fork_description=fork.fork_description,
+                        fork_reasoning=fork.reasoning,
+                        prior_sibling_briefs=[b for b in child_briefs if b is not None],
+                        survived_objection=survived_obj,
+                        is_final=is_final_child,
+                        depth=self.depth + 1,
+                        on_failure=_journal_brief_failure,
+                        parent_conclusion=parent_claims,
+                        excluded_routes=[r["brief"] for r in inherited_exclusions],
+                    )
+                    if b_cost > 0:
+                        self._spend(b_cost, f"{trigger}_child_brief_mutation", kind="brief")
+                    child_briefs[f_idx] = c_brief
+                    if c_brief is None:
+                        child_exclusions[f_idx].append(dict(parent_route))
 
         spawned: List[MiniHarness] = []
         for idx, (fork, c_budget, t_scale) in enumerate(zip(ordered_forks, child_budgets, token_scales)):
@@ -1038,6 +1144,8 @@ class MiniHarness:
                 token_scale=t_scale,
                 token_policy=self.token_policy,
                 enable_briefs=self.enable_briefs,
+                depth_cap=self.depth_cap,
+                piggyback_briefs=self.piggyback_briefs,
             )
             child.tracker.update_branch(
                 child_id,
@@ -1153,8 +1261,9 @@ class MiniHarness:
 
         rec = self.tracker.get(self.branch_id)
         stage = self._evaluate_graceful_degradation(rec.budget_remaining)
+        at_depth_cap = self.depth_cap is not None and self.depth >= self.depth_cap
 
-        if stage == "exploitation_only" or not self._can_afford("plaus"):
+        if stage == "exploitation_only" or at_depth_cap or not self._can_afford("plaus"):
             self._run_to_conclusion()
             return
 
@@ -1308,6 +1417,12 @@ class MainHarness:
         token_certainty_floor: float = 0.0,
         probe_token_tiers: Sequence[float] = DEFAULT_PROBE_TOKEN_TIERS,
         enable_briefs: bool = False,
+        test_before_merge: bool = True,
+        race_mode: bool = False,
+        time_budget_seconds: Optional[float] = None,
+        call_budget: Optional[int] = None,
+        depth_cap: Optional[int] = None,
+        piggyback_briefs: Optional[bool] = None,
     ) -> None:
         from .alignment_detector import AlignmentDetector
         from .arena import ArenaFeed, TronArenaRenderer
@@ -1326,17 +1441,35 @@ class MainHarness:
             raise ValueError("hard_cap_usd must be a finite number > 0")
 
         self.raw_client = client
+        is_race = bool(race_mode or time_budget_seconds is not None or call_budget is not None)
+        self.race_mode = is_race
+        if is_race:
+            self.time_budget_seconds = float(time_budget_seconds) if time_budget_seconds is not None else 60.0
+            self.call_budget = int(call_budget) if call_budget is not None else 90
+            self.depth_cap = int(depth_cap) if depth_cap is not None else 2
+            self.selection_rounds = 1 if selection_rounds == 3 else max(1, int(selection_rounds))
+            self.piggyback_briefs = True if piggyback_briefs is None else bool(piggyback_briefs)
+        else:
+            self.time_budget_seconds = float(time_budget_seconds) if time_budget_seconds is not None else None
+            self.call_budget = int(call_budget) if call_budget is not None else None
+            self.depth_cap = int(depth_cap) if depth_cap is not None else None
+            self.piggyback_briefs = bool(piggyback_briefs) if piggyback_briefs is not None else False
+            self.selection_rounds = max(1, int(selection_rounds))
+
         self.client = MeteredClient(
             client,
             hard_cap_usd=hard_cap_usd,
+            call_budget=self.call_budget,
             max_concurrent_calls=max_concurrent_calls,
         )
         self.starter_agents = starter_agents
         self.enable_selection = enable_selection
         self.enable_briefs = bool(enable_briefs)
+        self.test_before_merge = bool(test_before_merge)
         self.version_registry = version_registry
         self.seed_cases: List[Dict[str, Any]] = list(seed_cases or [])
-        self.selection_rounds = max(1, int(selection_rounds))
+        self._cut_by_budget = False
+        self._start_time = time.time()
         self.max_winners = max(1, int(max_winners))
         self.tracker = PFPTracker()
         self.detector = IssueDetector(self.client, k_probes=k_probes, depth_dial=depth_dial)
@@ -1390,6 +1523,7 @@ class MainHarness:
             tracker=self.tracker,
             budget_ledger=self.budget_ledger,
             event_sink=self._on_event,
+            require_tested=self.test_before_merge,
         )
         self.fail_judge = FailJudge(
             client=self.client,
@@ -1436,8 +1570,23 @@ class MainHarness:
     def _stop_reason(self) -> str:
         return self._abort_reason or "emergency_stop"
 
+    def _is_race_budget_expired(self) -> bool:
+        if not self.race_mode:
+            return False
+        # In mock mode: deadline MUST be expressed as call count budget, NOT wall time
+        if getattr(self.client, "is_mock", False):
+            return bool(self.call_budget is not None and self.client.calls >= self.call_budget)
+        time_expired = (self.time_budget_seconds is not None and (time.time() - self._start_time >= self.time_budget_seconds))
+        calls_expired = (self.call_budget is not None and self.client.calls >= self.call_budget)
+        return bool(time_expired or calls_expired)
+
     def _should_stop(self) -> bool:
         if self._stop_event.is_set():
+            return True
+        if self.race_mode and self._is_race_budget_expired():
+            self._cut_by_budget = True
+            self.halted_reason = "race_budget_expired"
+            self._stop_event.set()
             return True
         reg = self.version_registry
         return bool(reg is not None and getattr(reg, "emergency_stopped", False))
@@ -1781,6 +1930,36 @@ class MainHarness:
                     continue
                 if not (self.tracker.get(al.branch_a_id).is_alive and self.tracker.get(al.branch_b_id).is_alive):
                     continue
+                if self.test_before_merge:
+                    ba = self.tracker.get(al.branch_a_id)
+                    bb = self.tracker.get(al.branch_b_id)
+                    if not (ba.is_merge_eligible and bb.is_merge_eligible):
+                        untested = [b.id for b in (ba, bb) if not b.is_merge_eligible]
+                        self._on_event(
+                            HarnessEvent(
+                                event_type="absorption_deferred",
+                                branch_id=untested[0],
+                                timestamp=time.time(),
+                                details={
+                                    "reason": "untested_branch",
+                                    "branch_a_id": ba.id,
+                                    "branch_b_id": bb.id,
+                                    "branch_a_attacks_faced": ba.attacks_faced,
+                                    "branch_b_attacks_faced": bb.attacks_faced,
+                                    "untested_branches": untested,
+                                    "eligible": False,
+                                },
+                                snapshot=self.tracker.get(untested[0]).to_dict(),
+                            )
+                        )
+                        for ub_id in untested:
+                            if self.tracker.get(ub_id).is_alive:
+                                f_out = self.fail_judge.falsify_branch(ub_id, schedule_trigger="test_before_merge")
+                                falsifications_run.append(f_out.to_dict())
+                        ba = self.tracker.get(al.branch_a_id)
+                        bb = self.tracker.get(al.branch_b_id)
+                        if not (ba.is_alive and bb.is_alive and ba.is_merge_eligible and bb.is_merge_eligible):
+                            continue
                 merging.update((al.branch_a_id, al.branch_b_id))
                 pending.append(al)
 
@@ -1932,6 +2111,8 @@ class MainHarness:
                 ns_allocate=self._ns_allocate,
                 token_policy=self.token_policy,
                 enable_briefs=self.enable_briefs,
+                depth_cap=self.depth_cap,
+                piggyback_briefs=self.piggyback_briefs,
             )
             self.starters.append(starter)
             if self.enable_briefs and idx < len(starter_costs) and starter_costs[idx] > 0:
@@ -1968,8 +2149,11 @@ class MainHarness:
         if not problem or not problem.strip():
             raise ValueError("problem must be a non-empty string")
 
+        from .backend import CallBudgetExceededError
         active_version_id = self._apply_active_version_dials()
         selection_summary: Dict[str, Any] = {}
+        self._start_time = time.time()
+        self._cut_by_budget = False
         try:
             try:
                 self.budget_ledger.size_problem_once(self.client, problem)
@@ -2005,6 +2189,11 @@ class MainHarness:
 
                 if self.enable_selection and not self._should_stop():
                     selection_summary = self._run_selection_phase()
+            except CallBudgetExceededError as exc:
+                self._stop_event.set()
+                self._cut_by_budget = True
+                self.halted_reason = "race_budget_expired"
+                self._emit_halt("race_budget_expired", str(exc))
             except HardCapExceededError as exc:
                 self._stop_event.set()
                 self.halted_reason = "hard_cap"
@@ -2026,13 +2215,71 @@ class MainHarness:
                 self.halted_reason = "internal_error"
                 self._emit_halt("internal_error", f"{type(exc).__name__}: {str(exc)[:480]}")
             if self.halted_reason is None and self._should_stop():
-                self.halted_reason = "emergency_stop"
-                self._emit_halt("emergency_stop", "Emergency stop killed the run; rollback applies next run.")
+                if self.race_mode and self._is_race_budget_expired():
+                    self._cut_by_budget = True
+                    self.halted_reason = "race_budget_expired"
+                    self._emit_halt("race_budget_expired", f"Race budget expired (calls={self.client.calls}/{self.call_budget})")
+                else:
+                    self.halted_reason = "emergency_stop"
+                    self._emit_halt("emergency_stop", "Emergency stop killed the run; rollback applies next run.")
 
             remaining_across_branches = round(
                 sum(r.budget_remaining for r in self.tracker.all_records()), 6
             )
             meter = self.client.stats()
+            wall_seconds = time.time() - self._start_time
+
+            # Anytime winner computation
+            anytime_winner_rec = None
+            living = [b for b in self.tracker.active_branches() if b.is_alive]
+            if not living:
+                living = self.tracker.all_records()
+            if living:
+                best_rec = max(
+                    living,
+                    key=lambda b: (
+                        1 if b.state == BranchState.PASS else 0,
+                        b.survived_falsifications,
+                        b.attacks_faced,
+                        b.certainty_score,
+                        content_order_key(b),
+                    ),
+                )
+                anytime_winner_rec = {
+                    "branch_id": best_rec.id,
+                    "state": best_rec.state.value,
+                    "solution": best_rec.solution,
+                    "verification_depth": {
+                        "attacks_faced": best_rec.attacks_faced,
+                        "survived_falsifications": best_rec.survived_falsifications,
+                        "certainty": round(best_rec.certainty_score, 4),
+                    },
+                }
+                if not self.winners_box and self.race_mode:
+                    self.winners_box = [best_rec.to_dict()]
+            elif self.winners_box:
+                top_w = self.winners_box[0]
+                anytime_winner_rec = {
+                    "branch_id": top_w.get("id"),
+                    "state": top_w.get("state"),
+                    "solution": top_w.get("solution"),
+                    "verification_depth": {
+                        "attacks_faced": top_w.get("attacks_faced", 0),
+                        "survived_falsifications": top_w.get("survived_falsifications", 0),
+                        "certainty": round(top_w.get("certainty_score", 0.0), 4),
+                    },
+                }
+
+            race_block = {
+                "race_mode": self.race_mode,
+                "wall_seconds": round(wall_seconds, 4),
+                "calls_used": meter["calls"],
+                "calls_budget": self.call_budget,
+                "time_budget_seconds": self.time_budget_seconds,
+                "anytime_winner": anytime_winner_rec,
+                "completed_naturally": not self._cut_by_budget and self.halted_reason is None,
+                "cut_by_budget": bool(self._cut_by_budget or self.halted_reason == "race_budget_expired"),
+            }
 
             return {
                 "problem": problem,
@@ -2074,6 +2321,7 @@ class MainHarness:
                 "winners_box": self.winners_box,
                 "scoreboard": self.tracker.scoreboard(),
                 "events_count": len(self.events),
+                "race": race_block,
             }
         finally:
             if self.version_registry is not None and self.version_registry.run_in_progress:

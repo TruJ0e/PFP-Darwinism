@@ -336,6 +336,10 @@ class FailJudge:
                 rationale=f"Branch already terminal ({rec.state.value})",
             )
 
+        with self.tracker.atomic():
+            b_curr = self.tracker.get(branch_id)
+            self.tracker.update_branch(branch_id, attacks_faced=b_curr.attacks_faced + 1)
+
         survived, objection, rationale, cost = self._run_single_attack(
             rec,
             chosen_angle,
@@ -717,12 +721,12 @@ class FailJudge:
         if not alive:
             return None
 
-        # Prioritize branches with 0 survived_falsifications, ordered by certainty_score descending
-        untested = [b for b in alive if b.survived_falsifications == 0]
-        if untested:
+        # Prioritize untested branches (survived_falsifications == 0 and never attacked) ahead of re-testing tested ones
+        never_attacked = [b for b in alive if b.survived_falsifications == 0 and b.attacks_faced == 0]
+        if never_attacked:
             # An untested branch's last_tested_at is just its birth time, which parallel spawning
             # orders by thread scheduling; break certainty ties on content, not on the clock
-            target = min(untested, key=lambda b: (-b.certainty_score, content_order_key(b)))
+            target = min(never_attacked, key=lambda b: (-b.certainty_score, content_order_key(b)))
         else:
             # Least recently tested first, on the arena-round clock (wall time follows call latency)
             target = min(alive, key=lambda b: (-b.certainty_score, b.last_tested_round, content_order_key(b)))

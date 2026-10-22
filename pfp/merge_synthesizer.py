@@ -78,12 +78,14 @@ class MergeSynthesizer:
         *,
         super_model: str = SUPER_MODEL,
         event_sink: Optional[Callable[[HarnessEvent], None]] = None,
+        require_tested: bool = False,
     ) -> None:
         self.client = client
         self.tracker = tracker
         self.budget_ledger = budget_ledger
         self.super_model = super_model
         self.event_sink = event_sink
+        self.require_tested = bool(require_tested)
 
     def _emit(self, event_type: str, branch_id: str, details: Dict[str, Any]) -> None:
         if self.event_sink is None:
@@ -245,6 +247,11 @@ class MergeSynthesizer:
         parent_b = self.tracker.get(branch_b_id)
         self._require_alive(parent_a)
         self._require_alive(parent_b)
+        if self.require_tested:
+            if not (parent_a.attacks_faced > 0 or parent_a.survived_falsifications > 0):
+                raise ValueError(f"Branch '{branch_a_id}' is not eligible for merge: 0 falsification attacks faced")
+            if not (parent_b.attacks_faced > 0 or parent_b.survived_falsifications > 0):
+                raise ValueError(f"Branch '{branch_b_id}' is not eligible for merge: 0 falsification attacks faced")
 
         pos_a = fence_untrusted(branch_position_text(parent_a))
         pos_b = fence_untrusted(branch_position_text(parent_b))
