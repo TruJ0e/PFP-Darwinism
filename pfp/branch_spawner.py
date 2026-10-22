@@ -1470,6 +1470,7 @@ class MainHarness:
         self.seed_cases: List[Dict[str, Any]] = list(seed_cases or [])
         self._cut_by_budget = False
         self._start_time = time.time()
+        self._process_start_time = self._start_time
         self.max_winners = max(1, int(max_winners))
         self.tracker = PFPTracker()
         self.detector = IssueDetector(self.client, k_probes=k_probes, depth_dial=depth_dial)
@@ -2153,12 +2154,23 @@ class MainHarness:
         active_version_id = self._apply_active_version_dials()
         selection_summary: Dict[str, Any] = {}
         self._start_time = time.time()
+        # Total process time (setup included) for the report; the race/time
+        # clock itself (_start_time) is re-anchored after starter spawn below.
+        self._process_start_time = self._start_time
         self._cut_by_budget = False
         try:
             try:
                 self.budget_ledger.size_problem_once(self.client, problem)
                 probe_spent = self.budget_ledger.total_spent_usd
                 self._spawn_starters(problem)
+                if self.race_mode:
+                    # The race clock starts when the arena actually begins. Sizing-probe
+                    # and brief-generation latency (hundreds of seconds on queued free
+                    # models) must not consume the race time budget before any branch
+                    # steps: run 8 lost all 60s to 395s of setup and every starter was
+                    # killed 0.01s alive with halted_reason "race_budget_expired".
+                    # Mock-mode deadlines are call-count based, so this is a no-op there.
+                    self._start_time = time.time()
                 if self.starters and probe_spent > 0.0:
                     first_id = self.starters[0].branch_id
                     self._on_event(
@@ -2273,6 +2285,10 @@ class MainHarness:
             race_block = {
                 "race_mode": self.race_mode,
                 "wall_seconds": round(wall_seconds, 4),
+                # Setup (sizing probe + brief generation) is excluded from the race
+                # clock; report it separately so a queued free model eating 395s of
+                # setup (run 8) is visible instead of silently killing the race.
+                "setup_seconds": round(self._start_time - self._process_start_time, 4),
                 "calls_used": meter["calls"],
                 "calls_budget": self.call_budget,
                 "time_budget_seconds": self.time_budget_seconds,

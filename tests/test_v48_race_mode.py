@@ -42,6 +42,41 @@ def test_race_mode_mock_determinism_and_reproducibility():
     assert s1["winners_box"][0]["id"] == s2["winners_box"][0]["id"]
 
 
+def test_race_clock_starts_after_setup_not_at_run_entry(monkeypatch):
+    """Run 8 postmortem: 395s of sizing-probe + brief-generation latency on a queued
+    free model consumed the entire 60s race clock before any branch stepped, so every
+    starter was killed 0.01s alive with halted_reason "race_budget_expired". The race
+    clock must be re-anchored after starter spawn, and setup reported separately.
+    (is_mock is flipped off so the wall-clock expiry path is exercised with instant
+    mock responses; the deadline logic is identical.)"""
+    from pfp import BudgetLedger
+
+    orig_size = BudgetLedger.size_problem_once
+    harness_ref = {}
+
+    def slow_setup(self, client, problem):
+        out = orig_size(self, client, problem)
+        # Simulate 120s of setup latency elapsing after run() anchored the clock.
+        harness_ref["h"]._start_time -= 120.0
+        return out
+
+    monkeypatch.setattr(BudgetLedger, "size_problem_once", slow_setup)
+    client = MockOpenAIClient()
+    client.is_mock = False  # exercise the wall-clock expiry path
+    harness = MainHarness(client=client, race_mode=True)
+    harness_ref["h"] = harness
+
+    summary = harness.run(PROBLEM)
+
+    # The 120s of simulated setup is excluded from the race clock: wall_seconds
+    # measures arena time only, and setup is reported separately (0 when absent).
+    assert summary["race"].get("setup_seconds", 0) >= 0
+    # Pre-fix this was exactly 4 (probe + 3 briefs): the race died before racing.
+    assert summary["race"]["calls_used"] > 4
+    assert summary["race"]["calls_used"] <= 90
+    assert summary["race"]["anytime_winner"] is not None
+
+
 def test_test_before_merge_deferral_and_attacks_faced():
     tracker = PFPTracker()
     b1 = tracker.register_branch("b1", None, 1.0, "Path A", origin="starter")
