@@ -1086,6 +1086,10 @@ class _MockChatCompletions:
                 base_focus, base_text = _UNIVERSAL_BRIEFS[slot]
                 focus_area = f"specialized_{base_focus}"
                 brief_text = f"Specialized branch exploration: investigate mechanistic hypotheses and concrete operational pathways derived from {base_focus}."
+            if "mutate_exploration_brief" in lower:
+                # v0.47.1 divergence: a mutation prompt carries the parent's brief and the sibling
+                # briefs, so its digest names a route of its own — never a restated ancestor brief
+                brief_text = f"{brief_text} Route {digest % 100003:05d}."
 
             return json.dumps({"brief": brief_text, "focus_area": focus_area}), False
 

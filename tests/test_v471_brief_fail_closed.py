@@ -6,8 +6,9 @@ only the brief calls:
 1. Empty content (a reasoning model's 200-token budget eaten by reasoning) silently became
    the boilerplate "Explore distinct hypothesis space N" — now: reasoning-class budgets, a
    journaled `brief_generation_failed` event, one retry, then a brief-less branch.
-2. Probe-shaped JSON leaked through as brief text — now: rejected; a fork child inherits its
-   parent's brief verbatim.
+2. Probe-shaped JSON leaked through as brief text — now: rejected; a fork child whose
+   mutation fails runs brief-less, carrying its parent's brief only as an excluded route
+   (amendment: divergence at every spawn — never verbatim inheritance).
 3. Fork children got template echoes ("Specialized exploration of ... from brief_...") — now:
    a valid model brief is used verbatim and no template exists.
 """
@@ -194,22 +195,25 @@ def test_retry_recovers_after_one_empty_reply():
     assert [mt for _, mt in client.brief_calls] == [BRIEF_MAX_TOKENS, BRIEF_RETRY_MAX_TOKENS]
 
 
-def test_empty_fork_mutation_inherits_parent_brief_and_journals():
+def test_empty_fork_mutation_spawns_briefless_child_with_parent_route_excluded():
     client = _brief_client(mutate_reply=lambda p, n: "")
     harness = _run(client)
 
     starter_briefs = {s.directive.brief_id: s.directive.brief for s in harness.starters}
-    child_spawns = [e for e in _spawns(harness) if e.snapshot.get("parent") is not None and "brief" in e.details]
-    assert child_spawns, "no brief-carrying children spawned"
+    child_spawns = [e for e in _spawns(harness) if e.snapshot.get("parent") is not None]
+    assert child_spawns
+    excluded = [e for e in child_spawns if "excluded_route" in e.details]
+    assert excluded, "no brief-less child carried its parent's route as an exclusion"
     for e in child_spawns:
-        # Inherited verbatim: a real framing from the lineage, never a synthetic echo
-        assert e.details["brief_id"] == e.details["parent_brief_id"]
-        assert e.details["brief"] == starter_briefs.get(e.details["brief_id"], e.details["brief"])
-        assert e.details["brief_id"] == compute_brief_id(e.details["brief"])
+        # Never verbatim inheritance: no child carries a brief of its own here
+        assert "brief" not in e.details
+        assert "brief" not in e.details["directive"]
+    for e in excluded:
+        assert e.details["excluded_route"] == starter_briefs[e.details["excluded_route_brief_id"]]
 
     fork_failures = [e for e in _failures(harness) if e.details["stage"] == "fork_mutation"]
     assert fork_failures
-    assert {e.details["outcome_on_failure"] for e in fork_failures} == {"inherited_parent_brief"}
+    assert {e.details["outcome_on_failure"] for e in fork_failures} == {"briefless_parent_route_excluded"}
     _assert_no_boilerplate(harness)
     assert harness.arena_feed.anchor()["verified_chain"] is True
 
@@ -248,11 +252,8 @@ def test_probe_shaped_mutation_replies_never_become_briefs_unit():
             depth=1,
             on_failure=failures.append,
         )
-        assert child.brief == parent.brief, shape
-        assert child.trigger == "inherited"
-        assert child.parent_brief_id == parent.brief_id
+        assert child is None, shape
         assert len(failures) == 2
-        assert "fork_id" not in child.brief and not child.brief.startswith("{")
 
 
 def test_probe_shaped_replies_never_appear_in_spawn_briefs():
@@ -268,15 +269,16 @@ def test_probe_shaped_replies_never_appear_in_spawn_briefs():
     assert _failures(harness)
     _assert_no_boilerplate(harness)
 
-    # Valid starters, probe-shaped mutations: children carry their parent's real brief
+    # Valid starters, probe-shaped mutations: children run brief-less, parent route excluded
     client = _brief_client(mutate_reply=lambda p, n: PROBE_SHAPES[0])
     harness = _run(client)
     starter_texts = {s.directive.brief for s in harness.starters}
-    child_spawns = [e for e in _spawns(harness) if e.snapshot.get("parent") is not None and "brief" in e.details]
+    child_spawns = [e for e in _spawns(harness) if e.snapshot.get("parent") is not None]
     assert child_spawns
     for e in child_spawns:
-        assert "fork_id" not in e.details["brief"]
-        assert e.details["brief"] in starter_texts
+        assert "brief" not in e.details
+    excluded = [e.details["excluded_route"] for e in child_spawns if "excluded_route" in e.details]
+    assert excluded and set(excluded) <= starter_texts
 
 
 # ---------------------------------------------------------------------------

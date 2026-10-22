@@ -35,7 +35,7 @@ import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .backend import FAST_JUDGE_MODEL
@@ -99,6 +99,9 @@ class Directive:
     - brief: exploration brief (v0.47)
     - brief_id: id of the brief (v0.47)
     - parent_brief_id: id of the parent brief (v0.47)
+    - excluded_routes: covered ground (v0.47.1) — briefs the lineage already took, as
+      {"brief_id", "brief"}. Set when a fork mutation failed: the child runs brief-less and the
+      parent's brief reaches it ONLY as a route not to repeat, never as its assignment.
     """
 
     parent_reasoning_compressed: str
@@ -108,9 +111,10 @@ class Directive:
     brief: str = ""
     brief_id: str = ""
     parent_brief_id: Optional[str] = None
+    excluded_routes: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        d = {
+        d: Dict[str, Any] = {
             "parent_reasoning_compressed": self.parent_reasoning_compressed,
             "fork_exploring": self.fork_exploring,
             "state": self.state.value,
@@ -121,7 +125,13 @@ class Directive:
             d["brief_id"] = self.brief_id
             if self.parent_brief_id is not None:
                 d["parent_brief_id"] = self.parent_brief_id
+        if self.excluded_routes:
+            d["excluded_routes"] = [dict(r) for r in self.excluded_routes]
         return d
+
+    @property
+    def excluded_route_texts(self) -> List[str]:
+        return [r["brief"] for r in self.excluded_routes if r.get("brief")]
 
 
 @dataclass
@@ -716,6 +726,11 @@ class MiniHarness:
             spawn_details["brief_id"] = self.directive.brief_id
             if self.directive.parent_brief_id is not None:
                 spawn_details["parent_brief_id"] = self.directive.parent_brief_id
+        elif self.directive.excluded_routes:
+            # Brief-less after a failed mutation: the parent's brief is covered ground, not a route
+            nearest = self.directive.excluded_routes[-1]
+            spawn_details["excluded_route"] = nearest["brief"]
+            spawn_details["excluded_route_brief_id"] = nearest["brief_id"]
         if self.parent_id is None and origin == "starter":
             from .arena import MAX_STREAM_PROBLEM_CHARS
 
@@ -940,7 +955,10 @@ class MiniHarness:
         )
         self._evaluate_graceful_degradation(new_parent_budget)
 
-        child_briefs: List[Any] = []
+        # Per-fork child briefs (None = brief-less). The lineage MAP rides along as exclusions.
+        child_briefs: List[Any] = [None] * len(ordered_forks)
+        inherited_exclusions = [dict(r) for r in self.directive.excluded_routes] if self.enable_briefs else []
+        child_exclusions: List[List[Dict[str, str]]] = [list(inherited_exclusions) for _ in ordered_forks]
         if self.enable_briefs and self.directive.brief:
             from .briefs import BRIEF_FAILURE_EVENT, ExplorationBrief, mutate_brief_for_fork
 
@@ -953,6 +971,10 @@ class MiniHarness:
                 depth=self.depth,
             )
             survived_obj = rec.last_objection or ""
+            # Divergence inputs (v0.47.1): the parent's brief, its conclusion or surviving claims,
+            # its objections, upstream exclusions, and the sibling briefs generated so far
+            parent_claims = self.conclusion_text or compressed
+            parent_route = {"brief_id": self.directive.brief_id, "brief": self.directive.brief}
             for f_idx, fork in enumerate(ordered_forks):
                 is_final_child = (f_idx == len(ordered_forks) - 1 and len(ordered_forks) > 1)
                 c_brief, b_cost = mutate_brief_for_fork(
@@ -961,20 +983,26 @@ class MiniHarness:
                     parent_brief=parent_brief_obj,
                     fork_description=fork.fork_description,
                     fork_reasoning=fork.reasoning,
-                    prior_sibling_briefs=child_briefs,
+                    prior_sibling_briefs=[b for b in child_briefs if b is not None],
                     survived_objection=survived_obj,
                     is_final=is_final_child,
                     depth=self.depth + 1,
                     on_failure=_journal_brief_failure,
+                    parent_conclusion=parent_claims,
+                    excluded_routes=[r["brief"] for r in inherited_exclusions],
                 )
                 if b_cost > 0:
                     self._spend(b_cost, f"{trigger}_child_brief_mutation", kind="brief")
-                child_briefs.append(c_brief)
+                child_briefs[f_idx] = c_brief
+                if c_brief is None:
+                    child_exclusions[f_idx].append(dict(parent_route))
 
         spawned: List[MiniHarness] = []
         for idx, (fork, c_budget, t_scale) in enumerate(zip(ordered_forks, child_budgets, token_scales)):
             child_id = self.branch_counter()
             c_brief = child_briefs[idx] if idx < len(child_briefs) else None
+            if c_brief is not None and c_brief.brief == self.directive.brief:
+                raise AssertionError("a child brief may never restate its parent's brief")
             directive = Directive(
                 parent_reasoning_compressed=compressed,
                 fork_exploring=fork.fork_description,
@@ -983,6 +1011,7 @@ class MiniHarness:
                 brief=c_brief.brief if c_brief else "",
                 brief_id=c_brief.brief_id if c_brief else "",
                 parent_brief_id=c_brief.parent_brief_id if c_brief else None,
+                excluded_routes=[] if c_brief else child_exclusions[idx],
             )
             child = MiniHarness(
                 branch_id=child_id,
@@ -1081,6 +1110,9 @@ class MiniHarness:
         conclude_lines = [f"Conclude branch reasoning for problem: {self.problem}"]
         if self.enable_briefs and self.directive.brief:
             conclude_lines.append(f"Brief: {self.directive.brief}")
+        if self.enable_briefs:
+            for route in self.directive.excluded_route_texts:
+                conclude_lines.append(f"Covered by parent — do not repeat this route: {route}")
         conclude_lines.append(f"Fork: {self.directive.fork_exploring}")
         conclude_lines.append(f"Trace: {' | '.join(rec.reasoning_trace)}")
         conclude_lines.append("State this branch's concrete conclusion (the solution it proposes) in 1-3 sentences.")
@@ -1130,6 +1162,7 @@ class MiniHarness:
         parent_context = " | ".join(rec.reasoning_trace) or self.directive.parent_reasoning_compressed
         known_forks = self.tracker.known_forks_in_lineage(self.branch_id)
         brief_text = self.directive.brief if self.enable_briefs else ""
+        excluded_routes = self.directive.excluded_route_texts if self.enable_briefs else []
         plaus_res: IssueDetectionResult = self.detector.detect_plaus(
             problem=self.problem,
             parent_reasoning=parent_context,
@@ -1137,6 +1170,7 @@ class MiniHarness:
             known_forks=known_forks,
             max_tokens=self.probe_max_tokens,
             brief=brief_text,
+            excluded_routes=excluded_routes,
         )
         self._spend(plaus_res.cost_usd, "plaus_issue_detection", kind="plaus")
         cluster_bonus = plaus_res.distinct_forks[0].support_score if plaus_res.distinct_forks else 0.0
@@ -1202,6 +1236,7 @@ class MiniHarness:
                     known_forks=self.tracker.known_forks_in_lineage(self.branch_id),
                     max_tokens=self.probe_max_tokens,
                     brief=brief_text,
+                    excluded_routes=excluded_routes,
                 )
                 self._spend(ns_res.cost_usd, "ns_blind_variation", kind="ns")
                 self._emit(

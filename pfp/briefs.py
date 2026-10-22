@@ -30,9 +30,18 @@ v0.47.1 — briefs FAIL CLOSED:
    reasoning and returns empty content. A brief is only ever the model's parsed JSON
    `brief` field after validation — never raw output, never synthesized boilerplate.
    Every failed attempt is reported through `on_failure` (the harness journals it as a
-   `brief_generation_failed` event). After one retry a starter proceeds with NO brief,
-   a fork child inherits its parent's brief verbatim, and an objection revision keeps
-   the current brief.
+   `brief_generation_failed` event). After one retry a starter proceeds with NO brief
+   and an objection revision keeps the current brief.
+
+v0.47.1 amendment — divergence at EVERY spawn (Truman):
+   A descendant inherits the MAP (what the lineage covered, what died, which objections
+   landed), never the ROUTE. The fork-mutation call sees the parent's brief, its
+   conclusion / surviving claims, the falsifier objections it carries, the routes its
+   ancestors already excluded, and the sibling briefs already generated at this fork, and
+   must assign a route none of them took. A reply that restates the parent's or a
+   sibling's brief is rejected like any other invalid reply. If mutation still fails after
+   the retry the child proceeds with NO brief: the parent's brief reaches it only as an
+   excluded route (covered ground), never as its own assignment.
 """
 
 from __future__ import annotations
@@ -58,8 +67,7 @@ class ExplorationBrief:
     - brief_id: Content-addressed unique identifier for this framing
     - brief: Concise hypothesis space framing (1-2 sentences)
     - parent_brief_id: The brief_id of the ancestor brief this evolved from
-    - trigger: Event that generated this brief ("starter", "fork_variation", "falsification_objection",
-      or "inherited" when a fork mutation failed and the child kept its parent's brief)
+    - trigger: Event that generated this brief ("starter", "fork_variation", "falsification_objection")
     - depth: Generational depth of this brief framing
     """
 
@@ -92,6 +100,12 @@ BRIEF_FAILURE_EVENT = "brief_generation_failed"
 _PAYLOAD_MARKERS = ('"fork_id"', '"approach"', '"reasoning"', '"conclusion"', '"support_score"', '"fork_description"')
 
 BriefFailureSink = Callable[[Dict[str, Any]], None]
+# Extra rejection rule for an otherwise valid brief: returns a failure reason, or "" to accept.
+BriefRejector = Callable[[str], str]
+
+
+def _norm_brief(text: str) -> str:
+    return " ".join(str(text).split()).casefold()
 
 
 def validate_brief_text(text: Any) -> Tuple[Optional[str], str]:
@@ -136,6 +150,7 @@ def _request_brief(
     retry_max_tokens: int,
     context: Dict[str, Any],
     on_failure: Optional[BriefFailureSink],
+    reject: Optional[BriefRejector] = None,
 ) -> Tuple[Optional[str], float]:
     """
     One brief call, retried ONCE at the larger budget on empty/unparseable/invalid output.
@@ -154,6 +169,10 @@ def _request_brief(
         total_cost += float(getattr(getattr(resp, "usage", None), "cost_usd", 0.0) or 0.0)
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
         text, reason = _parse_brief_reply(raw)
+        if text is not None and reject is not None:
+            reason = reject(text)
+            if reason:
+                text = None
         if text is not None:
             return text, total_cost
         if on_failure is not None:
@@ -268,51 +287,80 @@ def mutate_brief_for_fork(
     max_tokens: int = BRIEF_MAX_TOKENS,
     retry_max_tokens: int = BRIEF_RETRY_MAX_TOKENS,
     on_failure: Optional[BriefFailureSink] = None,
-) -> tuple[ExplorationBrief, float]:
+    parent_conclusion: str = "",
+    parent_objections: Sequence[str] = (),
+    excluded_routes: Sequence[str] = (),
+) -> tuple[Optional[ExplorationBrief], float]:
     """
     Mutate an exploration brief for a child branch at a fork (v0.47).
-    Children spawned at a fork receive brief variations against the parent's
-    brief and their siblings'. If the parent survived a falsification carrying
-    an objection, the objection feeds the descendants' briefs.
 
-    The child's brief is the model's parsed, validated JSON `brief` (v0.47.1). If that
-    still fails after one retry, the child inherits the parent's brief verbatim
-    (trigger "inherited") — a real framing, never a synthesized echo.
+    Divergence obligation (v0.47.1): the call sees the lineage MAP — the parent's brief,
+    its conclusion / surviving claims, the falsifier objections it carries, routes already
+    excluded upstream, and the sibling briefs generated so far at this fork — and must
+    assign a route the parent did NOT take and no sibling is taking (coverage by
+    construction, applied recursively). A reply restating the parent's, a sibling's, or an
+    excluded brief is rejected and retried once like any other invalid reply.
+
+    Returns (None, cost) when mutation still fails after the retry: the caller spawns the
+    child brief-less, carrying the parent's brief only as an excluded route.
     """
     prior_texts = [f"- Sibling [{b.brief_id}]: {b.brief}" for b in prior_sibling_briefs]
     priors_block = "\n".join(prior_texts) if prior_texts else "None (first sibling in this cohort)."
 
+    objections = [" ".join(str(o).split()) for o in (survived_objection, *parent_objections) if str(o or "").strip()]
+    objections = list(dict.fromkeys(objections))
     objection_block = (
-        f"Falsification objection survived by parent: {survived_objection}\n"
-        "Explore around what this attack exposed: specialize this brief to investigate and resolve this objection.\n"
-        if survived_objection
+        "Falsification objections carried by parent:\n"
+        + "\n".join(f"- {o}" for o in objections)
+        + "\nExplore around what these attacks exposed.\n"
+        if objections
         else ""
     )
+    excluded = list(dict.fromkeys(" ".join(str(r).split()) for r in excluded_routes if str(r or "").strip()))
+    excluded_block = (
+        "Routes already covered upstream in this lineage (do not repeat):\n"
+        + "\n".join(f"- {r}" for r in excluded)
+        + "\n"
+        if excluded
+        else ""
+    )
+    claims = " ".join(str(parent_conclusion or "").split())
+    claims_line = f"Parent conclusion / surviving claims: {claims}\n" if claims else ""
 
     if is_final and len(prior_sibling_briefs) > 0:
         sibling_clause = (
             "MANDATE FOR FINAL SIBLING: Force this brief toward an orthogonal angle or overlooked mechanism "
-            "not covered by the sibling briefs in this cohort."
+            "not covered by the parent or the sibling briefs in this cohort."
         )
     else:
         sibling_clause = (
             "Ensure this brief specializes toward this fork's approach while remaining distinct from siblings."
         )
 
-    trigger = "falsification_objection" if survived_objection else "fork_variation"
+    trigger = "falsification_objection" if objections else "fork_variation"
     prompt = (
         f"mutate_exploration_brief {trigger} depth={depth}\n"
         f"Problem: {problem}\n"
-        f"Parent brief [{parent_brief.brief_id}]: {parent_brief.brief}\n"
+        f"Parent brief [{parent_brief.brief_id}] (route already taken by the parent): {parent_brief.brief}\n"
+        f"{claims_line}"
+        f"{objection_block}"
+        f"{excluded_block}"
         f"Fork under exploration: {fork_description}\n"
         f"Reasoning step: {fork_reasoning}\n"
-        f"{objection_block}"
         f"Prior sibling briefs in this fork cohort:\n"
         f"{priors_block}\n"
+        "Divergence obligation: assign a route the parent did NOT take and the siblings above are not "
+        "taking. Do not restate the parent's brief or a sibling's brief.\n"
         f"{sibling_clause}\n"
         "State this descendant branch's mutated exploration brief in 1-2 sentences. "
         'Return JSON: {"brief": "...", "focus_area": "..."}'
     )
+
+    taken = {_norm_brief(parent_brief.brief): "duplicates_parent_brief"}
+    for b in prior_sibling_briefs:
+        taken.setdefault(_norm_brief(b.brief), "duplicates_sibling_brief")
+    for r in excluded:
+        taken.setdefault(_norm_brief(r), "duplicates_excluded_route")
 
     brief_text, cost = _request_brief(
         client,
@@ -326,13 +374,13 @@ def mutate_brief_for_fork(
             "parent_brief_id": parent_brief.brief_id,
             "fork": str(fork_description)[:200],
             "sibling_index": len(prior_sibling_briefs),
-            "outcome_on_failure": "inherited_parent_brief",
+            "outcome_on_failure": "briefless_parent_route_excluded",
         },
         on_failure=on_failure,
+        reject=lambda text: taken.get(_norm_brief(text), ""),
     )
     if brief_text is None:
-        brief_text = parent_brief.brief
-        trigger = "inherited"
+        return None, cost
 
     b_id = compute_brief_id(brief_text)
     child_brief = ExplorationBrief(

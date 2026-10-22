@@ -190,6 +190,12 @@ def _parse_probe_json(raw_text: str, idx: int) -> ProbeContinuation:
     )
 
 
+def _excluded_routes_block(excluded_routes: Sequence[str]) -> str:
+    """Covered ground (v0.47.1): routes NOT to repeat, never presented as the assignment."""
+    lines = [" ".join(str(r).split()) for r in excluded_routes if str(r or "").strip()]
+    return "".join(f"Covered by parent — do not repeat this route: {r}\n" for r in lines)
+
+
 class IssueDetector:
     """
     Piece 1: Issue detector (Pass 2 refined).
@@ -400,6 +406,7 @@ class IssueDetector:
         k_override: Optional[int] = None,
         max_tokens: int = PROBE_MAX_TOKENS,
         brief: str = "",
+        excluded_routes: Sequence[str] = (),
     ) -> IssueDetectionResult:
         """
         Fire K diverse continuations blind (high temperature, cheap).
@@ -413,6 +420,7 @@ class IssueDetector:
             f"probe_continuation depth={depth}\n"
             f"Fire K diverse continuations for problem: {problem}\n"
             + (f"Exploration brief: {brief}\n" if brief else "")
+            + _excluded_routes_block(excluded_routes)
             + f"Parent reasoning so far: {parent_reasoning}\n"
             # One line only: a hint carrying newlines could forge the prompt's own structure
             + (f"Guidance: {' '.join(str(self.probe_hint).split())}\n" if self.probe_hint else "")
@@ -514,6 +522,7 @@ class IssueDetector:
         known_forks: Sequence[str] = (),
         max_tokens: int = PROBE_MAX_TOKENS,
         brief: str = "",
+        excluded_routes: Sequence[str] = (),
     ) -> IssueDetectionResult:
         """
         NS (natural selection): blind fan-out on cadence with no trigger.
@@ -524,6 +533,7 @@ class IssueDetector:
             f"ns_fanout natural selection blind variation depth={depth}\n"
             f"Problem: {problem}\n"
             + (f"Exploration brief: {brief}\n" if brief else "")
+            + _excluded_routes_block(excluded_routes)
             + f"Current reasoning: {parent_reasoning}\n"
             "Generate an orthogonal, unconsidered angle as JSON."
         )
