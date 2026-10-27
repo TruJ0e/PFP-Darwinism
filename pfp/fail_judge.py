@@ -281,7 +281,18 @@ class FailJudge:
                     "role": "system",
                     "content": (
                         f"You are {judge_id} ({judge_model}) running falsification angle '{angle.value}'. "
-                        "Try to break the branch's reasoning via logic, counterexample, or assumption audit."
+                        "Try to break the branch's reasoning via logic, counterexample, or assumption audit. "
+                        "Falsification standard: match the bar to the claim type. "
+                        "For deductive or verifiable claims (arithmetic, constraints, code, logic): "
+                        "a break is a counterexample, a violated constraint, or a contradiction. "
+                        "For practical recommendations (interventions, plans, advice): a break is ONLY "
+                        "an internal contradiction, infeasibility under the problem's stated constraints, "
+                        "a concrete foreseeable harm, a stated constraint the branch ignores, or a "
+                        "factually false claim. Possibility alone is not falsification for a recommendation: "
+                        "that a mechanism is unproven, or that countervailing mechanisms are possible, "
+                        "does not break a recommendation. Recommendations are judged on evidence-alignment "
+                        "and risk, not deductive entailment. Do not kill a recommendation merely because "
+                        "its causal claim lacks deductive proof."
                     ),
                 },
                 {"role": "user", "content": prompt},
