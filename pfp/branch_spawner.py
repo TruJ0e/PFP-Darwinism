@@ -2201,6 +2201,15 @@ class MainHarness:
 
                 if self.enable_selection and not self._should_stop():
                     selection_summary = self._run_selection_phase()
+                    # Final sweep (v0.52): selection can end with Possible branches
+                    # never tested — they spent their budget on children. Test each
+                    # once (falsification draws on the finish reserve, so a $0 branch
+                    # can still be examined). Survivors rank higher for the anytime
+                    # winner below; the run never ends with its best branch unexamined.
+                    if not self.race_mode:
+                        for rec in list(self.tracker.all_records()):
+                            if rec.state == BranchState.POSSIBLE and rec.attacks_faced == 0:
+                                self.fail_judge.falsify_branch(rec.id, schedule_trigger="final_sweep")
             except CallBudgetExceededError as exc:
                 self._stop_event.set()
                 self._cut_by_budget = True

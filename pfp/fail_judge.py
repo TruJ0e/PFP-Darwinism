@@ -110,7 +110,18 @@ _POSSIBILITY_PATTERNS = (
     r"no logical mechanism",
     r"paradoxically",
     r"assumes\b.*\bwithout\b",
-    r"without\s+(showing|demonstrating|mechanistic|empirical)\b",
+    r"without\s+(showing|demonstrating|mechanistic|empirical|accounting for|considering)\b",
+    r"without accounting for",
+    r"scenarios? where",
+    r"overlook\w* (cases|scenarios|possibilit)",
+    r"fails? to (consider|account for)",
+    r"uniformly",
+    r"universal(ly)? (benefit|claim|effect)",
+    r"\bsufficient\b",
+    r"\bguarantee\b",
+    r"\boften\b",
+    r"\bmay\b",
+    r"\bmight\b",
 )
 _CONCRETE_BREAK_PATTERNS = (
     r"contradict",
@@ -122,6 +133,12 @@ _CONCRETE_BREAK_PATTERNS = (
     r"mutually exclusive",
     r"incoherent",
     r"no substantive claim",
+    r"non sequitur",
+    r"fallac",
+    r"equivocat",
+    r"affirming the consequent",
+    r"incomplete logical chain",
+    r"does not follow from",
 )
 
 

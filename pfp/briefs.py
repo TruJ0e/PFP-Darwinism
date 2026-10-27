@@ -47,6 +47,7 @@ v0.47.1 amendment — divergence at EVERY spawn (Truman):
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -130,15 +131,32 @@ def validate_brief_text(text: Any) -> Tuple[Optional[str], str]:
 
 
 def _parse_brief_reply(raw: str) -> Tuple[Optional[str], str]:
-    """The brief is the parsed JSON `brief` field, validated — nothing else counts."""
+    """The brief is the parsed JSON `brief` field, validated — else prose fallback (v0.52).
+
+    A reasoning model that burns its budget mid-JSON used to kill divergence
+    outright (run 13: fork-mutation failures on truncated output). If the reply
+    does not parse but carries a readable prose sentence, that sentence is the
+    brief. JSON-shaped fragments never fall back: anything containing braces or
+    quotes stays a failure, so a truncated payload cannot become a brief.
+    """
     if not raw.strip():
         return None, "empty_content"
     parsed = parse_json_object(raw)
+    if parsed and "brief" in parsed:
+        return validate_brief_text(parsed.get("brief"))
+    text = re.sub(r"<think>.*?</think>", "", raw, flags=re.S)
+    text = re.sub(r"```(?:json)?(.*?)```", r"\1", text, flags=re.S)
+    text = " ".join(text.split())
+    if text and not any(c in text for c in "{}\"" ):
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        candidate = " ".join(sentences[:2])[:300].strip()
+        if candidate:
+            brief_text, _ = validate_brief_text(candidate)
+            if brief_text is not None:
+                return brief_text, ""
     if not parsed:
         return None, "unparseable_json"
-    if "brief" not in parsed:
-        return None, "missing_brief_field"
-    return validate_brief_text(parsed.get("brief"))
+    return None, "missing_brief_field"
 
 
 def _request_brief(
