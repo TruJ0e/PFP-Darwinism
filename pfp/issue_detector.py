@@ -17,6 +17,7 @@ Refinements in Pass 2 (by what was meant):
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import threading
@@ -179,8 +180,18 @@ def _parse_probe_json(raw_text: str, idx: int) -> ProbeContinuation:
         fork_desc = str(data.get("fork") or data.get("step") or data.get("approach") or raw_text[:80])
         reasoning = str(data.get("reasoning") or data.get("first_step") or raw_text)
     else:
+        # Fail closed (v0.50): a truncated probe must never become a branch's fork
+        # identity. Raw truncated JSON fragments used to be sliced into
+        # fork_description, then concatenated verbatim into merged children, which
+        # the falsifier then killed for incoherence at the gauntlet (run 12,
+        # branch_0016). A prose marker keeps the branch explorable without
+        # poisoning merges; the raw text stays in `reasoning` for brief mining.
+        frag = hashlib.sha1(raw_text.encode()).hexdigest()[:8]
         fork_id = f"fork_{idx}"
-        fork_desc = raw_text.strip()[:80]
+        fork_desc = (
+            f"Unparsed blind variation {idx} [{frag}] "
+            "(probe output did not parse as JSON; exploring an unconsidered angle)"
+        )
         reasoning = raw_text.strip()
     return ProbeContinuation(
         fork_id=fork_id,

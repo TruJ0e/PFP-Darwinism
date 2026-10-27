@@ -24,6 +24,7 @@ exits survived — not that only one can.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -90,6 +91,46 @@ class FalsificationOutcome:
             "cost_usd": round(self.cost_usd, 6),
             "transitioned_to": self.transitioned_to,
         }
+
+
+# Calibration (v0.50): a kill whose ONLY ground is possibility — an unproven
+# mechanism, possible countervailing effects, a causal claim lacking deductive
+# proof — does not falsify a claim in any domain. Falsification requires a
+# concrete break, not a possible one. The rule is applied as a verdict filter
+# (not prompt text) so mock economics are untouched: mock canned objections
+# always cite contradictions/violations, so the concrete-break guard below
+# always blocks conversion there.
+_POSSIBILITY_PATTERNS = (
+    r"causal\s+(leap|inference|oversimplification|claim)",
+    r"post hoc",
+    r"countervailing",
+    r"lacks logical support",
+    r"not logically warranted",
+    r"unverified causal",
+    r"no logical mechanism",
+    r"paradoxically",
+    r"assumes\b.*\bwithout\b",
+    r"without\s+(showing|demonstrating|mechanistic|empirical)\b",
+)
+_CONCRETE_BREAK_PATTERNS = (
+    r"contradict",
+    r"violat",
+    r"infeasib",
+    r"\bharm\b",
+    r"false\b",
+    r"incompatible",
+    r"mutually exclusive",
+    r"incoherent",
+    r"no substantive claim",
+)
+
+
+def _is_possibility_only_objection(objection: str, rationale: str) -> bool:
+    """True when the kill cites only possibility, never a concrete break."""
+    text = f"{objection or ''} {rationale or ''}".lower()
+    if any(re.search(p, text) for p in _CONCRETE_BREAK_PATTERNS):
+        return False
+    return any(re.search(p, text) for p in _POSSIBILITY_PATTERNS)
 
 
 class FailJudge:
@@ -281,18 +322,7 @@ class FailJudge:
                     "role": "system",
                     "content": (
                         f"You are {judge_id} ({judge_model}) running falsification angle '{angle.value}'. "
-                        "Try to break the branch's reasoning via logic, counterexample, or assumption audit. "
-                        "Falsification standard: match the bar to the claim type. "
-                        "For deductive or verifiable claims (arithmetic, constraints, code, logic): "
-                        "a break is a counterexample, a violated constraint, or a contradiction. "
-                        "For practical recommendations (interventions, plans, advice): a break is ONLY "
-                        "an internal contradiction, infeasibility under the problem's stated constraints, "
-                        "a concrete foreseeable harm, a stated constraint the branch ignores, or a "
-                        "factually false claim. Possibility alone is not falsification for a recommendation: "
-                        "that a mechanism is unproven, or that countervailing mechanisms are possible, "
-                        "does not break a recommendation. Recommendations are judged on evidence-alignment "
-                        "and risk, not deductive entailment. Do not kill a recommendation merely because "
-                        "its causal claim lacks deductive proof."
+                        "Try to break the branch's reasoning via logic, counterexample, or assumption audit."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -452,6 +482,17 @@ class FailJudge:
             else:
                 objection = esc_obj or objection
                 rationale = f"Fast-rung kill confirmed by {appeal_judge}: {esc_rat}"
+
+        # Calibration (v0.50): a kill whose only ground is possibility does not
+        # falsify. The conversion is journaled in the rationale so the proof trail
+        # shows the rule fired, not a hidden override. The branch must still
+        # survive its remaining rounds; conversion here buys one round, not a win.
+        if not survived and _is_possibility_only_objection(objection, rationale):
+            rationale = (
+                "Calibration: possibility-only objection does not falsify "
+                f"(original objection: {objection}) | {rationale}"
+            )
+            objection = ""
 
         if survived:
             # Credit lands only on a branch still alive when the verdict commits: a branch killed or
