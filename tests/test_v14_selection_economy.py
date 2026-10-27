@@ -43,7 +43,9 @@ class RoutingClient:
         if user.startswith("extract_claims"):
             return _response(json.dumps({"core_claims": self.claims}))
         if user.startswith("merge_synthesizer"):
-            return _response(json.dumps({"unified_fork": "merged", "unified_reasoning": "merged"}))
+            # Realistic-length fork: v0.53 refuses trivial syntheses after retry, so the
+            # fencing test's stub reply must pass the validity gate to reach the merge.
+            return _response(json.dumps({"unified_fork": "Merged synthesis of both parents into one coherent remediation plan", "unified_reasoning": "merged"}))
         return _response(self.verdict)
 
     def judge_calls(self) -> int:
