@@ -493,6 +493,7 @@ class FailJudge:
                 f"(original objection: {objection}) | {rationale}"
             )
             objection = ""
+            survived = True
 
         if survived:
             # Credit lands only on a branch still alive when the verdict commits: a branch killed or
