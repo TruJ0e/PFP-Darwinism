@@ -39,7 +39,7 @@ from pfp.backend import estimate_call_cost_usd, request_token_upper_bound
 from pfp.branch_spawner import MiniHarness
 from pfp.issue_detector import compute_token_entropy_from_choice
 
-MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
+MODEL = "nvidia/Nemotron-3_5-Lightning"
 PROBLEM = "A small business's SSH works laptop->desktop but not desktop->laptop."
 
 

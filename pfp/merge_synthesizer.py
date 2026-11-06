@@ -77,7 +77,7 @@ class MergeSynthesisResult:
 class MergeSynthesizer:
     """
     Piece 5: Merge synthesizer — combining aligned branches.
-    - Super call (`nvidia/nemotron-3-super-120b-a12b`) unifies compatible branches:
+    - Super call (`nvidia/Nemotron-3.5-Super-VL`) unifies compatible branches:
       keeps what's compatible, drops what's redundant, preserves provenance
       (mapping each parent branch ID to the claims/insights it contributed).
     - Child branch starts `BranchState.POSSIBLE` (never Passed).

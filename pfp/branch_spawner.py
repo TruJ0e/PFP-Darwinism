@@ -1754,6 +1754,26 @@ class MainHarness:
         post_merge_out = self.fail_judge.verify_after_merge(child_id)
         return merge_res, post_merge_out
 
+    def _charge_alignment_extraction(self, branches: Sequence[Any], pair_count: int = 0) -> None:
+        """Book claim-extraction spend the detector paid for but no verdict carries.
+
+        judge_planned_pairs can die mid-round (hard-cap refusal): the extractions
+        that already completed would otherwise vanish from the ledger while the
+        meter keeps them, and the run report would understate spend. Drain after
+        every round, success or failure.
+        """
+        # Duck-typed: test doubles (and any third-party detector) need not track it.
+        take = getattr(self.alignment_detector, "take_unbilled_extraction_usd", None)
+        amount = take() if callable(take) else 0.0
+        if amount <= 0.0 or not branches:
+            return
+        bid = branches[0].id
+        charged = self.budget_ledger.charge(self.tracker, bid, amount, allow_finish_reserve=True)
+        self._emit_budget(bid, "alignment_extract", charged)
+        if pair_count > 0:
+            # Keep the per-pair cost estimate honest: it used to see the folded total.
+            self.budget_ledger.observe_call_cost("alignment_pair", amount / pair_count)
+
     def _charge_alignment(self, al: Any) -> None:
         """Split a judge call's real cost across the two branches it compared (verification work)."""
         half_cost = al.cost_usd / 2.0
@@ -1888,9 +1908,15 @@ class MainHarness:
             plan = self.alignment_detector.plan_pairs(
                 active, max_pairs=max_pairs, roots_of=self.tracker.starter_roots
             )
-            alignments = self.alignment_detector.judge_planned_pairs(
-                active, plan, max_workers=self.judge_parallelism
-            )
+            alignments = []
+            try:
+                alignments = self.alignment_detector.judge_planned_pairs(
+                    active, plan, max_workers=self.judge_parallelism
+                )
+            finally:
+                # Extraction spend is booked when incurred; a hard-cap refusal
+                # mid-round must not drop what the meter already billed.
+                self._charge_alignment_extraction(active, pair_count=len(plan))
             for al in alignments:
                 self._charge_alignment(al)
                 self.budget_ledger.observe_call_cost("alignment_pair", al.cost_usd)

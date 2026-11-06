@@ -30,7 +30,7 @@ from pfp.backend import (
 
 _OK_BODY = {
     "id": "c1",
-    "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+    "model": "nvidia/Nemotron-3_5-Lightning",
     "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
     "usage": {"prompt_tokens": 1000, "completion_tokens": 500},
 }

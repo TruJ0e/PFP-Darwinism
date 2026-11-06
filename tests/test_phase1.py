@@ -29,13 +29,13 @@ class TestBackendInterface(unittest.TestCase):
         old_key = os.environ.get("NEBIUS_API_KEY")
         try:
             os.environ["NEBIUS_BASE_URL"] = "https://custom.nebius.example/v1"
-            os.environ["NEBIUS_MODEL"] = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
+            os.environ["NEBIUS_MODEL"] = "nvidia/Nemotron-3_5-Lightning"
             os.environ.pop("NEBIUS_API_KEY", None)
 
             client = create_client()
             self.assertIsInstance(client, MockOpenAIClient)
             self.assertEqual(client.base_url, "https://custom.nebius.example/v1")
-            self.assertEqual(client.model, "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B")
+            self.assertEqual(client.model, "nvidia/Nemotron-3_5-Lightning")
 
             resp = client.chat.completions.create(
                 messages=[{"role": "user", "content": "probe_continuation depth=0"}],
@@ -52,7 +52,7 @@ class TestBackendInterface(unittest.TestCase):
             live_client = create_client()
             self.assertIsInstance(live_client, OpenAICompatibleClient)
             self.assertEqual(live_client.base_url, "https://custom.nebius.example/v1")
-            self.assertEqual(live_client.model, "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B")
+            self.assertEqual(live_client.model, "nvidia/Nemotron-3_5-Lightning")
         finally:
             if old_url is None:
                 os.environ.pop("NEBIUS_BASE_URL", None)

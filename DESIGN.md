@@ -232,9 +232,9 @@ post-run replay — same data.
 - **Model requirement:** at least one NVIDIA open-source model, on Nebius
   Token Factory or Nebius AI Cloud.
 - **Model picks (live catalog):**
-  - `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` ($0.06/$0.24 per 1M) — branch
+  - `nvidia/Nemotron-3_5-Lightning` ($0.07/$0.20 per 1M) — branch
     fan-out workhorse. Start here.
-  - `nvidia/nemotron-3-super-120b-a12b` ($0.30/$0.90) — merge judge,
+  - `nvidia/Nemotron-3.5-Super-VL` ($0.30/$0.90) — merge judge,
     alignment judge, falsifier.
   - Ultra ($1.00/$3.00) skipped — too pricey for fan-out.
 - **Free path (verified, no card):** Token Factory $1 trial + Builder Program

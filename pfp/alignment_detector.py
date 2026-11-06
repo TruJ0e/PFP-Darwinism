@@ -187,7 +187,7 @@ class AlignmentDetector:
     """
     Piece 4: Alignment detector — spotting mergeable branches (Pass 2: intent & refinement).
     Stage 1: Embedding pre-filter (cheap cosine similarity on branch positions, recall-oriented).
-    Stage 2: Super judge call (`nvidia/nemotron-3-super-120b-a12b`) extracting core claims
+    Stage 2: Super judge call (`nvidia/Nemotron-3.5-Super-VL`) extracting core claims
              and comparing claim-by-claim into overlap/compatible, contradictory, or unrelated.
 
     Refinements in Pass 2 (by what was meant):
@@ -222,6 +222,13 @@ class AlignmentDetector:
         # faces the falsifier, a false contradiction still needs a Super-appealed kill.
         self.judge_model = judge_model or super_model
         self._claims_cache: Dict[Tuple[str, int], List[str]] = {}
+        # Claim-extraction spend billed when incurred, not folded into a verdict:
+        # a hard-cap refusal mid-round must not drop spend the meter already booked
+        # (v0.54: a model swap changed the mock trajectory, the selection round started
+        # judging, the cap refused the verdict calls, and two paid extractions vanished
+        # from the ledger while the meter kept them). The arena drains this after every
+        # judge_planned_pairs call, success or failure.
+        self.unbilled_extraction_usd: float = 0.0
         # Pairs already judged at their current trace versions — never pay Super twice for the same verdict
         self._judged_pairs: set = set()
 
@@ -305,7 +312,16 @@ class AlignmentDetector:
         if not claims:
             claims = [branch.fork_under_exploration or pos_text[:120]]
         self._claims_cache[cache_key] = list(claims)
+        # Booked here, at the moment the call is paid for — never folded into a
+        # later verdict that a hard-cap refusal may prevent from existing.
+        self.unbilled_extraction_usd = round(self.unbilled_extraction_usd + cost, 6)
         return claims, cost
+
+    def take_unbilled_extraction_usd(self) -> float:
+        """Drain extraction spend the arena has not booked yet (see __init__)."""
+        amount = round(self.unbilled_extraction_usd, 6)
+        self.unbilled_extraction_usd = 0.0
+        return amount
 
     def judge_pair(
         self,
@@ -314,7 +330,7 @@ class AlignmentDetector:
         cosine_sim: Optional[float] = None,
     ) -> AlignmentJudgeResult:
         """
-        Stage 2: Super judge call (`nvidia/nemotron-3-super-120b-a12b`).
+        Stage 2: Super judge call (`nvidia/Nemotron-3.5-Super-VL`).
         Extracts each branch's core claims and compares them claim-by-claim:
         - overlap (compatible -> alignable)
         - contradictory (clash -> leave them to fight / trigger falsification)
@@ -325,8 +341,10 @@ class AlignmentDetector:
             vb = compute_branch_embedding(id_free(branch_position_text(branch_b)), dim=self.embedding_dim)
             cosine_sim = cosine_similarity(va, vb)
 
-        claims_a, cost_a = self.extract_claims(branch_a)
-        claims_b, cost_b = self.extract_claims(branch_b)
+        # Extraction spend is booked when incurred (see unbilled_extraction_usd):
+        # it must not ride on this verdict, which a hard-cap refusal may prevent.
+        claims_a, _ = self.extract_claims(branch_a)
+        claims_b, _ = self.extract_claims(branch_b)
 
         def _quoted(branch: BranchRecord, claims: Sequence[str]) -> str:
             body = (
@@ -359,7 +377,7 @@ class AlignmentDetector:
             temperature=0.1,
             max_tokens=1024,
         )
-        total_cost = cost_a + cost_b + float(resp.usage.cost_usd)
+        total_cost = float(resp.usage.cost_usd)
         raw = (resp.choices[0].message.content if resp.choices else "") or ""
 
         data = parse_json_object(raw)
@@ -553,8 +571,8 @@ class AlignmentDetector:
         Judge `pairs` concurrently; results come back in `pairs` order.
 
         Claims are extracted first, once per branch (in parallel), so two pairs sharing a branch
-        never race to pay for the same extraction. Each extraction's cost rides on the first
-        planned pair that uses the branch, exactly as `judge_pair` folds it into a lone verdict.
+        never race to pay for the same extraction. The spend is booked in
+        unbilled_extraction_usd when incurred; the arena drains it after every round.
         """
         by_id = {b.id: b for b in branches}
         live_pairs = [p for p in pairs if p.branch_a_id in by_id and p.branch_b_id in by_id]
@@ -567,17 +585,18 @@ class AlignmentDetector:
                 if bid not in need:
                     need.append(bid)
         workers = max(1, min(int(max_workers), len(need) or 1))
-        extraction_cost: Dict[str, float] = {}
 
         def _extract(bid: str) -> float:
             return self.extract_claims(by_id[bid])[1]
 
+        # Claims are extracted first, once per branch (in parallel), so two pairs
+        # sharing a branch never race to pay for the same extraction. The spend is
+        # booked in unbilled_extraction_usd when incurred, never folded into a verdict.
         if workers == 1:
-            costs = [_extract(bid) for bid in need]
+            [_extract(bid) for bid in need]
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                costs = list(pool.map(_extract, need))
-        extraction_cost = dict(zip(need, costs))
+                list(pool.map(_extract, need))
 
         def _judge(p: AlignmentCandidatePair) -> AlignmentJudgeResult:
             return self.judge_pair(by_id[p.branch_a_id], by_id[p.branch_b_id], cosine_sim=p.cosine_similarity)
@@ -589,12 +608,7 @@ class AlignmentDetector:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 results = list(pool.map(_judge, live_pairs))
 
-        billed: set = set()
-        for res in results:
-            extra = 0.0
-            for bid in (res.branch_a_id, res.branch_b_id):
-                if bid not in billed:
-                    billed.add(bid)
-                    extra += extraction_cost.get(bid, 0.0)
-            res.cost_usd = round(res.cost_usd + extra, 6)
+        # No folding here: extraction spend is already booked in
+        # unbilled_extraction_usd when incurred (see extract_claims), and the
+        # arena drains it after every round, success or failure.
         return results

@@ -193,11 +193,13 @@ def test_no_briefs_escape_dial_matches_v046():
         assert "brief" not in e.details
 
     # 2. Spend and branch count match v0.46 baseline (37 branches, $0.8667 arena spend over 154 calls),
-    # plus the v0.52 final sweep: 2 previously-untested branches tested once (+2 calls, +4 events, +$0.02092).
+    # plus the v0.52 final sweep: 2 previously-untested branches tested once (+2 calls, +4 events, +$0.02092),
+    # plus the v0.54 model swap (Lightning $0.07/$0.20, Qwen3-30B $0.10/$0.30 — cheaper judge calls)
+    # and its alignment-extract accounting (3 alignment_extract budget events, one per selection round).
     assert s_nobriefs["total_branches_spawned"] == 37
-    assert s_nobriefs["budget"]["total_spent_usd"] == 0.886652
+    assert s_nobriefs["budget"]["total_spent_usd"] == 0.647979
     assert s_nobriefs["budget"]["api_calls"] == 156
-    assert len(harness_nobriefs.arena_feed.events) == 265
+    assert len(harness_nobriefs.arena_feed.events) == 268
 
     # Briefs run should have generated brief calls and different spend/events
     assert s_briefs["budget"]["api_calls"] > s_nobriefs["budget"]["api_calls"]

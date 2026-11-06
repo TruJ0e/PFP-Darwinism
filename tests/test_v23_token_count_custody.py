@@ -57,7 +57,7 @@ def test_malformed_provider_usage_is_conservatively_estimated(field: str, bad: o
     expected_prompt = 1000 if field == "completion_tokens" else request_token_upper_bound(
         messages,
         {
-            "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+            "model": "nvidia/Nemotron-3_5-Lightning",
             "temperature": 0.7,
             "max_tokens": 17,
         },

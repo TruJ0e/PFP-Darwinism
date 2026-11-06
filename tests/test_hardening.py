@@ -230,7 +230,7 @@ class _FakeServer:
 
 _OK_BODY = {
     "id": "c1",
-    "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+    "model": "nvidia/Nemotron-3_5-Lightning",
     "choices": [{"index": 0, "message": {"role": "assistant", "content": '```json\n{"survived": true}\n```'}}],
     "usage": {"prompt_tokens": 1000, "completion_tokens": 500},
 }
@@ -255,8 +255,8 @@ class TestLiveClient(unittest.TestCase):
         self.assertEqual(len(sleeps), 2)
         self.assertEqual(sleeps[1], 2.0)  # Retry-After honored
         self.assertEqual(parse_json_object(resp.choices[0].message.content), {"survived": True})
-        # Cost computed from live catalog pricing: 1000 in @0.06/M + 500 out @0.24/M
-        self.assertAlmostEqual(resp.usage.cost_usd, 0.00006 + 0.00012, places=9)
+        # Cost computed from live catalog pricing: 1000 in @0.07/M + 500 out @0.20/M
+        self.assertAlmostEqual(resp.usage.cost_usd, 0.00007 + 0.0001, places=9)
 
     def test_non_retryable_error_raises_immediately_with_status(self) -> None:
         sleeps: List[float] = []

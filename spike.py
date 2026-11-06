@@ -14,7 +14,7 @@ NEBIUS_BASE_URL if the region-specific endpoint differs at signup time.
 import argparse, json, os, statistics, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
+MODEL = "nvidia/Nemotron-3_5-Lightning"
 BASE_URL = os.environ.get("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1")
 # Live catalog 2026-10-13: Nano $0.06 / $0.24 per 1M tokens in/out.
 IN_PER_1M, OUT_PER_1M = 0.06, 0.24

@@ -30,7 +30,7 @@ def test_live_client_accepts_explicit_non_streaming(stream: object) -> None:
 
 def test_meter_refuses_streaming_without_reserving_or_counting() -> None:
     class _Inner:
-        model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
+        model = "nvidia/Nemotron-3_5-Lightning"
         calls = 0
 
         class chat:  # noqa: N801

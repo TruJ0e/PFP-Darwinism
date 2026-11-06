@@ -131,7 +131,7 @@ class TestHonestUsage(unittest.TestCase):
             request_token_upper_bound(
                 [{"role": "user", "content": "x"}],
                 {
-                    "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+                    "model": "nvidia/Nemotron-3_5-Lightning",
                     "temperature": 0.7,
                     "max_tokens": 64,
                 },
@@ -148,7 +148,7 @@ class TestHonestUsage(unittest.TestCase):
 
     def test_meter_charges_reservation_when_inner_client_reports_no_cost(self) -> None:
         class NoUsage:
-            model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
+            model = "nvidia/Nemotron-3_5-Lightning"
 
             class chat:  # noqa: N801
                 class completions:  # noqa: N801

@@ -47,7 +47,7 @@ def _run(**kwargs) -> Tuple[MainHarness, dict, _RecordingMock]:
 def test_fast_judge_is_priced_in_the_catalog() -> None:
     # An unpriced model falls back to the most expensive rates: the meter would reserve Super
     # prices for every fast-rung call and the hard-cap preflight would refuse cheap work
-    assert MODEL_PRICING_PER_1M[FAST_JUDGE_MODEL] == (0.20, 0.60)
+    assert MODEL_PRICING_PER_1M[FAST_JUDGE_MODEL] == (0.10, 0.30)
     assert FAST_JUDGE_MODEL != SUPER_MODEL
 
 

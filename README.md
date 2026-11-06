@@ -33,7 +33,7 @@ Live on Nebius Token Factory:
 ```bash
 export NEBIUS_API_KEY=...                       # Token Factory key
 export NEBIUS_BASE_URL=https://api.tokenfactory.nebius.com/v1   # default
-export NEBIUS_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B        # default (fan-out workhorse)
+export NEBIUS_MODEL=nvidia/Nemotron-3_5-Lightning        # default (fan-out workhorse)
 python run_arena.py --hard-cap 2.00 --state-dir .pfp_state --html-out arena_out/arena.html
 ```
 
@@ -142,8 +142,8 @@ the live run hashed it, so only an unedited copy matches the anchor.
 | 7. Arena feed | `pfp/arena.py`, `pfp/arena_html.py` | Append-only event stream (JSONL in/out). ASCII renderer and a self-contained HTML/Canvas Tron player are pure functions of the stream. |
 | 8. Self-improvement | `pfp/self_improvement.py`, `pfp/dials.py` | Mine the log → recall past wins → self-assessment → evidence-grounded anti-model → proposition → sandbox → hashed version registry with auto-revert, pin, run-boundary switching, emergency stop. |
 
-Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
-(`nvidia/nemotron-3-super-120b-a12b`) for alignment, merge and falsification.
+Models: Lightning (`nvidia/Nemotron-3_5-Lightning`) for fan-out; Super
+(`nvidia/Nemotron-3.5-Super-VL`) for alignment, merge and falsification.
 
 ## Safety rails and honest accounting
 
@@ -427,7 +427,7 @@ Models: Nano (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) for fan-out; Super
   512 tokens run 3 lost three of four verdicts under that reasoning. First-pass judging —
   claim extraction, alignment verdicts, background / NS / post-merge / contradiction attacks
   and gauntlet rounds before the last — now runs on a fast instruct model
-  (`FAST_JUDGE_MODEL`, Qwen3-235B-A22B-Instruct-2507, $0.20/$0.60 per 1M). Super keeps every
+  (`FAST_JUDGE_MODEL`, Qwen3-30B-A3B-Instruct-2507, $0.10/$0.30 per 1M). Super keeps every
   appeal, the final gauntlet round, the pre-exit check and merge synthesis, and has the last
   word on every kill: a fast-rung kill is appealed to Super, and when the branch's one appeal
   is already spent the kill escalates once to Super before it can stand (a verdictless

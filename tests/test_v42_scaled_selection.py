@@ -91,8 +91,10 @@ def test_concurrent_judging_extracts_each_branch_once_and_keeps_plan_order() -> 
     involved = {bid for p in plan for bid in (p.branch_a_id, p.branch_b_id)}
     assert client.tags.count("extract_claims") == len(involved)
     assert client.tags.count("alignment_judge") == len(plan)
-    # Every extraction is billed exactly once, on the first pair that uses the branch
-    assert round(sum(r.cost_usd for r in results), 6) == round(0.002 * len(involved) + 0.001 * len(plan), 6)
+    # Verdicts carry only the verdict call's cost; extraction spend is booked when
+    # incurred in the detector's accumulator, drained by the arena after the round.
+    assert round(sum(r.cost_usd for r in results), 6) == round(0.001 * len(plan), 6)
+    assert round(det.take_unbilled_extraction_usd(), 6) == round(0.002 * len(involved), 6)
 
 
 class _QuietDetector:
